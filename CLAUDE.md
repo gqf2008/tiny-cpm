@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`tiny-cpm` runs [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B) **quantized (GGUF, e.g. Q8_0)** on Apple **Metal**, using the **official `candle` 0.11** crate (crates.io, not a fork) plus a vendored `quantized_minicpm5` module. Two source files: `src/main.rs` (CLI + ChatML + decode loop + reasoning split) and `src/quantized_minicpm5.rs` (the model).
+`tiny-cpm` runs [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B) **quantized (GGUF, e.g. Q8_0)** on Apple **Metal**, using the **official `candle` 0.11** crate (crates.io, not a fork) plus a vendored `quantized_minicpm5` module. Two main source files: `src/main.rs` (CLI + ChatML + decode loop + tag-stripping stream) and `src/quantized_minicpm5.rs` (the model); plus `src/token_output_stream.rs`, a vendored copy of candle's streaming tokenizer wrapper that decodes tokens incrementally so partial words aren't flushed mid-token.
 
 **History** — this project went through three iterations, all recoverable via git stash:
 - `git stash@{0}` — the original hand-written educational engine (`TinyTensor`, KV cache, ratatui TUI).
@@ -41,7 +41,7 @@ There is **no test suite**.
 
 ## Architecture
 
-- **`src/main.rs`** — CLI parse → load GGUF via `candle_core::quantized::gguf_file` → `ModelWeights::from_gguf` → apply MiniCPM5's ChatML template → prefill → top-p decode loop (stops on eos `[1, 130073]`) → split `<think>...</think>` from the answer → print, with load/TTFT/decode timing on stderr.
+- **`src/main.rs`** — CLI parse → load GGUF via `candle_core::quantized::gguf_file` → `ModelWeights::from_gguf` → apply MiniCPM5's ChatML template → prefill → top-p decode loop (stops on eos `[1, 130073]`) → stream tokens to stdout with the reasoning tags stripped inline (`stream_clean`), so reasoning and answer come out as one continuous stream rather than two separate blocks → load/TTFT/decode timing on stderr.
 - **`src/quantized_minicpm5.rs`** — vendored from `candle_transformers::models::quantized_llama` (0.11) with two patches so MiniCPM5 works (see below).
 
 ## Non-obvious things that bite
