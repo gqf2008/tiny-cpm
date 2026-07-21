@@ -1,5 +1,7 @@
 # tiny-cpm
 
+**On-device (edge) inference for MiniCPM5-1B: a single tiny Rust binary, quantized on Apple Metal — no server, no cloud, no Python.**
+
 A single-binary Rust CLI that runs [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B) — a reasoning ("thinking") LLM — **quantized (GGUF, e.g. Q8_0)** on Apple **Metal**, using the official [`candle`](https://github.com/huggingface/candle) crate (0.11, from crates.io) plus a vendored, minimally patched `quantized_minicpm5` model module.
 
 MiniCPM5's `<think>…</think>` reasoning tags are stripped inline during streaming, so the visible output reads as one continuous answer.
