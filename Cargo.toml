@@ -1,0 +1,14 @@
+[package]
+name = "tiny-cpm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+candle-core = { version = "0.11", features = ["metal"] }
+candle-nn = { version = "0.11", features = ["metal"] }
+candle-transformers = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = "0.22"
+tracing = "0.1"
