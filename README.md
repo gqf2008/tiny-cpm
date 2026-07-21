@@ -4,8 +4,6 @@ A single-binary Rust CLI that runs [MiniCPM5-1B](https://huggingface.co/openbmb/
 
 MiniCPM5's `<think>…</think>` reasoning tags are stripped inline during streaming, so the visible output reads as one continuous answer.
 
-Inspired by [tiny-vllm](https://github.com/kuawo/tiny-llm).
-
 ## What you get
 
 - ~57–59 tok/s decode on Metal with Q8_0 (vs ~24 tok/s for bf16). Candle's Metal quantized path dequantizes per block then matmuls; for a 1B model the memory-bandwidth win from half-size weights beats the dequant cost.
