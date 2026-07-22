@@ -97,7 +97,8 @@ impl Qwen3AsrProcessor {
     }
 
     /// aha `process_audio_tensor`: single in-memory mono waveform (1-D, 16kHz).
-    #[allow(dead_code)] // kept verbatim from aha; the CLI path uses process_audio_path
+    /// Used by `Qwen3AsrEngine::transcribe_samples` (the live loop); the CLI
+    /// path uses process_audio_path.
     pub fn process_audio_tensor(
         &self,
         render: &str,

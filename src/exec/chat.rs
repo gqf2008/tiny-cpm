@@ -50,9 +50,10 @@ pub fn load_model(model_path: &str, device: &Device) -> Result<ModelWeights> {
     Ok(model)
 }
 
-/// Generate one chat reply for `prompt` (ChatML single-turn). Clean streamed
-/// deltas (think tags stripped) are passed to `sink`; the full clean text plus
-/// decode stats are returned. All diagnostics go to stderr.
+/// Generate one chat reply for `prompt` (ChatML single-turn, optional system
+/// message). Clean streamed deltas (think tags stripped) are passed to `sink`;
+/// the full clean text plus decode stats are returned. All diagnostics go to
+/// stderr.
 pub fn generate_reply(
     model: &mut ModelWeights,
     tokenizer: &Tokenizer,
@@ -61,8 +62,40 @@ pub fn generate_reply(
     max_tokens: usize,
     sink: &mut dyn FnMut(&str),
 ) -> Result<ChatGenStats> {
-    // MiniCPM5 uses ChatML. Render a single-turn user message + generation prompt.
-    let chat = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
+    generate_reply_with_system(
+        model, tokenizer, device, None, prompt, false, max_tokens, sink,
+    )
+}
+
+/// `generate_reply` with an optional ChatML system message prepended.
+/// `no_think` appends an empty think block (`<think>\n\n</think>\n\n`) after
+/// the generation prompt — the official chat template's
+/// `enable_thinking=false` convention, which makes MiniCPM5 skip reasoning
+/// and answer directly (its untagged inner monologue otherwise leaks into the
+/// reply).
+pub fn generate_reply_with_system(
+    model: &mut ModelWeights,
+    tokenizer: &Tokenizer,
+    device: &Device,
+    system: Option<&str>,
+    prompt: &str,
+    no_think: bool,
+    max_tokens: usize,
+    sink: &mut dyn FnMut(&str),
+) -> Result<ChatGenStats> {
+    // MiniCPM5 uses ChatML. Render [optional system +] one user message +
+    // generation prompt.
+    let chat = match system {
+        Some(sys) => format!(
+            "<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+        ),
+        None => format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"),
+    };
+    let chat = if no_think {
+        format!("{chat}<think>\n\n</think>\n\n")
+    } else {
+        chat
+    };
     let enc = tokenizer
         .encode(chat, true)
         .map_err(|e| anyhow::anyhow!("encode: {e}"))?;

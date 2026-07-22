@@ -2,7 +2,9 @@
 //! Adaptations vs aha:
 //! - `generate()` takes `sample_len` (max codec frames) and `save_path` parameters
 //!   instead of the hardcoded `sample_len = 100` and `./demo.wav`; it returns the
-//!   number of frames actually generated.
+//!   number of frames actually generated. The frame loop + codec decode also live
+//!   in `generate_waveform()`, which returns the waveform in memory (used by the
+//!   `live` subcommand); `generate()` is a thin wrapper that adds `save_wav`.
 use crate::{
     common::sample::{sample_from_logits_vec, simple_sample_cpu},
     models::{
@@ -32,6 +34,39 @@ pub struct MossGenStats {
     pub codec_decode: std::time::Duration,
     /// Whole generate() call.
     pub total: std::time::Duration,
+}
+
+/// Streaming sink for `MossTTSModel::generate_waveform`: every `chunk_frames`
+/// codec frames, the prefix generated so far is decoded and the new audio
+/// tail is handed to `on_chunk` (interleaved stereo f32, [-1,1]).
+pub struct StreamChunk<'a> {
+    pub chunk_frames: usize,
+    pub on_chunk: &'a mut dyn FnMut(Vec<f32>),
+}
+
+/// Emit the not-yet-emitted tail of a (channels, len) waveform as interleaved
+/// f32. Returns the new emitted count (per channel).
+fn emit_tail(
+    waveform: &Tensor,
+    emitted: usize,
+    on_chunk: &mut dyn FnMut(Vec<f32>),
+) -> Result<usize> {
+    let (channels, len) = waveform.dims2()?;
+    if len <= emitted {
+        return Ok(emitted);
+    }
+    // One bulk GPU→CPU copy, then interleave on the host.
+    let w = waveform
+        .to_dtype(candle_core::DType::F32)?
+        .to_vec2::<f32>()?;
+    let mut pcm = Vec::with_capacity((len - emitted) * channels);
+    for i in emitted..len {
+        for row in w.iter().take(channels) {
+            pcm.push(row[i]);
+        }
+    }
+    on_chunk(pcm);
+    Ok(len)
 }
 
 pub struct MossTTSModel {
@@ -193,16 +228,23 @@ impl MossTTSModel {
         Ok(Tensor::cat(&[&slot, &audio_token_ids], D::Minus1)?)
     }
 
-    /// Generates up to `sample_len` codec frames, decodes them with the audio
-    /// tokenizer and writes the (stereo) waveform to `save_path`.
-    /// Returns generation stats (frame count, TTFT, codec decode time).
-    pub fn generate(
+    /// Generates up to `sample_len` codec frames and decodes them with the
+    /// audio tokenizer. Returns the (channels, len) f32 waveform (not written
+    /// to disk) plus generation stats (frame count, TTFT, codec decode time).
+    ///
+    /// When `stream` is set, every `stream.chunk_frames` frames the frames
+    /// generated so far are decoded through the (causal) codec and the newly
+    /// available interleaved-stereo f32 tail is passed to `stream.on_chunk` —
+    /// this lets playback start after the first chunk instead of after the
+    /// whole utterance. Prefix re-decode is exact because the codec is causal;
+    /// it costs one extra codec pass per chunk.
+    pub fn generate_waveform(
         &mut self,
         input_ids: &Tensor,
         audio_tokenizer: &MossAudioTokenizer,
         sample_len: usize,
-        save_path: &str,
-    ) -> Result<MossGenStats> {
+        mut stream: Option<StreamChunk<'_>>,
+    ) -> Result<(Tensor, MossGenStats)> {
         let gen_start = std::time::Instant::now();
         // generate() restarts seqlen_offset at 0, so any KV cache left over
         // from a previous call would corrupt attention (mask/kv length
@@ -214,6 +256,8 @@ impl MossTTSModel {
         let mut seqlen_offset = 0;
         let mut seq_len = input_ids.dim(1)?;
         let mut generated_frames = vec![];
+        // Samples (per channel) already emitted through `stream`.
+        let mut emitted = 0usize;
         // Python reference (modeling_moss_tts_nano.py:1687, 1733-1735): the
         // repetition penalty for channel k is applied against that channel's
         // previously generated frames only (`generated_audio_history[:, :, k]`;
@@ -286,6 +330,15 @@ impl MossTTSModel {
                 // TTFT: prompt prefill + first full codec frame.
                 ttft = Some(gen_start.elapsed());
             }
+            if let Some(s) = stream.as_mut()
+                && generated_frames.len() % s.chunk_frames == 0
+            {
+                let audio_token_ids = Tensor::stack(&generated_frames, 0)?;
+                let waveform = audio_tokenizer
+                    .decode_audio_token_ids_to_waveform(&audio_token_ids)?
+                    .squeeze(0)?;
+                emitted = emit_tail(&waveform, emitted, &mut s.on_chunk)?;
+            }
         }
         let num_frames = generated_frames.len();
         if num_frames == 0 {
@@ -300,18 +353,35 @@ impl MossTTSModel {
         let waveform = audio_tokenizer
             .decode_audio_token_ids_to_waveform(&audio_token_ids)?
             .squeeze(0)?;
+        if let Some(s) = stream.as_mut() {
+            emit_tail(&waveform, emitted, &mut s.on_chunk)?;
+        }
+        let stats = MossGenStats {
+            frames: num_frames,
+            ttft: ttft.unwrap_or_default(),
+            codec_decode: decode_start.elapsed(),
+            total: gen_start.elapsed(),
+        };
+        Ok((waveform, stats))
+    }
+
+    /// `generate_waveform` + write the (stereo) waveform to `save_path`.
+    pub fn generate(
+        &mut self,
+        input_ids: &Tensor,
+        audio_tokenizer: &MossAudioTokenizer,
+        sample_len: usize,
+        save_path: &str,
+    ) -> Result<MossGenStats> {
+        let (waveform, stats) =
+            self.generate_waveform(input_ids, audio_tokenizer, sample_len, None)?;
         save_wav(
             &waveform,
             save_path,
             2,
             audio_tokenizer.sampling_rate as u32,
         )?;
-        Ok(MossGenStats {
-            frames: num_frames,
-            ttft: ttft.unwrap_or_default(),
-            codec_decode: decode_start.elapsed(),
-            total: gen_start.elapsed(),
-        })
+        Ok(stats)
     }
 
     #[allow(dead_code)]

@@ -29,7 +29,7 @@ use crate::exec::{chat, fun_asr_nano::FunAsrEngine, moss_tts::MossEngine};
 const ASR_MAX_TOKENS: usize = 512;
 /// Default LLM reply cap.
 const DEFAULT_MAX_TOKENS: usize = 256;
-/// MOSS codec-frame cap (300 frames @ 25 fps ~= 12 s of audio).
+/// MOSS codec-frame cap (300 frames @ 12.5 fps ~= 24 s of audio).
 const MOSS_MAX_FRAMES: usize = 300;
 
 pub fn run(args: &[String]) -> Result<()> {

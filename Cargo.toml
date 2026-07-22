@@ -18,6 +18,7 @@ symphonia = { version = "0.5", features = ["mp3", "wav"] }
 realfft = "3.5"
 rustfft = "6"
 sentencepiece = "0.13"
+cpal = "0.16"
 kaldi-native-fbank = "0.1"
 rand = "0.10"
 half = "2.7"

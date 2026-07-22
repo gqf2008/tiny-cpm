@@ -8,8 +8,8 @@
 //! - `--ref`: reference wav, enables VoiceClone mode; without it the model runs
 //!   in Continuation mode (text only).
 //! - `--max-len`: cap on generated codec frames. Default 100, matching aha's
-//!   hardcoded `sample_len` (MOSS-Audio-Tokenizer-Nano emits 25 fps at 24 kHz,
-//!   so the default yields ~4 s of audio).
+//!   hardcoded `sample_len` (MOSS-Audio-Tokenizer-Nano emits 12.5 fps at
+//!   48 kHz stereo, so the default yields ~8 s of audio).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,7 +24,7 @@ use crate::models::{
     moss_audio_tokenizer_nano::{MossAudioTokenizer, config::MossAudioTokenizerConfig},
     moss_tts_nano::{
         config::MossTTSConfig,
-        model::{MossGenStats, MossTTSMode, MossTTSModel},
+        model::{MossGenStats, MossTTSMode, MossTTSModel, StreamChunk},
         processor::MossTTSProcessor,
     },
 };
@@ -138,6 +138,11 @@ impl MossEngine {
         })
     }
 
+    /// Codec output sample rate (MOSS emits stereo at this rate).
+    pub fn sample_rate(&self) -> usize {
+        self.audio_tokenizer.sampling_rate
+    }
+
     /// Synthesize `text` to `out_path` (mirrors aha MossTTSGenerate::generate).
     /// No `ref_wav` => Continuation (text only); `ref_wav` => VoiceClone.
     pub fn synthesize(
@@ -185,13 +190,91 @@ impl MossEngine {
         eprintln!(
             "generated {} codec frames ({:.2}s audio) in {:.2}s ({:.2} frames/s, codec decode {:.2}s) -> {out_path}",
             stats.frames,
+            // True codec frame rate: sampling_rate / downsample_rate = 12.5 Hz
+            // (the interleave factor is already inside downsample_rate).
             stats.frames as f64 * self.audio_tokenizer.downsample_rate as f64
-                / (self.audio_tokenizer.sampling_rate * self.audio_tokenizer.number_channels)
-                    as f64,
+                / self.audio_tokenizer.sampling_rate as f64,
             stats.total.as_secs_f64(),
             stats.frames as f64 / stats.total.as_secs_f64(),
             stats.codec_decode.as_secs_f64(),
         );
+        Ok(stats)
+    }
+
+    /// Synthesize `text` to interleaved stereo f32 PCM in [-1,1] at the codec
+    /// sample rate (48kHz), for direct playback (used by the `live` loop).
+    /// Continuation mode (no reference audio). Sample layout and peak
+    /// normalization mirror `save_wav`.
+    pub fn synthesize_pcm(
+        &mut self,
+        text: &str,
+        max_len: usize,
+    ) -> Result<(Vec<f32>, MossGenStats)> {
+        let mode = self
+            .processor
+            .resolved_mode(Some(MossTTSMode::Continuation), false, false)?;
+        let input_ids = self.processor.build_inference_input_ids(
+            text,
+            None,
+            None,
+            mode,
+            &self.audio_tokenizer,
+            &self.text_tokenizer,
+            &self.device,
+        )?;
+        let (waveform, stats) =
+            self.model
+                .generate_waveform(&input_ids, &self.audio_tokenizer, max_len, None)?;
+        // (channels, len) -> interleaved, normalized like save_wav's i16 ratio.
+        let max_val = waveform.abs()?.max_all()?.to_scalar::<f32>()?;
+        let scale = if max_val > 1.0 { 1.0 / max_val } else { 1.0 };
+        let chans = waveform.to_vec2::<f32>()?;
+        if chans.is_empty() {
+            return Ok((Vec::new(), stats));
+        }
+        let len = chans[0].len();
+        let mut pcm = Vec::with_capacity(len * chans.len());
+        for i in 0..len {
+            for ch in &chans {
+                pcm.push((ch[i] * scale).clamp(-1.0, 1.0));
+            }
+        }
+        Ok((pcm, stats))
+    }
+
+    /// Streaming variant of `synthesize_pcm`: every `chunk_frames` codec
+    /// frames, `on_chunk` receives the newly synthesized audio (interleaved
+    /// stereo f32, un-normalized — the global peak isn't known until the end).
+    /// Playback can start after the first chunk instead of the full sentence.
+    /// Each chunk costs one codec prefix re-decode (exact — codec is causal).
+    pub fn synthesize_pcm_stream(
+        &mut self,
+        text: &str,
+        max_len: usize,
+        chunk_frames: usize,
+        on_chunk: &mut dyn FnMut(Vec<f32>),
+    ) -> Result<MossGenStats> {
+        let mode = self
+            .processor
+            .resolved_mode(Some(MossTTSMode::Continuation), false, false)?;
+        let input_ids = self.processor.build_inference_input_ids(
+            text,
+            None,
+            None,
+            mode,
+            &self.audio_tokenizer,
+            &self.text_tokenizer,
+            &self.device,
+        )?;
+        let (_, stats) = self.model.generate_waveform(
+            &input_ids,
+            &self.audio_tokenizer,
+            max_len,
+            Some(StreamChunk {
+                chunk_frames,
+                on_chunk,
+            }),
+        )?;
         Ok(stats)
     }
 }

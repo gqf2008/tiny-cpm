@@ -6,6 +6,7 @@
 //!   tts    VoxCPM2 / MOSS-TTS-Nano speech synthesis
 //!   vad    FireRedVAD voice activity detection
 //!   dialogue  Fun-ASR -> MiniCPM5 -> MOSS-TTS voice-dialogue pipeline
+//!   live   realtime voice dialogue: mic -> VAD -> Qwen3-ASR -> MiniCPM5 -> MOSS-TTS -> speaker
 //!
 //! Usage:
 //!     tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens]
@@ -13,6 +14,7 @@
 //!     tiny-cpm tts <voxcpm|moss> <model-dir> "<text>" <out.wav> [--codec <codec-dir>] [--ref <ref.wav>] [--max-len N]
 //!     tiny-cpm vad <model-dir> <audio-file>
 //!     tiny-cpm dialogue <funasr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
+//!     tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N]
 
 mod common;
 mod exec;
@@ -48,6 +50,7 @@ fn main() -> Result<()> {
             ),
         },
         "vad" => exec::vad::run(rest),
+        "live" => exec::live::run(rest),
         _ => {
             usage();
             std::process::exit(1);
@@ -65,5 +68,8 @@ fn usage() {
     eprintln!("  tiny-cpm vad <model-dir> <audio-file>");
     eprintln!(
         "  tiny-cpm dialogue <funasr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]"
+    );
+    eprintln!(
+        "  tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N]"
     );
 }
