@@ -10,5 +10,20 @@ candle-nn = { version = "0.11", features = ["metal"] }
 candle-transformers = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 tokenizers = "0.22"
 tracing = "0.1"
+hound = "3.5"
+symphonia = { version = "0.5", features = ["mp3", "wav"] }
+realfft = "3.5"
+rustfft = "6"
+sentencepiece = "0.13"
+kaldi-native-fbank = "0.1"
+rand = "0.10"
+half = "2.7"
+byteorder = "1.5"
+
+[lints.clippy]
+needless_range_loop = "allow"
+single_range_in_vec_init = "allow"
+manual_div_ceil = "allow"

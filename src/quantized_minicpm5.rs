@@ -19,11 +19,11 @@
 
 use std::collections::HashMap;
 
-use candle_transformers::quantized_nn::RmsNorm;
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::quantized::{ggml_file, gguf_file};
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder};
+use candle_transformers::quantized_nn::RmsNorm;
 use serde::Deserialize;
 
 pub const MAX_SEQ_LEN: usize = 4096;
@@ -262,7 +262,9 @@ impl LayerWeights {
             att.matmul(&v.contiguous()?)?
         };
 
-        let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+        let y = y
+            .transpose(1, 2)?
+            .reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
         let y = self.attention_wo.forward(&y)?;
         Ok(y)
     }
@@ -737,8 +739,8 @@ impl ModelWeights {
 
 #[cfg(test)]
 mod tests {
-    use candle_transformers::utils::build_causal_mask;
     use candle_core::{Device, Result};
+    use candle_transformers::utils::build_causal_mask;
 
     // ── Mask shape tests ──────────────────────────────────────────────────────
 

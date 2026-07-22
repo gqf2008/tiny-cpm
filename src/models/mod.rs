@@ -1,0 +1,9 @@
+pub mod feature_extractor;
+pub mod fire_red_vad;
+pub mod fun_asr_nano;
+pub mod gpt2;
+pub mod moss_audio_tokenizer_nano;
+pub mod moss_tts_nano;
+pub mod qwen3;
+pub mod qwen3_asr;
+pub mod voxcpm;

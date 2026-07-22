@@ -24,3 +24,9 @@ target
 # Added by cargo
 
 /target
+
+# Local model weights (downloaded separately, not committed)
+/models
+
+# Local dialogue test artifacts
+/dialogue_io
