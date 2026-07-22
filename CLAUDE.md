@@ -4,57 +4,61 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`tiny-cpm` runs [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B) **quantized (GGUF, e.g. Q8_0)** on Apple **Metal**, using the **official `candle` 0.11** crate (crates.io, not a fork) plus a vendored `quantized_minicpm5` module. Two main source files: `src/main.rs` (CLI + ChatML + decode loop + tag-stripping stream) and `src/quantized_minicpm5.rs` (the model); plus `src/token_output_stream.rs`, a vendored copy of candle's streaming tokenizer wrapper that decodes tokens incrementally so partial words aren't flushed mid-token.
+`tiny-cpm` is a single-binary Rust CLI for **on-device inference on Apple Metal** (macOS / Apple Silicon only), built on the **official `candle` 0.11** crate. One binary, six models, five subcommands:
 
-**History** — this project went through three iterations, all recoverable via git stash:
-- `git stash@{0}` — the original hand-written educational engine (`TinyTensor`, KV cache, ratatui TUI).
-- `git stash@{1}` — a candle-vllm client (bf16, ~24 tok/s).
-- **current** — official candle + Q8 + vendored `quantized_minicpm5` (~57 tok/s, fastest).
+- `chat` — MiniCPM5-1B reasoning LLM, quantized GGUF Q8_0 (~57 tok/s on Metal) via a vendored `quantized_minicpm5` module.
+- `asr funasr` / `asr qwen3` — Fun-ASR-Nano-2512 and Qwen3-ASR speech recognition.
+- `tts voxcpm` / `tts moss` — VoxCPM2 and MOSS-TTS-Nano (+ MOSS-Audio-Tokenizer-Nano codec) speech synthesis, with `--ref` voice cloning.
+- `dialogue` — one-process pipeline: Fun-ASR transcribes input WAV → MiniCPM5 replies → MOSS speaks it; per-stage latency on stderr.
+- `vad` — FireRedVAD-Stream-VAD speech-segment detection (safetensors + cmvn.json; `.pth.tar` rejected). stdout: one `start end` (seconds) per segment.
+
+The four speech models are **ported from [`aha`](https://github.com/jhqxxx/aha)** (candle 0.9.2 → 0.11; server/rocket/tokio/modelscope/minijinja coupling stripped). Ported files carry `//! Ported from aha …` headers and keep aha's names/signatures for mechanical re-porting.
+
+**History** — earlier iterations recoverable via git stash: `stash@{0}` hand-written educational engine (`TinyTensor`, ratatui TUI); `stash@{1}` candle-vllm client (bf16, ~24 tok/s); then official candle + Q8 MiniCPM5 chat; the speech models came in on branch `port-asr-tts-models`.
 
 ## Commands
 
 ```bash
-# Build & run. argv[1] is either a GGUF file (pre-converted Q8) or a bf16
-# safetensors directory (auto-quantized to Q8_0 in-memory at load).
-cargo run --release -- "<model.gguf | dir>" "<tokenizer.json>" "<prompt>" [max_tokens]
+cargo run --release -- chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens]
+cargo run --release -- asr funasr <model-dir> <audio-file> [max_tokens]
+cargo run --release -- asr qwen3  <model-dir> <audio-file> [max_tokens]
+cargo run --release -- tts voxcpm <model-dir> "<text>" <out.wav> [--ref ref.wav] [--max-len N]
+cargo run --release -- tts moss   <model-dir> "<text>" <out.wav> [--codec dir] [--ref ref.wav] [--max-len N]
+cargo run --release -- dialogue <funasr-dir> <minicpm5.gguf|bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
 
-# GGUF (pre-converted with llama.cpp) — fast load
-cargo run --release -- ./models/MiniCPM5-1B-Q8_0.gguf ./models/tokenizer.json "What is AI?" 512
-
-# Or a bf16 safetensors directory (HF layout + config.json) — no llama.cpp needed,
-# quantizes to Q8_0 in memory at load (~5s slower load)
-cargo run --release -- ./models/minicpm5-1b/ ./models/tokenizer.json "What is AI?" 512
-
-cargo build --release     # build without running
-cargo check               # fast type-check
+cargo build --release
+cargo check
 cargo fmt
 cargo clippy
+cargo test    # CPU-only unit tests (masks, feature-length math, config parsing)
 ```
 
-CLI is positional, parsed in `main()`:
-- `argv[1]` = GGUF model file (required)
-- `argv[2]` = tokenizer.json (required)
-- `argv[3]` = prompt (required)
-- `argv[4]` = max_tokens (optional, default 512)
+Output contract: payload (chat/transcript) → **stdout**; diagnostics → **stderr**; TTS writes WAV to the given path.
 
-There is **no test suite**.
+Model weights are not in the repo — download into `./models/` (gitignored). MOSS models live on ModelScope (`openmoss/…`), the rest on HuggingFace.
 
 ## Architecture
 
-- **`src/main.rs`** — CLI parse → load GGUF via `candle_core::quantized::gguf_file` → `ModelWeights::from_gguf` → apply MiniCPM5's ChatML template → prefill → top-p decode loop (stops on eos `[1, 130073]`) → stream tokens to stdout with the reasoning tags stripped inline (`stream_clean`), so reasoning and answer come out as one continuous stream rather than two separate blocks → load/TTFT/decode timing on stderr.
-- **`src/quantized_minicpm5.rs`** — vendored from `candle_transformers::models::quantized_llama` (0.11) with two patches so MiniCPM5 works (see below).
+- **`src/main.rs`** — subcommand dispatch only.
+- **`src/exec/`** — thin per-model CLI drivers (`chat.rs`, `fun_asr_nano.rs`, `qwen3_asr.rs`, `voxcpm.rs`, `moss_tts.rs`, `dialogue.rs`): parse args → load weights → infer → emit. Model math lives in `src/models/`.
+- **`src/quantized_minicpm5.rs`** + **`src/token_output_stream.rs`** — MiniCPM5 chat path, vendored from candle (`quantized_llama` + streaming tokenizer wrapper). Minimal diff from upstream.
+- **`src/models/`** — aha ports: `fun_asr_nano/`, `qwen3_asr/`, `voxcpm/`, `moss_tts_nano/`, `moss_audio_tokenizer_nano/`; shared backbones `qwen3/`, `gpt2/`, `feature_extractor/`.
+- **`src/common/`** (`modules.rs`, `sample.rs`, `InferenceModel`/`MultiModalData`), **`src/utils/`** (`audio_utils.rs`, `tensor_utils.rs`), **`src/position_embed/`**, **`src/tokenizer/`** — shared infra ported from aha with identical names.
 
 ## Non-obvious things that bite
 
-- **`from_gguf` vs `from_safetensors_dir`**: `main.rs` picks by `argv[1]` — `.gguf` file → `from_gguf` (read pre-quantized weights, fast load); a directory → `from_safetensors_dir` (load bf16 safetensors on CPU, `quantize_onto` each weight to Q8_0 onto Metal, slower load ~5s but needs no llama.cpp). Both produce equivalent Q8 weights (~59 tok/s).
-- **`quantize_onto` needs a CPU source**: candle's `QTensor::quantize_onto(src, dtype, dev)` requires `src` on CPU (the quantized storage lands on `dev`). So `from_safetensors_dir` mmaps on `Device::Cpu`, then quantizes onto Metal.
-- **Why a vendored `quantized_minicpm5`**: upstream `quantized_llama` hardcodes `head_dim = hidden/heads` (= 96 for MiniCPM5) and reshapes attention output to `hidden` (1536). MiniCPM5 has `head_dim=128`, so `num_heads*head_dim = 2048 ≠ hidden`. Two patches: (1) `head_dim` read from GGUF `llama.rope.dimension_count`; (2) attention output reshaped to `n_head*head_dim` (the o_proj then maps 2048→1536). Documented at the top of the file.
-- **Greedy (`ArgMax`) loops forever** on MiniCPM5 — its `<think>` repeats. `main.rs` defaults to `Sampling::TopP { p: 0.9, temperature: 0.7 }` to break the loop.
+- **`from_gguf` vs `from_safetensors_dir`** (chat): `.gguf` → pre-quantized fast load; a directory → bf16 safetensors quantized to Q8_0 in memory at load. **`quantize_onto` needs a CPU source** — mmap on CPU, then quantize onto Metal.
+- **Why vendored `quantized_minicpm5`**: upstream `quantized_llama` hardcodes `head_dim = hidden/heads` (96 for MiniCPM5); MiniCPM5 has `head_dim=128`, `16*128=2048 ≠ 1536`. Patches: read `head_dim` from GGUF metadata / config.json; reshape attention output to `n_head*head_dim` before o_proj.
+- **Greedy (`ArgMax`) loops forever** on MiniCPM5 — `chat` uses `TopP { p: 0.9, temperature: 0.7 }`, seed `299792458`, EOS `[1, 130073]`.
+- **Weight formats differ per model**: Fun-ASR = `.pt` pickles + bundled `Qwen3-0.6B/` subdir; Qwen3-ASR = mmaped safetensors (bf16); VoxCPM2 = safetensors LM + `.pth` AudioVAE (F32); MOSS = `.bin` pickles (loaded at **F32** — F16 visibly degraded quality vs the official F32 Python reference) + safetensors codec + sentencepiece `tokenizer.model`.
+- **MOSS**: `--codec` defaults to `<model-dir>/../MOSS-Audio-Tokenizer-Nano`; `--max-len` default 100 frames (~4 s at 25 fps); output WAV is stereo.
+- **Metal-risky ops**: `conv_transpose1d` (VoxCPM AudioVAE), per-frame `arg_sort`/`to_scalar` syncs (MOSS, perf only). Compile-clean; watch at first real run.
+- **ASR prompt templates are rendered manually** (no minijinja): Qwen3-ASR expands `<|audio_pad|>` placeholders; Fun-ASR splices adaptor outputs at `fbank_mask` positions.
 - **macOS requires the Metal Toolchain** (one-time): `xcodebuild -downloadComponent MetalToolchain`.
-- **Q8 on Metal via candle works and is fast** (~57 tok/s, beats bf16's 24). candle's metal quantized path dequantizes per block then matmuls; for a 1B model the memory-bandwidth win from half-size weights exceeds the dequant cost. (candle-vllm's fork `--isq` hangs on Metal — different kernel; this project avoids it by using official candle.)
-- **Single-shot, synchronous**: no streaming, no server. Load → prefill → decode → print → exit.
 
 ## Code conventions
 
-- Keep `quantized_minicpm5.rs` a **minimal diff** from upstream `quantized_llama` (only the two patches), so it's easy to re-vendor on candle updates.
-- `main.rs` is a thin driver; all model math lives in the vendored module.
+- Vendored/ported files stay minimal diffs (candle upstream / aha); don't restyle them, keep original comments (including Chinese ones).
+- `src/main.rs` and `src/exec/*` stay thin drivers.
+- Errors: `anyhow::Result` in drivers; ported aha code keeps `anyhow::Result` (verbatim-port wins); `candle_core::Result` only in the vendored candle files.
+- Keep `AGENTS.md` and this file in sync.
