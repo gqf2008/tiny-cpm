@@ -4,7 +4,7 @@ Guidance for AI coding agents working on this repository. Assumes no prior knowl
 
 ## Project overview
 
-`tiny-cpm` is a single-binary Rust CLI for **on-device inference on Apple Metal** (macOS / Apple Silicon only), built on the official [`candle`](https://github.com/huggingface/candle) crate (0.11, from crates.io). One binary, six models, five subcommands:
+`tiny-cpm` is a single-binary Rust CLI for **on-device inference on Apple Metal** (macOS / Apple Silicon only), built on the official [`candle`](https://github.com/huggingface/candle) crate (0.11, from crates.io). One binary, six models, six subcommands:
 
 - `chat` — [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B) reasoning LLM, **quantized (GGUF Q8_0)** via a vendored, minimally patched `quantized_minicpm5` module. ~57–59 tok/s decode on Metal.
 - `asr funasr` — Fun-ASR-Nano-2512 (SANM encoder + adaptor + Qwen3-0.6B decoder; `.pt` pickle weights).
@@ -13,6 +13,7 @@ Guidance for AI coding agents working on this repository. Assumes no prior knowl
 - `tts moss` — MOSS-TTS-Nano (GPT-2-style codec-LM; `.bin` pickles + sentencepiece) + MOSS-Audio-Tokenizer-Nano codec (safetensors). Voice cloning via `--ref`.
 - `dialogue` — one-process voice pipeline: Fun-ASR-Nano transcribes an input WAV → MiniCPM5 replies → MOSS-TTS speaks the reply; per-stage latency summary on stderr. Diagnostic env probes: `DIALOGUE_PROBE=1` (MOSS steady-state ms/frame after each stage), `DIALOGUE_PROBE_ONLY=1` + `PROBE_NO_FUNASR`/`PROBE_NO_LLM` (residency isolation).
 - `vad` — FireRedVAD-Stream-VAD speech-segment detection (safetensors + `cmvn.json`; torch `.pth.tar` checkpoints rejected). stdout prints one `start end` (seconds) per segment; the streaming `detect_frame*` API is ported and ready for a realtime loop.
+- `live` — realtime voice dialogue: mic (cpal/CoreAudio) → FireRedVAD endpointing → Qwen3-ASR → MiniCPM5 (sentence-streamed) → MOSS-TTS per sentence → speaker. `--input <wav>`/`--output <wav>` give a simulation mode for testing without a mic. No barge-in in v1.
 
 The four speech models are **ported from [`aha`](https://github.com/jhqxxx/aha)** (candle 0.9.2 → 0.11; rocket server / tokio / modelscope / minijinja coupling stripped; Metal-only). Ported files carry a `//! Ported from aha …` header and keep aha's names/signatures so future aha updates can be re-ported mechanically.
 
@@ -24,7 +25,7 @@ Key characteristics:
 ## Tech stack
 
 - Rust, edition 2024 (stable rustc ≥ 1.85-ish — verified with 1.97). **macOS / Apple Silicon**: `Device::new_metal(0)` is the default everywhere (moss/voxcpm allow a `TINY_CPM_DEVICE=cpu` override); candle built with the `metal` feature.
-- Dependencies (`Cargo.toml`): candle-* 0.11, `anyhow`, `serde` + `serde_json` + `serde_yaml` (Fun-ASR `config.yaml`), `tokenizers` 0.22, `sentencepiece` 0.13 (MOSS), `hound` (WAV), `symphonia` 0.5 (mp3/wav), `realfft`/`rustfft` (STFT/mel), `tracing`, `rand`, `half`, `byteorder`.
+- Dependencies (`Cargo.toml`): candle-* 0.11, `anyhow`, `serde` + `serde_json` + `serde_yaml` (Fun-ASR `config.yaml`), `tokenizers` 0.22, `sentencepiece` 0.13 (MOSS), `cpal` 0.16 (live mic/speaker), `hound` (WAV), `symphonia` 0.5 (mp3/wav), `realfft`/`rustfft` (STFT/mel), `tracing`, `rand`, `half`, `byteorder`.
 - Model weights are **not** in the repo. Download into `./models/` (gitignored). MOSS models are on ModelScope (`openmoss/…`), the rest on HuggingFace.
 
 ## Prerequisites
@@ -42,6 +43,7 @@ cargo run --release -- asr qwen3  <model-dir> <audio-file> [max_tokens]
 cargo run --release -- tts voxcpm <model-dir> "<text>" <out.wav> [--ref ref.wav] [--max-len N]
 cargo run --release -- tts moss   <model-dir> "<text>" <out.wav> [--codec dir] [--ref ref.wav] [--max-len N]
 cargo run --release -- dialogue <funasr-dir> <minicpm5.gguf|bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
+cargo run --release -- live <vad-dir> <qwen3asr-dir> <minicpm5.gguf|bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N]
 cargo run --release -- vad <model-dir> <audio-file>
 
 cargo build --release
@@ -53,12 +55,12 @@ cargo test    # CPU-only unit tests
 
 ## Code organization
 
-- **`src/main.rs`** — subcommand dispatch only (`chat` / `asr` / `tts` / `dialogue` / `vad`).
-- **`src/exec/`** — per-model CLI drivers (`chat.rs`, `fun_asr_nano.rs`, `qwen3_asr.rs`, `voxcpm.rs`, `moss_tts.rs`, `dialogue.rs`). Thin: parse args → load weights → run inference → emit. All model math lives in `src/models/`.
+- **`src/main.rs`** — subcommand dispatch only (`chat` / `asr` / `tts` / `dialogue` / `vad` / `live`).
+- **`src/exec/`** — per-model CLI drivers (`chat.rs`, `fun_asr_nano.rs`, `qwen3_asr.rs`, `voxcpm.rs`, `moss_tts.rs`, `dialogue.rs`, `live.rs`). Thin: parse args → load weights → run inference → emit. All model math lives in `src/models/`. Reusable engines also live here: `FunAsrEngine`, `Qwen3AsrEngine` (file + in-memory `transcribe_samples`), `MossEngine` (`synthesize` to wav, `synthesize_pcm` to memory).
 - **`src/quantized_minicpm5.rs`** + **`src/token_output_stream.rs`** — the MiniCPM5 chat path (vendored from candle, see "two patches" below). Kept a minimal diff from upstream.
 - **`src/models/`** — aha ports: `fun_asr_nano/`, `qwen3_asr/`, `voxcpm/`, `moss_tts_nano/`, `moss_audio_tokenizer_nano/`, plus shared backbones `qwen3/`, `gpt2/`, `feature_extractor/` (whisper mel frontend).
 - **`src/common/`** — `modules.rs` (attention/MLP/conv builders), `sample.rs` (temp/top-k/top-p/repetition penalty), `InferenceModel` trait + `MultiModalData`.
-- **`src/utils/`** — `audio_utils.rs` (load/resample/mel/kaldi-fbank/LFR/STFT/WAV), `tensor_utils.rs` (masks, scatter, linspace).
+- **`src/utils/`** — `audio_utils.rs` (load/resample/mel/kaldi-fbank/LFR/STFT/WAV), `live_audio.rs` (cpal mic capture → 16kHz/400-sample frames, speaker playback queue), `tensor_utils.rs` (masks, scatter, linspace).
 - **`src/position_embed/`** — RoPE variants, sinusoidal PE. **`src/tokenizer/`** — tokenizers + sentencepiece wrappers.
 
 ### The two MiniCPM5 patches (why `quantized_minicpm5` is vendored)
@@ -83,7 +85,7 @@ Upstream `quantized_llama` assumes `head_dim == hidden_size / num_heads` and `nu
 - **Never greedy/argmax with MiniCPM5** — its `<think>` loops forever. `chat` uses `Sampling::TopP { p: 0.9, temperature: 0.7 }`, seed `299792458`; EOS ids `[1, 130073]`.
 - **`QTensor::quantize_onto` requires a CPU source tensor** — that's why the bf16→Q8 path mmaps on CPU first.
 - **Weight formats differ per model**: Fun-ASR = `.pt` pickles (`pickle::read_all_with_key(.., Some("state_dict"))`) + bundled `Qwen3-0.6B/` subdir; Qwen3-ASR = mmaped safetensors; VoxCPM2 = safetensors LM + `.pth` AudioVAE (kept F32); MOSS = `.bin` pickles (loaded at **F32** — the official Python reference runs F32 on CPU and F16 visibly degraded quality on this ~100M model) + safetensors codec + `tokenizer.model` sentencepiece.
-- **MOSS defaults**: `--codec` defaults to `<model-dir>/../MOSS-Audio-Tokenizer-Nano`; `--max-len` default 100 codec frames (~4 s at 25 fps). Output is stereo.
+- **MOSS defaults**: `--codec` defaults to `<model-dir>/../MOSS-Audio-Tokenizer-Nano`; `--max-len` default 100 codec frames (~8 s at 12.5 fps — the codec's true frame rate is 12.5 Hz at 48 kHz stereo, NOT 25 fps). Output is stereo.
 - **Metal-risky ops** (worked at compile time, watch at runtime): `conv_transpose1d` (VoxCPM AudioVAE), per-frame `arg_sort`/`to_scalar` syncs (MOSS sampling, perf only), bf16 convs.
 - ASR prompts are rendered manually (no minijinja): Qwen3-ASR expands `<|audio_pad|>` × `get_feat_extract_output_lengths(mel_frames)`; Fun-ASR uses fake tokens replaced by adaptor outputs at `fbank_mask` positions.
 

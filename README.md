@@ -17,6 +17,8 @@ The four speech models are ported from [`aha`](https://github.com/jhqxxx/aha) (c
 
 A fifth subcommand, `dialogue`, chains three models in one process (all loaded once, kept resident): Fun-ASR-Nano transcribes an input WAV → MiniCPM5 replies → MOSS-TTS speaks the reply, with a per-stage latency summary on stderr.
 
+A sixth subcommand, `live`, is the realtime version: microphone → FireRedVAD endpointing → Qwen3-ASR → MiniCPM5 (reply streams sentence-by-sentence) → MOSS-TTS per sentence → speaker playback (cpal/CoreAudio). `--input <wav>` runs a simulation mode (no mic needed) that feeds a WAV through the same loop and writes the reply audio to `--output <wav>`. v1 has no barge-in.
+
 ## Prerequisites
 
 macOS needs the Metal Toolchain (one-time):
@@ -58,6 +60,7 @@ tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens]
 tiny-cpm asr <funasr|qwen3> <model-dir> <audio-file> [max_tokens]
 tiny-cpm tts <voxcpm|moss> <model-dir> "<text>" <out.wav> [--codec <codec-dir>] [--ref <ref.wav>] [--max-len N]
 tiny-cpm dialogue <funasr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
+tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N]
 tiny-cpm vad <model-dir> <audio-file>
 ```
 
@@ -75,7 +78,7 @@ cargo test    # CPU-only unit tests (masks, feature-length math, config parsing)
 
 ## How it works
 
-- **`src/main.rs`** — subcommand dispatch only. Drivers live in **`src/exec/`** (`chat.rs`, `fun_asr_nano.rs`, `qwen3_asr.rs`, `voxcpm.rs`, `moss_tts.rs`, `dialogue.rs`, `vad.rs`): parse args → load weights → run inference → emit payload/diagnostics.
+- **`src/main.rs`** — subcommand dispatch only. Drivers live in **`src/exec/`** (`chat.rs`, `fun_asr_nano.rs`, `qwen3_asr.rs`, `voxcpm.rs`, `moss_tts.rs`, `dialogue.rs`, `vad.rs`, `live.rs`): parse args → load weights → run inference → emit payload/diagnostics. Live audio IO (mic/speaker via cpal) is in **`src/utils/live_audio.rs`**.
 - **`src/quantized_minicpm5.rs`** + **`src/token_output_stream.rs`** — the original MiniCPM5 path: a vendored copy of `candle_transformers::models::quantized_llama` (0.11) with two patches for MiniCPM5's non-standard attention geometry (see below). `MAX_SEQ_LEN = 4096`.
 - **`src/models/`** — the aha ports: `fun_asr_nano/` (SANM encoder + adaptor + Qwen3-0.6B decoder), `qwen3_asr/` (Whisper-style audio encoder + Qwen3 decoder), `voxcpm/` (MiniCPM4 LM + residual LM + locDiT flow matching + AudioVAE), `moss_tts_nano/` (GPT-2-style codec-LM) + `moss_audio_tokenizer_nano/` (LFQ codec), plus shared backbones `qwen3/`, `gpt2/`, `feature_extractor/` (whisper mel frontend).
 - **`src/common/`** (`modules.rs`, `sample.rs`, `InferenceModel`/`MultiModalData`), **`src/utils/`** (`audio_utils.rs` — load/resample/mel/fbank/STFT/WAV; `tensor_utils.rs`), **`src/position_embed/`** (RoPE, sinusoidal), **`src/tokenizer/`** — shared infrastructure ported from aha with names/signatures kept identical, so re-porting future aha updates stays mechanical.
