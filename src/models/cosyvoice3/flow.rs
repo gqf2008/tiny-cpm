@@ -48,6 +48,9 @@ const MEL_DIM: usize = 80;
 const SPK_DIM_IN: usize = 192;
 const SPEECH_CODEBOOK: usize = 6561;
 const PRE_LOOKAHEAD_LEN: usize = 3;
+/// DiT chunk-causal mask granularity in mel frames (upstream
+/// cosyvoice3.yaml `static_chunk_size`; DiT/dit.py:163-166).
+const STATIC_CHUNK_SIZE: usize = 50;
 const TIME_EMB_DIM: usize = 256;
 const TIME_EMB_SCALE: f64 = 1000.0;
 const ROPE_THETA: f32 = 10000.0;
@@ -106,6 +109,21 @@ fn cosine_t_span(n_steps: usize) -> Vec<f64> {
         .collect()
 }
 
+/// Additive chunk-causal attention mask (1, 1, T, T), F32: entry (i, j) is 0
+/// when j < (floor(i/STATIC_CHUNK_SIZE) + 1) * STATIC_CHUNK_SIZE, else -inf
+/// (upstream utils/mask.py:154-158 `subsequent_chunk_mask`, applied in
+/// DiT/dit.py:163-166 for streaming chunks).
+fn chunk_causal_mask(t: usize, device: &Device) -> Result<Tensor> {
+    let mut m = vec![f32::NEG_INFINITY; t * t];
+    for (i, row) in m.chunks_exact_mut(t).enumerate() {
+        let hi = ((i / STATIC_CHUNK_SIZE) + 1) * STATIC_CHUNK_SIZE;
+        for v in row.iter_mut().take(hi.min(t)) {
+            *v = 0.0;
+        }
+    }
+    Ok(Tensor::from_vec(m, (1, 1, t, t), device)?)
+}
+
 /// Upstream RoPE quirk: applied on the PRE-RESHAPE (T, 16*64) Q/K with
 /// rot_dim = head_dim = 64, so only the first 64 channels (= head 0) rotate.
 /// Interleaved/GPT-J convention (adjacent pairs), theta = 10000.
@@ -147,6 +165,7 @@ impl DitBlock {
     }
 
     /// x: (T, dim); t_silu: (1, dim) precomputed silu(t_emb); cos/sin: (T, 64).
+    /// attn_mask: optional additive (1, 1, T, T) chunk-causal mask (0 / -inf).
     fn forward(
         &self,
         x: &Tensor,
@@ -155,6 +174,7 @@ impl DitBlock {
         sin: &Tensor,
         ln_ones: &Tensor,
         ln_zeros: &Tensor,
+        attn_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let t = x.dim(0)?;
         let md = self.adaln.forward(t_silu)?; // (1, 6*dim)
@@ -194,7 +214,7 @@ impl DitBlock {
             &to_heads(&k)?.to_dtype(DType::F32)?,
             &to_heads(&v)?.to_dtype(DType::F32)?,
             None,
-            None, // bidirectional — no mask
+            attn_mask, // None = bidirectional; Some = chunk-causal (streaming)
             1.0 / (DIT_HEAD_DIM as f64).sqrt(),
         )? // (1, T, heads, head_dim)
         .to_dtype(dtype)?;
@@ -450,7 +470,12 @@ impl CosyVoice3Flow {
     /// Speech tokens -> mu (T_mel = TOKEN_MEL_RATIO * T_tok, mel).
     /// Embedding lookup -> PreLookahead (right-pad 3, conv1 k=4, leaky_relu(0.01),
     /// left-pad 2, conv2 k=3, + residual) -> repeat_interleave(2).
-    fn pre_lookahead_mu(&self, speech_tokens: &[u32]) -> Result<Tensor> {
+    ///
+    /// `context`: the next PRE_LOOKAHEAD_LEN tokens when streaming
+    /// (finalize=false): their embeddings replace the zero right-pad before
+    /// conv1 (upstream PreLookaheadLayer main/context split,
+    /// transformer/upsample_encoder.py:91-94 via flow/flow.py:394).
+    fn pre_lookahead_mu(&self, speech_tokens: &[u32], context: Option<&[u32]>) -> Result<Tensor> {
         let t_tok = speech_tokens.len();
         if speech_tokens.iter().any(|&t| t as usize >= SPEECH_CODEBOOK) {
             bail!("cosyvoice3 flow: speech token id out of range (codebook {SPEECH_CODEBOOK})");
@@ -459,7 +484,27 @@ impl CosyVoice3Flow {
         let tok_emb = self.input_embd.index_select(&ids, 0)?; // (T_tok, mel)
         // Conv chain is channel-first: (1, C, T).
         let x = tok_emb.unsqueeze(0)?.transpose(1, 2)?.contiguous()?; // (1, mel, T)
-        let x = x.pad_with_zeros(2, 0, PRE_LOOKAHEAD_LEN)?; // right-pad 3
+        let x = match context {
+            None => x.pad_with_zeros(2, 0, PRE_LOOKAHEAD_LEN)?, // right-pad 3
+            Some(ctx) => {
+                if ctx.len() != PRE_LOOKAHEAD_LEN {
+                    bail!(
+                        "cosyvoice3 flow: pre-lookahead context must be {PRE_LOOKAHEAD_LEN} tokens, got {}",
+                        ctx.len()
+                    );
+                }
+                if ctx.iter().any(|&t| t as usize >= SPEECH_CODEBOOK) {
+                    bail!(
+                        "cosyvoice3 flow: context token id out of range (codebook {SPEECH_CODEBOOK})"
+                    );
+                }
+                let cids = Tensor::from_vec(ctx.to_vec(), ctx.len(), &self.device)?;
+                let ctx_emb = self.input_embd.index_select(&cids, 0)?; // (3, mel)
+                let ctx = ctx_emb.unsqueeze(0)?.transpose(1, 2)?.contiguous()?; // (1, mel, 3)
+                // context fills the whole lookahead window -> no zero pad left
+                Tensor::cat(&[&x, &ctx], 2)?
+            }
+        };
         let x = self.pre_la_conv1.forward(&x)?; // (1, 1024, T)
         let x = ops::leaky_relu(&x, 0.01)?;
         let x = x.pad_with_zeros(2, PRE_LOOKAHEAD_LEN - 1, 0)?; // left-pad 2
@@ -494,6 +539,11 @@ impl CosyVoice3Flow {
 
     /// DiT estimator velocity prediction. x/mu/cond: (T_mel, mel);
     /// spk_proj: (1, mel); cos/sin: (T_mel, 64). Returns (T_mel, mel).
+    /// `attn_mask`: the chunk-causal mask for streaming chunks (built once
+    /// per chunk by the caller; upstream DiT/dit.py:163-166 +
+    /// utils/mask.py:154-158 `subsequent_chunk_mask(., static_chunk_size)`),
+    /// None = bidirectional (finalize).
+    #[allow(clippy::too_many_arguments)]
     fn estimator_forward(
         &self,
         x: &Tensor,
@@ -503,6 +553,7 @@ impl CosyVoice3Flow {
         t: f64,
         cos: &Tensor,
         sin: &Tensor,
+        attn_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let t_mel = x.dim(0)?;
         // TimestepEmbedding: sinusoidal -> Linear -> SiLU -> Linear.
@@ -525,7 +576,15 @@ impl CosyVoice3Flow {
         let mut h = proj.add(&pos)?;
 
         for blk in &self.blocks {
-            h = blk.forward(&h, &t_silu, cos, sin, &self.ln_ones, &self.ln_zeros)?;
+            h = blk.forward(
+                &h,
+                &t_silu,
+                cos,
+                sin,
+                &self.ln_ones,
+                &self.ln_zeros,
+                attn_mask,
+            )?;
         }
 
         // AdaLN-Final: Linear(silu(t_emb)) -> 2*dim in (scale, shift) order.
@@ -543,6 +602,9 @@ impl CosyVoice3Flow {
     /// branch is recomputed only on the first/last/every-K-th step and cached
     /// in between (CrispASR's `CRISPASR_COSYVOICE3_CFG_INTERVAL` semantics) —
     /// near-lossless, cuts most of the uncond cost.
+    /// `finalize == false` puts the estimator in streaming-chunk mode
+    /// (chunk-causal attention mask on both CFG branches, as upstream runs
+    /// cond+uncond batched through the same masked estimator).
     fn solve_euler(
         &self,
         mu: &Tensor,
@@ -551,6 +613,7 @@ impl CosyVoice3Flow {
         n_steps: usize,
         cfg_rate: f64,
         seed: u64,
+        finalize: bool,
     ) -> Result<Tensor> {
         let (t_mel, _) = mu.dims2()?;
         let t_span = cosine_t_span(n_steps);
@@ -562,6 +625,14 @@ impl CosyVoice3Flow {
             .forward_repeat_interleave(0, t_mel, &self.device)?;
         let cos = cos.to_dtype(self.dtype)?;
         let sin = sin.to_dtype(self.dtype)?;
+        // Streaming chunk: one chunk-causal mask for the whole ODE (depends
+        // only on t_mel; mask[i, j] = j < (floor(i/50) + 1) * 50).
+        let attn_mask = if finalize {
+            None
+        } else {
+            Some(chunk_causal_mask(t_mel, &self.device)?)
+        };
+        let attn_mask = attn_mask.as_ref();
         let zeros_mel = Tensor::zeros((t_mel, MEL_DIM), self.dtype, &self.device)?;
         let zeros_spk = Tensor::zeros((1, MEL_DIM), self.dtype, &self.device)?;
         let cfg_interval: usize = std::env::var("CV3_CFG_INTERVAL")
@@ -573,7 +644,8 @@ impl CosyVoice3Flow {
         let mut t = t_span[0];
         let mut dt = t_span[1] - t_span[0];
         for step in 1..=n_steps {
-            let dphi_cond = self.estimator_forward(&x, mu, spk_proj, cond, t, &cos, &sin)?;
+            let dphi_cond =
+                self.estimator_forward(&x, mu, spk_proj, cond, t, &cos, &sin, attn_mask)?;
             let dphi = if cfg_rate != 0.0 {
                 // Uncond branch: mu / spks / cond all zeroed. With interval-CFG,
                 // reuse the cached dphi from a nearby step (approximation).
@@ -582,7 +654,7 @@ impl CosyVoice3Flow {
                     || (cfg_interval > 0 && step % cfg_interval == 0);
                 if recompute {
                     cached_unc = Some(self.estimator_forward(
-                        &x, &zeros_mel, &zeros_spk, &zeros_mel, t, &cos, &sin,
+                        &x, &zeros_mel, &zeros_spk, &zeros_mel, t, &cos, &sin, attn_mask,
                     )?);
                 }
                 let dphi_unc = cached_unc.as_ref().unwrap();
@@ -612,13 +684,79 @@ impl CosyVoice3Flow {
         cfg: f64,
         seed: u64,
     ) -> Result<Tensor> {
+        self.synthesize_mel_impl(
+            speech_tokens,
+            None,
+            spk_emb,
+            ref_mel,
+            n_steps,
+            cfg,
+            seed,
+            true,
+        )
+    }
+
+    /// Streaming-chunk variant (upstream flow/flow.py:391-394).
+    /// `full_tokens` = prompt prefix + generated tokens SO FAR + the
+    /// PRE_LOOKAHEAD_LEN lookahead tokens (the last 3).
+    /// finalize=true -> identical to `synthesize_mel` over all tokens.
+    /// finalize=false -> the last 3 tokens are split off as PreLookahead
+    /// context (not decoded into mel), and the DiT runs with the
+    /// chunk-causal attention mask. The same `seed` keeps x_init a
+    /// deterministic prefix across chunks (seeded_randn draws sequentially).
+    /// Returns mel INCLUDING the ref prefix frames.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_mel_chunk(
+        &self,
+        full_tokens: &[u32],
+        spk_emb: &Tensor,
+        ref_mel: &Tensor,
+        n_steps: usize,
+        cfg: f64,
+        seed: u64,
+        finalize: bool,
+    ) -> Result<Tensor> {
+        if finalize {
+            return self.synthesize_mel(full_tokens, spk_emb, ref_mel, n_steps, cfg, seed);
+        }
+        if full_tokens.len() <= PRE_LOOKAHEAD_LEN {
+            bail!(
+                "cosyvoice3 flow: streaming chunk needs > {PRE_LOOKAHEAD_LEN} tokens, got {}",
+                full_tokens.len()
+            );
+        }
+        let (main, context) = full_tokens.split_at(full_tokens.len() - PRE_LOOKAHEAD_LEN);
+        self.synthesize_mel_impl(
+            main,
+            Some(context),
+            spk_emb,
+            ref_mel,
+            n_steps,
+            cfg,
+            seed,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn synthesize_mel_impl(
+        &self,
+        speech_tokens: &[u32],
+        context: Option<&[u32]>,
+        spk_emb: &Tensor,
+        ref_mel: &Tensor,
+        n_steps: usize,
+        cfg: f64,
+        seed: u64,
+        finalize: bool,
+    ) -> Result<Tensor> {
         if speech_tokens.is_empty() {
             bail!("cosyvoice3 flow: empty speech token sequence");
         }
         if n_steps == 0 {
             bail!("cosyvoice3 flow: n_steps must be >= 1");
         }
-        let mu = self.pre_lookahead_mu(speech_tokens)?; // (T_mel, mel)
+        let mu = self.pre_lookahead_mu(speech_tokens, context)?; // (T_mel, mel)
         let (t_mel, _) = mu.dims2()?;
         let spk_proj = self.spk_project(spk_emb)?; // (1, mel)
 
@@ -643,7 +781,7 @@ impl CosyVoice3Flow {
             )?
         };
 
-        self.solve_euler(&mu, &spk_proj, &cond, n_steps, cfg, seed)
+        self.solve_euler(&mu, &spk_proj, &cond, n_steps, cfg, seed, finalize)
     }
 }
 
@@ -661,6 +799,25 @@ mod tests {
         assert_eq!(align_prompt_len(100, 0), 100);
         // ref_mel longer than 2*tokens: keep all tokens.
         assert_eq!(align_prompt_len(10, 1000), 10);
+    }
+
+    #[test]
+    fn test_chunk_causal_mask() {
+        // T=120: rows 0..50 see j<50, rows 50..100 see j<100, rows 100..120 all.
+        let m = chunk_causal_mask(120, &Device::Cpu)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        assert!(m[0][..50].iter().all(|&v| v == 0.0));
+        assert!(m[0][50..].iter().all(|&v| v == f32::NEG_INFINITY));
+        assert!(m[49][..50].iter().all(|&v| v == 0.0));
+        assert!(m[50][..100].iter().all(|&v| v == 0.0));
+        assert_eq!(m[50][100], f32::NEG_INFINITY);
+        assert!(m[119].iter().all(|&v| v == 0.0));
     }
 
     #[test]

@@ -315,6 +315,54 @@ impl Hift {
         Ok(istft(&spec, t_mel))
     }
 
+    /// Streaming variant (upstream hifigan/generator.py:672-726).
+    /// finalize=true -> identical to `mel_to_waveform`.
+    /// finalize=false drops the 8 right-context mel frames that look ahead
+    /// (3 f0 + 4 conv_pre + 1 istft tail), emitting (T_mel - 8) * 480 samples:
+    /// - f0 keeps T-3 frames (f0_predictor.py:99: lookahead conv with the
+    ///   last 3 frames as context — identical to truncating the full-mel f0);
+    /// - the source STFT loses 480 frames (generator.py:678-679);
+    /// - conv_pre's lookahead is served by running it over the FULL mel and
+    ///   keeping the first T-7 outputs (all decode convs below are causal,
+    ///   so the kept prefix is bit-identical to upstream's context passing,
+    ///   generator.py:677);
+    /// - the istft tail loses 480 samples (generator.py:709).
+    pub fn mel_to_waveform_stream(&self, mel: &Tensor, finalize: bool) -> Result<Vec<f32>> {
+        if finalize {
+            return self.mel_to_waveform(mel);
+        }
+        let t_mel = mel.dim(0)?;
+        if mel.dim(1)? != MEL_DIM {
+            return Err(anyhow!("mel must be (T_mel, {MEL_DIM})"));
+        }
+        if t_mel < 9 {
+            return Err(anyhow!(
+                "mel_to_waveform_stream(finalize=false) needs T_mel >= 9, got {t_mel}"
+            ));
+        }
+        let mel = mel.to_dtype(DType::F32)?.to_device(&self.device)?;
+        let x = mel.t()?.unsqueeze(0)?; // (1, 80, T_mel)
+
+        // Upstream computes f0 in float64 ("crucial for causal inference",
+        // generator.py:715-716). We deliberately stay in F32: deterministic,
+        // so recompute-and-slice keeps the kept prefix consistent chunk to
+        // chunk — a documented absolute-accuracy deviation, not a bug.
+        let f0 = self.f0_predict(&x)?; // Vec<f32>, T_mel
+        let f0 = &f0[..t_mel - 3]; // f0 lookahead context: drop 3 frames
+        let t_stft_full = (t_mel - 3) * UPSAMPLE_SCALE / ISTFT_HOP + 1;
+        let s_stft = self.source_stft(f0)?; // (18, T_stft_full) row-major
+        let s = Tensor::from_vec(s_stft, (1, S_STFT_CH, t_stft_full), &self.device)?;
+        // Drop 480 source STFT frames = the 4 conv_pre lookahead mel frames.
+        let s = s.narrow(2, 0, t_stft_full - 480)?;
+
+        // decode's t_min alignment truncates the (causal) tower to the
+        // shortened source: (T-7)*120 + 1 frames.
+        let spec = self.decode(&x, &s)?; // (1, 18, (T-7)*120+1)
+        let spec = spec.squeeze(0)?.to_vec2::<f32>()?;
+        // istft then drop the last 480 samples -> (T-8) * 480 output samples.
+        Ok(istft(&spec, t_mel - 8))
+    }
+
     /// CausalConvRNNF0Predictor: mel -> |Linear(ELU conv tower)|, (T_mel,) Hz.
     fn f0_predict(&self, x: &Tensor) -> Result<Vec<f32>> {
         // Layer 0: lookahead conv (k=4, right-pad 3), 80 -> 512.
@@ -534,5 +582,22 @@ mod tests {
             "hift smoke: {} samples, rms={rms:.4}, peak={peak:.4}",
             wav.len()
         );
+        // Streaming chunk: drops the 8 right-context frames -> (T-8)*480.
+        let wav_stream = hift.mel_to_waveform_stream(&mel, false).unwrap();
+        assert_eq!(wav_stream.len(), (t_mel - 8) * UPSAMPLE_SCALE);
+        assert!(wav_stream.iter().all(|v| v.is_finite()));
+    }
+
+    /// Streaming length math: (T-3) f0 frames -> (T-3)*120+1 STFT frames;
+    /// dropping 480 source frames lands the decode tower at (T-7)*120+1;
+    /// istft then emits exactly (T-8)*480 samples.
+    #[test]
+    fn test_stream_lengths() {
+        let t_mel = 20usize;
+        let t_stft_full = (t_mel - 3) * UPSAMPLE_SCALE / ISTFT_HOP + 1;
+        let t_stft = t_stft_full - 480;
+        assert_eq!(t_stft, (t_mel - 7) * UPSAMPLE_SCALE / ISTFT_HOP + 1);
+        let spec = vec![vec![0.0f32; t_stft]; S_STFT_CH];
+        assert_eq!(istft(&spec, t_mel - 8).len(), (t_mel - 8) * UPSAMPLE_SCALE);
     }
 }

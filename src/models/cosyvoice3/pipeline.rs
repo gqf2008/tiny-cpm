@@ -606,6 +606,223 @@ impl CosyVoice3Pipeline {
         stats.audio_secs = wav.len() as f64 / SAMPLE_RATE as f64;
         Ok((wav, stats))
     }
+
+    /// Chunked-streaming synthesis (upstream cosyvoice/cli/model.py:343-374 +
+    /// :425-450): the LM streams tokens; whenever `this_hop + 3` unprocessed
+    /// tokens are buffered, flow+HiFT RE-RUN over the entire prefix (no
+    /// neural state is kept between chunks) and only the new audio tail is
+    /// emitted via `on_audio`. With zero mid-chunk flushes this reduces
+    /// exactly to `synthesize`.
+    ///
+    /// Chunk schedule (CosyVoice3Model, cli/model.py:410-413): hop 25,
+    /// doubling per chunk (stream_scale_factor 2) up to 100; the first hop is
+    /// 25 + prompt_pad so (n_prompt + token_offset) lands on a 25-token grid.
+    /// Upstream mutates `self.token_hop_len` per call (a bug); the hop state
+    /// here is LOCAL per synthesis.
+    pub fn synthesize_streaming(
+        &mut self,
+        text: &str,
+        voice: &Voice,
+        max_tokens: usize,
+        n_steps: usize,
+        cfg: f64,
+        seed: u64,
+        on_audio: &mut dyn FnMut(Vec<f32>),
+    ) -> Result<SynthStats> {
+        let mut stats = SynthStats::default();
+
+        // Same preamble as synthesize(): prompt alignment + tokenisation.
+        let n_prompt = align_prompt_len(voice.prompt_speech_tokens.len(), voice.ref_mel.dim(0)?);
+        if n_prompt == 0 {
+            bail!(
+                "cosyvoice3: voice '{}' has an empty aligned prompt",
+                voice.name
+            );
+        }
+        let prompt_tokens = &voice.prompt_speech_tokens[..n_prompt];
+        let t_ref_mel = n_prompt * TOKEN_MEL_RATIO;
+        let ref_mel = voice.ref_mel.narrow(0, 0, t_ref_mel)?;
+        let mut text_ids = tokenize_prompt(&self.tokenizer, &voice.prompt_text)?;
+        text_ids.extend(tokenize_prompt(&self.tokenizer, text)?);
+        if text_ids.is_empty() {
+            bail!("cosyvoice3: empty text after tokenisation");
+        }
+
+        let mut st = StreamState {
+            // cli/model.py:345: pad the prompt up to the token_hop_len grid.
+            prompt_pad: (TOKEN_HOP_LEN - n_prompt % TOKEN_HOP_LEN) % TOKEN_HOP_LEN,
+            hop: TOKEN_HOP_LEN,
+            first: true,
+            ..StreamState::default()
+        };
+        let mut gen_tokens: Vec<u32> = Vec::new();
+
+        // Field-split borrows: the LM runs &mut while the flush closure uses
+        // flow/hift (&) — disjoint fields.
+        let lm = &mut self.lm;
+        let flow = &self.flow;
+        let hift = &self.hift;
+        let spk_emb = &voice.spk_emb;
+        let ref_mel = &ref_mel;
+
+        let t0 = Instant::now();
+        let gen_tokens_out = lm.generate_speech_tokens_streaming(
+            &text_ids,
+            prompt_tokens,
+            max_tokens,
+            seed,
+            &mut |tok| {
+                gen_tokens.push(tok);
+                // Flush every eligible chunk as soon as its tokens exist
+                // (upstream polls every 0.1 s; the condition is the same).
+                flush_stream_chunks(
+                    flow,
+                    hift,
+                    prompt_tokens,
+                    &gen_tokens,
+                    spk_emb,
+                    ref_mel,
+                    t_ref_mel,
+                    n_steps,
+                    cfg,
+                    seed,
+                    &mut st,
+                    on_audio,
+                )
+            },
+        )?;
+        // Subtract the mid-chunk flow+HiFT flushes (run synchronously inside
+        // the LM callback) so lm/flow/hift partition the total wall time.
+        stats.lm_secs = t0.elapsed().as_secs_f64() - st.flush_secs;
+        if gen_tokens_out.is_empty() {
+            bail!("cosyvoice3: LM produced 0 speech tokens");
+        }
+
+        // Final: all tokens, full bidirectional attention, finalize=true
+        // (cli/model.py:366-373); emit the tail after speech_offset.
+        let mut full_tokens = Vec::with_capacity(prompt_tokens.len() + gen_tokens.len());
+        full_tokens.extend_from_slice(prompt_tokens);
+        full_tokens.extend_from_slice(&gen_tokens);
+        let t0 = Instant::now();
+        let mel_full =
+            flow.synthesize_mel_chunk(&full_tokens, spk_emb, ref_mel, n_steps, cfg, seed, true)?;
+        st.flow_secs += t0.elapsed().as_secs_f64();
+        let start = t_ref_mel + st.token_offset * TOKEN_MEL_RATIO;
+        let mel = mel_full.narrow(0, start, mel_full.dim(0)? - start)?;
+        let full_mel = match st.mel_cache.take() {
+            Some(c) => Tensor::cat(&[&c, &mel], 0)?,
+            None => mel,
+        };
+        let t0 = Instant::now();
+        let wav = hift.mel_to_waveform_stream(&full_mel, true)?;
+        st.hift_secs += t0.elapsed().as_secs_f64();
+        on_audio(wav[st.speech_offset..].to_vec());
+
+        stats.n_text_ids = text_ids.len();
+        stats.n_prompt_tokens = n_prompt;
+        stats.n_gen_tokens = gen_tokens.len();
+        stats.t_mel_out = full_mel.dim(0)?;
+        stats.flow_secs = st.flow_secs;
+        stats.hift_secs = st.hift_secs;
+        stats.audio_secs = full_mel.dim(0)? as f64 * UPSAMPLE_SCALE as f64 / SAMPLE_RATE as f64;
+        Ok(stats)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chunked streaming (upstream cosyvoice/cli/model.py:343-374)
+// ---------------------------------------------------------------------------
+
+/// Generated-token hop per chunk; doubles per chunk up to 100
+/// (CosyVoice3Model: token_hop_len 25, token_max_hop_len 4*25,
+/// stream_scale_factor 2, cli/model.py:410-413).
+const TOKEN_HOP_LEN: usize = 25;
+const TOKEN_MAX_HOP_LEN: usize = 100;
+const STREAM_SCALE_FACTOR: usize = 2;
+/// flow.pre_lookahead_len: chunks decode with 3 lookahead tokens
+/// (flow/flow.py:394); a chunk flushes at this_hop + 3 buffered tokens.
+const PRE_LOOKAHEAD_LEN: usize = 3;
+/// HiFT output samples per mel frame (24 kHz / 50 fps).
+const UPSAMPLE_SCALE: usize = 480;
+
+/// Mutable per-synthesis streaming state (upstream keeps this in
+/// hift_cache_dict + mutated self.token_hop_len; ours is local).
+#[derive(Default)]
+struct StreamState {
+    prompt_pad: usize,
+    token_offset: usize,
+    hop: usize,
+    first: bool,
+    mel_cache: Option<Tensor>,
+    speech_offset: usize,
+    flow_secs: f64,
+    hift_secs: f64,
+    /// Wall time spent in mid-chunk flushes (== flow_secs + hift_secs of the
+    /// mid chunks); subtracted from the LM wall time for the stage split.
+    flush_secs: f64,
+}
+
+/// Flush every eligible chunk: while `gen - token_offset >= this_hop + 3`,
+/// re-run flow (chunk-causal, lookahead context) over the FULL prefix, keep
+/// the new mel tail, re-run HiFT (finalize=false) over the full mel cache and
+/// emit only the samples past `speech_offset` (cli/model.py:346-361 +
+/// token2wav :425-450).
+#[allow(clippy::too_many_arguments)]
+fn flush_stream_chunks(
+    flow: &CosyVoice3Flow,
+    hift: &Hift,
+    prompt_tokens: &[u32],
+    gen_tokens: &[u32],
+    spk_emb: &Tensor,
+    ref_mel: &Tensor,
+    t_ref_mel: usize,
+    n_steps: usize,
+    cfg: f64,
+    seed: u64,
+    st: &mut StreamState,
+    on_audio: &mut dyn FnMut(Vec<f32>),
+) -> Result<()> {
+    let t_flush = Instant::now();
+    loop {
+        let this_hop = if st.first {
+            TOKEN_HOP_LEN + st.prompt_pad
+        } else {
+            st.hop
+        };
+        if gen_tokens.len() - st.token_offset < this_hop + PRE_LOOKAHEAD_LEN {
+            break;
+        }
+        let n_gen = st.token_offset + this_hop + PRE_LOOKAHEAD_LEN;
+        let mut full_tokens = Vec::with_capacity(prompt_tokens.len() + n_gen);
+        full_tokens.extend_from_slice(prompt_tokens);
+        full_tokens.extend_from_slice(&gen_tokens[..n_gen]);
+
+        let t0 = Instant::now();
+        let mel_full =
+            flow.synthesize_mel_chunk(&full_tokens, spk_emb, ref_mel, n_steps, cfg, seed, false)?;
+        st.flow_secs += t0.elapsed().as_secs_f64();
+
+        // Keep only the new tail (cli/model.py:303: token_offset * ratio).
+        let start = t_ref_mel + st.token_offset * TOKEN_MEL_RATIO;
+        let mel = mel_full.narrow(0, start, mel_full.dim(0)? - start)?;
+        let full_mel = match st.mel_cache.take() {
+            Some(c) => Tensor::cat(&[&c, &mel], 0)?,
+            None => mel,
+        };
+
+        let t0 = Instant::now();
+        let wav = hift.mel_to_waveform_stream(&full_mel, false)?;
+        st.hift_secs += t0.elapsed().as_secs_f64();
+        st.mel_cache = Some(full_mel); // move after HiFT (no clone)
+        on_audio(wav[st.speech_offset..].to_vec());
+        st.speech_offset = wav.len();
+
+        st.token_offset += this_hop;
+        st.hop = (st.hop * STREAM_SCALE_FACTOR).min(TOKEN_MAX_HOP_LEN);
+        st.first = false;
+    }
+    st.flush_secs += t_flush.elapsed().as_secs_f64();
+    Ok(())
 }
 
 #[cfg(test)]

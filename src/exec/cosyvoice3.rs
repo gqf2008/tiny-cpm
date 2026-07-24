@@ -1,10 +1,14 @@
 //! CosyVoice3 (Fun-CosyVoice3-0.5B-2512) TTS driver. Usage:
-//!   tiny-cpm tts cosyvoice3 <model-dir> "<text>" <out.wav> [--voice <name>] [--ref <ref.wav>] [--ref-text "<text>"] [--steps N] [--max-tokens N]
+//!   tiny-cpm tts cosyvoice3 <model-dir> "<text>" <out.wav> [--voice <name>] [--ref <ref.wav>] [--ref-text "<text>"] [--steps N] [--max-tokens N] [--stream]
 //!
 //! Baked voices come from voices.gguf in the model dir (default
 //! `zero_shot`); `--ref` runs zero-shot cloning from a reference wav instead
 //! (s3tok + CAMPPlus GGUFs required; `--ref-text` is the transcript of the
 //! ref wav and is REQUIRED — CrispASR refuses zero-shot cloning without it).
+//! `--stream` runs chunked streaming synthesis (first audio in ~2.7 s instead
+//! of a full-utterance wait); for now the chunks are just buffered and one
+//! WAV is written — the per-chunk callback exists for latency measurement
+//! and as the future live-playback hook.
 //! stdout stays empty: the WAV goes to
 //! the given path, diagnostics to stderr.
 
@@ -16,13 +20,14 @@ use candle_core::{Device, Tensor};
 use crate::models::cosyvoice3::pipeline::{CosyVoice3Pipeline, SAMPLE_RATE};
 use crate::utils::audio_utils::save_wav_mono;
 
-const USAGE: &str = "usage: tiny-cpm tts cosyvoice3 <model-dir> \"<text>\" <out.wav> [--voice <name>] [--ref <ref.wav>] [--ref-text \"<text>\"] [--steps N] [--max-tokens N]";
+const USAGE: &str = "usage: tiny-cpm tts cosyvoice3 <model-dir> \"<text>\" <out.wav> [--voice <name>] [--ref <ref.wav>] [--ref-text \"<text>\"] [--steps N] [--max-tokens N] [--stream]";
 
 pub fn run(args: &[String]) -> Result<()> {
     let mut positional: Vec<&str> = Vec::new();
     let mut voice_name = "zero_shot".to_string();
     let mut ref_wav: Option<String> = None;
     let mut ref_text: Option<String> = None;
+    let mut stream = false;
     let mut steps: usize = 4; // 4 Euler steps: ~30% faster than the reference
     // default of 6 with ASR-verified quality parity
     // (use --steps 6 for the reference default)
@@ -71,6 +76,9 @@ pub fn run(args: &[String]) -> Result<()> {
                     .ok_or_else(|| anyhow!("--max-tokens requires a value"))?
                     .parse()
                     .map_err(|_| anyhow!("--max-tokens must be a non-negative integer"))?;
+            }
+            "--stream" => {
+                stream = true;
             }
             other => positional.push(other),
         }
@@ -129,7 +137,44 @@ pub fn run(args: &[String]) -> Result<()> {
     );
 
     let t0 = Instant::now();
-    let (wav, stats) = pipe.synthesize(text, &voice, max_tokens, steps, CFG, SEED)?;
+    let (wav, stats) = if stream {
+        // Chunked streaming (upstream cosyvoice/cli/model.py:343-374): audio
+        // tails are emitted per chunk; we just append them to the output
+        // buffer and log per-chunk latency to stderr.
+        let synth_start = Instant::now();
+        let mut first_chunk_secs: Option<f64> = None;
+        let mut chunk_idx = 0usize;
+        let mut buf: Vec<f32> = Vec::new();
+        let stats = pipe.synthesize_streaming(
+            text,
+            &voice,
+            max_tokens,
+            steps,
+            CFG,
+            SEED,
+            &mut |samples| {
+                let elapsed = synth_start.elapsed().as_secs_f64();
+                if first_chunk_secs.is_none() {
+                    first_chunk_secs = Some(elapsed);
+                }
+                eprintln!(
+                    "cosyvoice3: stream chunk {chunk_idx}: +{} samples ({:.2}s audio), {elapsed:.2}s elapsed",
+                    samples.len(),
+                    samples.len() as f64 / SAMPLE_RATE as f64
+                );
+                chunk_idx += 1;
+                buf.extend_from_slice(&samples);
+            },
+        )?;
+        eprintln!(
+            "cosyvoice3: stream: first chunk at {:.2}s ({} chunks total)",
+            first_chunk_secs.unwrap_or(f64::NAN),
+            chunk_idx
+        );
+        (buf, stats)
+    } else {
+        pipe.synthesize(text, &voice, max_tokens, steps, CFG, SEED)?
+    };
     let total = t0.elapsed().as_secs_f64();
 
     let n = wav.len();

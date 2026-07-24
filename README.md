@@ -52,7 +52,7 @@ cargo run --release -- asr qwen3 ./models/Qwen3-ASR-0.6B ./audio.wav
 # TTS — writes a WAV file; --ref clones the voice from a reference clip
 cargo run --release -- tts voxcpm ./models/VoxCPM2 "你好，世界。" out.wav [--ref ref.wav] [--max-len N]
 cargo run --release -- tts moss ./models/MOSS-TTS-Nano "你好，世界。" out.wav [--codec ./models/MOSS-Audio-Tokenizer-Nano] [--ref ref.wav] [--max-len N]
-cargo run --release -- tts cosyvoice3 ./models/Fun-CosyVoice3-0.5B-2512 "你好，世界。" out.wav [--voice zero_shot] [--ref ref.wav --ref-text "参考音频文本"] [--steps 6]
+cargo run --release -- tts cosyvoice3 ./models/Fun-CosyVoice3-0.5B-2512 "你好，世界。" out.wav [--voice zero_shot] [--ref ref.wav --ref-text "参考音频文本"] [--steps 6] [--stream]
 ```
 
 Full CLI contract (parsed in `src/main.rs`):
@@ -61,11 +61,13 @@ Full CLI contract (parsed in `src/main.rs`):
 tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens]
 tiny-cpm asr <funasr|qwen3> <model-dir> <audio-file> [max_tokens]
 tiny-cpm tts <voxcpm|moss> <model-dir> "<text>" <out.wav> [--codec <codec-dir>] [--ref <ref.wav>] [--max-len N]
-tiny-cpm tts cosyvoice3 <model-dir> "<text>" <out.wav> [--voice <name>] [--ref <ref.wav> --ref-text "<text>"] [--steps N] [--max-tokens N]
+tiny-cpm tts cosyvoice3 <model-dir> "<text>" <out.wav> [--voice <name>] [--ref <ref.wav> --ref-text "<text>"] [--steps N] [--max-tokens N] [--stream]
 tiny-cpm dialogue <funasr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
 tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N]
 tiny-cpm vad <model-dir> <audio-file>
 ```
+
+cosyvoice3 `--stream`: chunked streaming synthesis — first audio in ~2.7 s instead of a full-utterance wait (flow steps default 4; chunks are buffered and one WAV is written for now).
 
 Output contract: the payload (chat text / transcript) goes to **stdout**; all diagnostics (load time, TTFT, tok/s) go to **stderr**. TTS writes its WAV to the given path. Keep it that way — stdout is what consumers may pipe.
 

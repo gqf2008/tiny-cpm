@@ -208,6 +208,27 @@ impl CosyVoice3LM {
         max_steps: usize,
         seed: u64,
     ) -> Result<Vec<u32>> {
+        self.generate_speech_tokens_streaming(
+            text_ids,
+            prompt_speech_tokens,
+            max_steps,
+            seed,
+            &mut |_| Ok(()),
+        )
+    }
+
+    /// Streaming variant of `generate_speech_tokens`: identical RAS/stop
+    /// semantics, but `on_token` fires after each generated token is pushed
+    /// (so the callback observes the tokens in order and can flush audio
+    /// chunks mid-generation, upstream cosyvoice/cli/model.py:346-361).
+    pub fn generate_speech_tokens_streaming(
+        &mut self,
+        text_ids: &[u32],
+        prompt_speech_tokens: &[u32],
+        max_steps: usize,
+        seed: u64,
+        on_token: &mut dyn FnMut(u32) -> Result<()>,
+    ) -> Result<Vec<u32>> {
         if text_ids.is_empty() {
             return Err(anyhow!("generate_speech_tokens: text_ids is empty"));
         }
@@ -258,6 +279,7 @@ impl CosyVoice3LM {
                 break;
             }
             out.push(pick);
+            on_token(pick)?;
             let emb = self.speech_embed_rows(&[pick])?.unsqueeze(0)?;
             logits = self.forward_logits(&emb, n_past)?;
             n_past += 1;
