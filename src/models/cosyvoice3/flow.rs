@@ -13,14 +13,23 @@
 //! Weights load from the raw upstream `flow.pt` pickle (names kept verbatim,
 //! e.g. `decoder.estimator.transformer_blocks.0.attn.to_q.weight`).
 //!
+//! When `cosyvoice3-flow-q8_0.gguf` exists in the model dir it takes
+//! precedence: every tensor is dequantized to F16 and remapped to the flow.pt
+//! name tree (GGUF keys `cosyvoice3.flow.*`, see CrispASR
+//! convert-cosyvoice3-to-gguf.py), so the whole estimator runs F16 on Metal.
+//! Hardcoded F32 tensors (RoPE tables, sinusoidal time embedding, ODE noise,
+//! LayerNorm constants) are cast to the module dtype via `self.dtype`.
+//!
 //! CFG note: like CrispASR's non-batched fallback we run the estimator TWICE
 //! per Euler step (cond + uncond, both T-major) instead of one B=2 forward —
 //! numerically identical, simpler shapes.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::Path;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use candle_core::quantized::gguf_file;
 use candle_core::{D, DType, Device, Tensor, pickle::read_all_with_key};
 use candle_nn::{Conv1d, Conv1dConfig, Linear, Module, VarBuilder, conv1d, linear, ops};
 use rand::{RngExt, SeedableRng};
@@ -174,14 +183,21 @@ impl DitBlock {
                 .unsqueeze(0)?
                 .contiguous()?)
         };
+        // Run the attention math in F32: the UNSCALED q·k matmul overflows
+        // F16 (hidden magnitudes reach ~100+, so q·k > 65504 -> inf -> NaN
+        // softmax), which is where the F16 path blew up. Casting back after
+        // keeps the rest of the estimator in the module dtype; the casts are
+        // identity no-ops on the F32 (flow.pt) path.
+        let dtype = x.dtype();
         let attn = eager_attention_forward(
-            &to_heads(&q)?,
-            &to_heads(&k)?,
-            &to_heads(&v)?,
+            &to_heads(&q)?.to_dtype(DType::F32)?,
+            &to_heads(&k)?.to_dtype(DType::F32)?,
+            &to_heads(&v)?.to_dtype(DType::F32)?,
             None,
             None, // bidirectional — no mask
             1.0 / (DIT_HEAD_DIM as f64).sqrt(),
-        )?; // (1, T, heads, head_dim)
+        )? // (1, T, heads, head_dim)
+        .to_dtype(dtype)?;
         let attn = attn.reshape((t, DIT_DIM))?;
         let attn = self.to_o.forward(&attn)?;
         let x = x.add(&attn.broadcast_mul(gate_msa)?)?;
@@ -196,6 +212,8 @@ impl DitBlock {
 /// CosyVoice3 flow model: token conditioning + DiT-CFM estimator + Euler solver.
 pub struct CosyVoice3Flow {
     device: Device,
+    /// Module dtype: F32 for the flow.pt path, F16 for the GGUF path.
+    dtype: DType,
     // Token conditioning.
     input_embd: Tensor,   // (codebook, mel)
     pre_la_conv1: Conv1d, // k=4, 80 -> 1024, right-pad 3 (lookahead)
@@ -215,10 +233,135 @@ pub struct CosyVoice3Flow {
     ln_zeros: Tensor, // (dim,)
 }
 
+/// Map one `cosyvoice3.flow.*` GGUF tensor name to the flow.pt module tree.
+/// Returns None for tensors we recompute at runtime (rope_inv_freq).
+fn flow_gguf_to_pt_name(name: &str) -> Result<Option<String>> {
+    let s = name
+        .strip_prefix("cosyvoice3.flow.")
+        .ok_or_else(|| anyhow!("flow gguf: unexpected tensor name `{name}`"))?;
+    let fixed: &[(&str, &str)] = &[
+        ("input_embd.w", "input_embedding.weight"),
+        ("pre_la.conv1.w", "pre_lookahead_layer.conv1.weight"),
+        ("pre_la.conv1.b", "pre_lookahead_layer.conv1.bias"),
+        ("pre_la.conv2.w", "pre_lookahead_layer.conv2.weight"),
+        ("pre_la.conv2.b", "pre_lookahead_layer.conv2.bias"),
+        ("spk_affine.w", "spk_embed_affine_layer.weight"),
+        ("spk_affine.b", "spk_embed_affine_layer.bias"),
+        ("dit.in_proj.w", "decoder.estimator.input_embed.proj.weight"),
+        ("dit.in_proj.b", "decoder.estimator.input_embed.proj.bias"),
+        (
+            "dit.conv_pos.c1.w",
+            "decoder.estimator.input_embed.conv_pos_embed.conv1.0.weight",
+        ),
+        (
+            "dit.conv_pos.c1.b",
+            "decoder.estimator.input_embed.conv_pos_embed.conv1.0.bias",
+        ),
+        (
+            "dit.conv_pos.c2.w",
+            "decoder.estimator.input_embed.conv_pos_embed.conv2.0.weight",
+        ),
+        (
+            "dit.conv_pos.c2.b",
+            "decoder.estimator.input_embed.conv_pos_embed.conv2.0.bias",
+        ),
+        (
+            "dit.time_mlp.0.w",
+            "decoder.estimator.time_embed.time_mlp.0.weight",
+        ),
+        (
+            "dit.time_mlp.0.b",
+            "decoder.estimator.time_embed.time_mlp.0.bias",
+        ),
+        (
+            "dit.time_mlp.2.w",
+            "decoder.estimator.time_embed.time_mlp.2.weight",
+        ),
+        (
+            "dit.time_mlp.2.b",
+            "decoder.estimator.time_embed.time_mlp.2.bias",
+        ),
+        ("dit.norm_out.w", "decoder.estimator.norm_out.linear.weight"),
+        ("dit.norm_out.b", "decoder.estimator.norm_out.linear.bias"),
+        ("dit.proj_out.w", "decoder.estimator.proj_out.weight"),
+        ("dit.proj_out.b", "decoder.estimator.proj_out.bias"),
+    ];
+    for (from, to) in fixed {
+        if s == *from {
+            return Ok(Some(to.to_string()));
+        }
+    }
+    if s == "dit.rope_inv_freq" {
+        return Ok(None); // recomputed by RoPE::new (theta 10000)
+    }
+    if let Some(rest) = s.strip_prefix("dit.blk.") {
+        let (n, w) = rest
+            .split_once('.')
+            .ok_or_else(|| anyhow!("flow gguf: bad block tensor name `{name}`"))?;
+        let pt_w = match w {
+            "adaln.w" => "attn_norm.linear.weight",
+            "adaln.b" => "attn_norm.linear.bias",
+            "attn.q.w" => "attn.to_q.weight",
+            "attn.q.b" => "attn.to_q.bias",
+            "attn.k.w" => "attn.to_k.weight",
+            "attn.k.b" => "attn.to_k.bias",
+            "attn.v.w" => "attn.to_v.weight",
+            "attn.v.b" => "attn.to_v.bias",
+            "attn.o.w" => "attn.to_out.0.weight",
+            "attn.o.b" => "attn.to_out.0.bias",
+            "ffn.l1.w" => "ff.ff.0.0.weight",
+            "ffn.l1.b" => "ff.ff.0.0.bias",
+            "ffn.l2.w" => "ff.ff.2.weight",
+            "ffn.l2.b" => "ff.ff.2.bias",
+            _ => return Err(anyhow!("flow gguf: unmapped block tensor `{name}`")),
+        };
+        return Ok(Some(format!(
+            "decoder.estimator.transformer_blocks.{n}.{pt_w}"
+        )));
+    }
+    Err(anyhow!("flow gguf: unmapped tensor `{name}`"))
+}
+
+/// Read `cosyvoice3-flow-q8_0.gguf`, dequantize every tensor to F16 and key
+/// the map by the flow.pt module names (`from_vb` consumes that tree).
+fn load_flow_gguf(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
+    let mut reader = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let ct = gguf_file::Content::read(&mut reader)
+        .with_context(|| format!("parse gguf header {}", path.display()))?;
+    let mut tensors = HashMap::with_capacity(ct.tensor_infos.len());
+    for name in ct.tensor_infos.keys() {
+        let Some(pt_name) = flow_gguf_to_pt_name(name)? else {
+            continue;
+        };
+        let t = ct
+            .tensor(&mut reader, name, device)
+            .with_context(|| format!("gguf tensor `{name}`"))?
+            .dequantize(device)?
+            .to_dtype(DType::F16)?;
+        tensors.insert(pt_name, t);
+    }
+    if !tensors.contains_key("decoder.estimator.proj_out.weight") {
+        bail!(
+            "cosyvoice3 flow: {} does not look like a flow GGUF (missing decoder.estimator.*)",
+            path.display()
+        );
+    }
+    Ok(tensors)
+}
+
 impl CosyVoice3Flow {
-    /// Load `flow.pt` (upstream PyTorch pickle) from `dir`.
+    /// Load the flow weights from `dir`: the Q8_0 GGUF (dequantized to F16)
+    /// when present, else the upstream `flow.pt` pickle (F32).
     pub fn load(dir: impl AsRef<Path>, device: &Device) -> Result<Self> {
-        let path = dir.as_ref().join("flow.pt");
+        let dir = dir.as_ref();
+        let gguf_path = dir.join("cosyvoice3-flow-q8_0.gguf");
+        if gguf_path.exists() {
+            let tensors = load_flow_gguf(&gguf_path, device)?;
+            let vb = VarBuilder::from_tensors(tensors, DType::F16, device);
+            return Self::from_vb(vb, device, DType::F16);
+        }
+
+        let path = dir.join("flow.pt");
         if !path.exists() {
             bail!("cosyvoice3 flow: {} not found", path.display());
         }
@@ -235,7 +378,12 @@ impl CosyVoice3Flow {
             );
         }
         let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+        Self::from_vb(vb, device, DType::F32)
+    }
 
+    /// Build the module tree from a VarBuilder over the flow.pt name space
+    /// (the GGUF path remaps its keys to the same tree, F16-dequantized).
+    fn from_vb(vb: VarBuilder, device: &Device, dtype: DType) -> Result<Self> {
         let no_pad = Conv1dConfig {
             padding: 0,
             stride: 1,
@@ -254,6 +402,7 @@ impl CosyVoice3Flow {
         }
         Ok(Self {
             device: device.clone(),
+            dtype,
             input_embd: vb
                 .pp("input_embedding")
                 .get((SPEECH_CODEBOOK, MEL_DIM), "weight")?,
@@ -293,8 +442,8 @@ impl CosyVoice3Flow {
             norm_out: linear(DIT_DIM, 2 * DIT_DIM, est.pp("norm_out.linear"))?,
             proj_out: linear(DIT_DIM, MEL_DIM, est.pp("proj_out"))?,
             rope: RoPE::new(DIT_HEAD_DIM, ROPE_THETA, device)?,
-            ln_ones: Tensor::ones(DIT_DIM, DType::F32, device)?,
-            ln_zeros: Tensor::zeros(DIT_DIM, DType::F32, device)?,
+            ln_ones: Tensor::ones(DIT_DIM, dtype, device)?,
+            ln_zeros: Tensor::zeros(DIT_DIM, dtype, device)?,
         })
     }
 
@@ -339,7 +488,8 @@ impl CosyVoice3Flow {
         // F.normalize: x / max(||x||_2, 1e-12); the scalar sync is once per call.
         let norm = spk.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt().max(1e-12);
         let spk = (spk / norm as f64)?;
-        Ok(self.spk_affine.forward(&spk.unsqueeze(0)?)?) // (1, mel)
+        let spk = spk.to_dtype(self.dtype)?.unsqueeze(0)?;
+        Ok(self.spk_affine.forward(&spk)?) // (1, mel)
     }
 
     /// DiT estimator velocity prediction. x/mu/cond: (T_mel, mel);
@@ -356,7 +506,7 @@ impl CosyVoice3Flow {
     ) -> Result<Tensor> {
         let t_mel = x.dim(0)?;
         // TimestepEmbedding: sinusoidal -> Linear -> SiLU -> Linear.
-        let sin_emb = sinusoidal_time_emb(t, &self.device)?;
+        let sin_emb = sinusoidal_time_emb(t, &self.device)?.to_dtype(self.dtype)?;
         let t_emb = self
             .time_mlp_2
             .forward(&ops::silu(&self.time_mlp_0.forward(&sin_emb)?)?)?; // (1, dim)
@@ -389,6 +539,10 @@ impl CosyVoice3Flow {
 
     /// Cosine-schedule Euler ODE with classifier-free guidance.
     /// Runs the estimator twice per step (cond / uncond) — see module header.
+    /// Interval-CFG (env `CV3_CFG_INTERVAL=K`, 0/absent = off): the uncond
+    /// branch is recomputed only on the first/last/every-K-th step and cached
+    /// in between (CrispASR's `CRISPASR_COSYVOICE3_CFG_INTERVAL` semantics) —
+    /// near-lossless, cuts most of the uncond cost.
     fn solve_euler(
         &self,
         mu: &Tensor,
@@ -401,21 +555,37 @@ impl CosyVoice3Flow {
         let (t_mel, _) = mu.dims2()?;
         let t_span = cosine_t_span(n_steps);
         let noise = seeded_randn(t_mel * MEL_DIM, seed, &self.device)?;
-        let mut x = Tensor::from_vec(noise, (t_mel, MEL_DIM), &self.device)?;
+        let mut x =
+            Tensor::from_vec(noise, (t_mel, MEL_DIM), &self.device)?.to_dtype(self.dtype)?;
         let (cos, sin) = self
             .rope
             .forward_repeat_interleave(0, t_mel, &self.device)?;
-        let zeros_mel = Tensor::zeros((t_mel, MEL_DIM), DType::F32, &self.device)?;
-        let zeros_spk = Tensor::zeros((1, MEL_DIM), DType::F32, &self.device)?;
+        let cos = cos.to_dtype(self.dtype)?;
+        let sin = sin.to_dtype(self.dtype)?;
+        let zeros_mel = Tensor::zeros((t_mel, MEL_DIM), self.dtype, &self.device)?;
+        let zeros_spk = Tensor::zeros((1, MEL_DIM), self.dtype, &self.device)?;
+        let cfg_interval: usize = std::env::var("CV3_CFG_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
 
+        let mut cached_unc: Option<Tensor> = None;
         let mut t = t_span[0];
         let mut dt = t_span[1] - t_span[0];
         for step in 1..=n_steps {
             let dphi_cond = self.estimator_forward(&x, mu, spk_proj, cond, t, &cos, &sin)?;
             let dphi = if cfg_rate != 0.0 {
-                // Uncond branch: mu / spks / cond all zeroed.
-                let dphi_unc =
-                    self.estimator_forward(&x, &zeros_mel, &zeros_spk, &zeros_mel, t, &cos, &sin)?;
+                // Uncond branch: mu / spks / cond all zeroed. With interval-CFG,
+                // reuse the cached dphi from a nearby step (approximation).
+                let recompute = cached_unc.is_none()
+                    || step == n_steps
+                    || (cfg_interval > 0 && step % cfg_interval == 0);
+                if recompute {
+                    cached_unc = Some(self.estimator_forward(
+                        &x, &zeros_mel, &zeros_spk, &zeros_mel, t, &cos, &sin,
+                    )?);
+                }
+                let dphi_unc = cached_unc.as_ref().unwrap();
                 ((dphi_cond * (1.0 + cfg_rate))? - (dphi_unc * cfg_rate)?)?
             } else {
                 dphi_cond
@@ -453,7 +623,7 @@ impl CosyVoice3Flow {
         let spk_proj = self.spk_project(spk_emb)?; // (1, mel)
 
         // cond: ref_mel in the first T_ref frames, zeros after.
-        let ref_mel = ref_mel.to_device(&self.device)?.to_dtype(DType::F32)?;
+        let ref_mel = ref_mel.to_device(&self.device)?.to_dtype(self.dtype)?;
         let (t_ref, mel) = ref_mel.dims2()?;
         if mel != MEL_DIM {
             bail!("cosyvoice3 flow: ref_mel dim {mel} != {MEL_DIM}");
@@ -467,7 +637,7 @@ impl CosyVoice3Flow {
             Tensor::cat(
                 &[
                     &ref_mel,
-                    &Tensor::zeros((t_mel - t_ref, MEL_DIM), DType::F32, &self.device)?,
+                    &Tensor::zeros((t_mel - t_ref, MEL_DIM), self.dtype, &self.device)?,
                 ],
                 0,
             )?
@@ -563,9 +733,16 @@ mod tests {
             mel.dims2().unwrap(),
             (tokens.len() * TOKEN_MEL_RATIO, MEL_DIM)
         );
-        assert!(mel.dtype() == DType::F32);
+        // F32 on the flow.pt path, F16 on the GGUF path.
+        assert!(matches!(mel.dtype(), DType::F32 | DType::F16));
         // Output must be finite (no NaN/Inf blow-ups in the ODE).
-        let flat = mel.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let flat = mel
+            .flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         assert!(flat.iter().all(|v| v.is_finite()));
         eprintln!(
             "smoke mel: {:?} absmax {:.3}",

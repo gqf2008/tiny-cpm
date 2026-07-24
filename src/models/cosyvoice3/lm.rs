@@ -12,6 +12,11 @@
 //! `llm_decoder.weight`); the `llm.model.` prefix is stripped so the backbone
 //! names line up with the `crate::models::qwen2` module tree. Runs F32 (the
 //! Python reference also runs `.float()`).
+//!
+//! When `cosyvoice3-llm-q4_k.gguf` exists in the model dir it takes
+//! precedence: the Qwen2 backbone runs QMatMul (see `quantized_lm.rs`), with
+//! F32 activations as on the unquantized path, so generation semantics
+//! (RAS sampler, KV-cached AR loop) are unchanged.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -23,6 +28,35 @@ use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 use crate::models::qwen2::{Qwen2Config, Qwen2Decoder};
 use crate::utils::tensor_utils::prepare_causal_attention_mask;
+
+use super::quantized_lm;
+
+/// Backbone dispatch: verbatim aha Qwen2 port (F32, from llm.pt) or the
+/// QMatMul mirror (GGUF Q4_K, same forward semantics).
+enum Qwen2Backbone {
+    Full(Qwen2Decoder),
+    Quant(quantized_lm::QuantizedQwen2Decoder),
+}
+
+impl Qwen2Backbone {
+    fn forward(
+        &mut self,
+        xs: &Tensor,
+        attention_mask: Option<&Tensor>,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Full(d) => d.forward(xs, attention_mask, seqlen_offset),
+            Self::Quant(d) => d.forward(xs, attention_mask, seqlen_offset),
+        }
+    }
+    fn clear_kv_cache(&mut self) {
+        match self {
+            Self::Full(d) => d.clear_kv_cache(),
+            Self::Quant(d) => d.clear_kv_cache(),
+        }
+    }
+}
 
 /// Speech codebook size. Ids in [SPEECH_CODEBOOK, speech_vocab) are specials
 /// (sos/eos/task_id/fill/...); sampling any of them ends decoding.
@@ -41,7 +75,7 @@ const RAS_TAU_R: f32 = 0.1;
 pub struct CosyVoice3LM {
     cfg: Qwen2Config,
     token_embedding: Embedding,
-    decoder: Qwen2Decoder,
+    decoder: Qwen2Backbone,
     speech_embedding: Embedding,
     speech_lm_head: Linear,
     speech_vocab: usize,
@@ -60,6 +94,22 @@ impl CosyVoice3LM {
                 .with_context(|| format!("parse {}", cfg_path.display()))?,
             Err(_) => default_qwen2_config(),
         };
+
+        // Prefer the quantized GGUF (QMatMul Q4_K) when present; fall back to
+        // the original F32 llm.pt pickle otherwise.
+        let gguf_path = dir.join("cosyvoice3-llm-q4_k.gguf");
+        if gguf_path.exists() {
+            let w = quantized_lm::load_gguf(&gguf_path, &cfg, device)?;
+            return Ok(Self {
+                cfg,
+                token_embedding: w.token_embedding,
+                decoder: Qwen2Backbone::Quant(w.decoder),
+                speech_embedding: w.speech_embedding,
+                speech_lm_head: w.speech_lm_head,
+                speech_vocab: w.speech_vocab,
+                device: device.clone(),
+            });
+        }
 
         let pt_path = dir.join("llm.pt");
         let named = match read_all_with_key(&pt_path, Some("state_dict")) {
@@ -101,7 +151,7 @@ impl CosyVoice3LM {
         Ok(Self {
             cfg,
             token_embedding,
-            decoder,
+            decoder: Qwen2Backbone::Full(decoder),
             speech_embedding,
             speech_lm_head,
             speech_vocab,

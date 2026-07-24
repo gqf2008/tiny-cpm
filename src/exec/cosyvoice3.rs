@@ -23,7 +23,9 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut voice_name = "zero_shot".to_string();
     let mut ref_wav: Option<String> = None;
     let mut ref_text: Option<String> = None;
-    let mut steps: usize = 6; // CrispASR audible-synthesis default (parity with upstream 10)
+    let mut steps: usize = 4; // 4 Euler steps: ~30% faster than the reference
+    // default of 6 with ASR-verified quality parity
+    // (use --steps 6 for the reference default)
     let mut max_tokens: usize = 0; // 0 -> 20 * n_text_ids, min 16
     let mut i = 0;
     while i < args.len() {

@@ -11,4 +11,5 @@ pub mod flow;
 pub mod hift;
 pub mod lm;
 pub mod pipeline;
+pub mod quantized_lm;
 pub mod s3tok;

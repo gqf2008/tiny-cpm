@@ -439,10 +439,10 @@ impl CosyVoice3Pipeline {
         let dir = dir.as_ref();
         let t0 = Instant::now();
         let lm = CosyVoice3LM::load(dir, device)?;
-        eprintln!("cosyvoice3: llm.pt loaded in {:.2?}", t0.elapsed());
+        eprintln!("cosyvoice3: llm loaded in {:.2?}", t0.elapsed());
         let t0 = Instant::now();
         let flow = CosyVoice3Flow::load(dir, device)?;
-        eprintln!("cosyvoice3: flow.pt loaded in {:.2?}", t0.elapsed());
+        eprintln!("cosyvoice3: flow loaded in {:.2?}", t0.elapsed());
         let t0 = Instant::now();
         let hift = Hift::load(dir, device)?;
         eprintln!("cosyvoice3: hift.pt loaded in {:.2?}", t0.elapsed());
