@@ -1,4 +1,5 @@
 pub mod chat;
+pub mod cosyvoice3;
 pub mod dialogue;
 pub mod fun_asr_nano;
 pub mod live;

@@ -3,7 +3,7 @@
 //! Subcommands:
 //!   chat   MiniCPM5-1B GGUF/bf16 text generation (original tiny-cpm path)
 //!   asr    Fun-ASR-Nano / Qwen3-ASR speech recognition
-//!   tts    VoxCPM2 / MOSS-TTS-Nano speech synthesis
+//!   tts    VoxCPM2 / MOSS-TTS-Nano / CosyVoice3 speech synthesis
 //!   vad    FireRedVAD voice activity detection
 //!   dialogue  Fun-ASR -> MiniCPM5 -> MOSS-TTS voice-dialogue pipeline
 //!   live   realtime voice dialogue: mic -> VAD -> Qwen3-ASR -> MiniCPM5 -> MOSS-TTS -> speaker
@@ -12,6 +12,7 @@
 //!     tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens]
 //!     tiny-cpm asr <funasr|qwen3> <model-dir> <audio-file> [max_tokens]
 //!     tiny-cpm tts <voxcpm|moss> <model-dir> "<text>" <out.wav> [--codec <codec-dir>] [--ref <ref.wav>] [--max-len N]
+//!     tiny-cpm tts cosyvoice3 <model-dir> "<text>" <out.wav> [--voice <name>] [--ref <ref.wav> --ref-text "<text>"] [--steps N] [--max-tokens N]
 //!     tiny-cpm vad <model-dir> <audio-file>
 //!     tiny-cpm dialogue <funasr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
 //!     tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N]
@@ -45,8 +46,9 @@ fn main() -> Result<()> {
         "tts" => match rest.first().map(String::as_str) {
             Some("voxcpm") => exec::voxcpm::run(&rest[1..]),
             Some("moss") => exec::moss_tts::run(&rest[1..]),
+            Some("cosyvoice3") => exec::cosyvoice3::run(&rest[1..]),
             _ => bail!(
-                "usage: tiny-cpm tts <voxcpm|moss> <model-dir> \"<text>\" <out.wav> [--codec <codec-dir>] [--ref <ref.wav>] [--max-len N]"
+                "usage: tiny-cpm tts <voxcpm|moss> <model-dir> \"<text>\" <out.wav> [--codec <codec-dir>] [--ref <ref.wav>] [--max-len N]\n       tiny-cpm tts cosyvoice3 <model-dir> \"<text>\" <out.wav> [--voice <name>] [--ref <ref.wav> --ref-text \"<text>\"] [--steps N] [--max-tokens N]"
             ),
         },
         "vad" => exec::vad::run(rest),
@@ -64,6 +66,9 @@ fn usage() {
     eprintln!("  tiny-cpm asr <funasr|qwen3> <model-dir> <audio-file> [max_tokens]");
     eprintln!(
         "  tiny-cpm tts <voxcpm|moss> <model-dir> \"<text>\" <out.wav> [--codec <codec-dir>] [--ref <ref.wav>] [--max-len N]"
+    );
+    eprintln!(
+        "  tiny-cpm tts cosyvoice3 <model-dir> \"<text>\" <out.wav> [--voice <name>] [--ref <ref.wav> --ref-text \"<text>\"] [--steps N] [--max-tokens N]"
     );
     eprintln!("  tiny-cpm vad <model-dir> <audio-file>");
     eprintln!(
