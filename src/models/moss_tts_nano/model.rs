@@ -24,6 +24,27 @@ pub enum MossTTSMode {
     VoiceClone,
 }
 
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_f32(key: &str, default: f32) -> f32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
 /// Timing stats from `MossTTSModel::generate`.
 pub struct MossGenStats {
     /// Codec frames actually generated (stops early on the end token).
@@ -149,10 +170,15 @@ impl MossTTSModel {
             n_vq: cfg.n_vq,
             audio_pad_token_id_tensor,
             audio_codebook_sizes: cfg.audio_codebook_sizes.clone(),
-            audio_temperature: 0.8,
-            audio_top_k: 25,
-            audio_top_p: 0.95,
-            audio_repetition_penalty: 1.2,
+            // Sampling defaults: the official Python library generate() defaults
+            // (1.7/0.8/25/1.0, same as audio.cpp) — A/B listening tests preferred
+            // them over the official infer.py CLI set (0.8/0.95/25/1.2 via aha).
+            // Override via MOSS_TEMPERATURE / MOSS_TOP_P / MOSS_TOP_K /
+            // MOSS_REP_PENALTY.
+            audio_temperature: env_f64("MOSS_TEMPERATURE", 1.7),
+            audio_top_k: env_usize("MOSS_TOP_K", 25),
+            audio_top_p: env_f32("MOSS_TOP_P", 0.8),
+            audio_repetition_penalty: env_f32("MOSS_REP_PENALTY", 1.0),
             // audio_processor,
         })
     }
