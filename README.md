@@ -11,9 +11,10 @@ A single-binary Rust CLI built on the official [`candle`](https://github.com/hug
 | `asr qwen3` | [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) / 1.7B | speech recognition | safetensors (bf16) |
 | `tts voxcpm` | [VoxCPM2](https://huggingface.co/OpenBMB/VoxCPM2) | TTS + voice cloning | safetensors (bf16) + `.pth` AudioVAE |
 | `tts moss` | [MOSS-TTS-Nano](https://modelscope.cn/models/openmoss/MOSS-TTS-Nano) + [MOSS-Audio-Tokenizer-Nano](https://modelscope.cn/models/openmoss/MOSS-Audio-Tokenizer-Nano) | TTS + voice cloning | `.bin` pickles + sentencepiece; codec: safetensors |
+| `tts cosyvoice3` | [Fun-CosyVoice3-0.5B-2512](https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512) | TTS (9 languages + 18 zh dialects) + zero-shot cloning | `.pt` pickles (llm/flow/hift) + GGUF (voices/s3tok/campplus) |
 | `vad` | [FireRedVAD-Stream-VAD](https://modelscope.cn/models/jiangjiangaha/FireRedVAD-Stream-VAD) | voice activity detection | safetensors + `cmvn.json` (torch `.pth.tar` checkpoints are rejected) |
 
-The four speech models are ported from [`aha`](https://github.com/jhqxxx/aha) (candle 0.9.2 → 0.11, server framework stripped, Metal-only). MiniCPM5 chat uses a vendored, minimally patched `quantized_minicpm5` module (see below).
+The four speech models are ported from [`aha`](https://github.com/jhqxxx/aha) (candle 0.9.2 → 0.11, server framework stripped, Metal-only). CosyVoice3 is ported from [CrispASR](https://github.com/CrispStrobe/CrispASR)'s C++/ggml implementation. MiniCPM5 chat uses a vendored, minimally patched `quantized_minicpm5` module (see below).
 
 A fifth subcommand, `dialogue`, chains three models in one process (all loaded once, kept resident): Fun-ASR-Nano transcribes an input WAV → MiniCPM5 replies → MOSS-TTS speaks the reply, with a per-stage latency summary on stderr.
 
@@ -51,6 +52,7 @@ cargo run --release -- asr qwen3 ./models/Qwen3-ASR-0.6B ./audio.wav
 # TTS — writes a WAV file; --ref clones the voice from a reference clip
 cargo run --release -- tts voxcpm ./models/VoxCPM2 "你好，世界。" out.wav [--ref ref.wav] [--max-len N]
 cargo run --release -- tts moss ./models/MOSS-TTS-Nano "你好，世界。" out.wav [--codec ./models/MOSS-Audio-Tokenizer-Nano] [--ref ref.wav] [--max-len N]
+cargo run --release -- tts cosyvoice3 ./models/Fun-CosyVoice3-0.5B-2512 "你好，世界。" out.wav [--voice zero_shot] [--ref ref.wav --ref-text "参考音频文本"] [--steps 6]
 ```
 
 Full CLI contract (parsed in `src/main.rs`):
@@ -59,6 +61,7 @@ Full CLI contract (parsed in `src/main.rs`):
 tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens]
 tiny-cpm asr <funasr|qwen3> <model-dir> <audio-file> [max_tokens]
 tiny-cpm tts <voxcpm|moss> <model-dir> "<text>" <out.wav> [--codec <codec-dir>] [--ref <ref.wav>] [--max-len N]
+tiny-cpm tts cosyvoice3 <model-dir> "<text>" <out.wav> [--voice <name>] [--ref <ref.wav> --ref-text "<text>"] [--steps N] [--max-tokens N]
 tiny-cpm dialogue <funasr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
 tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N]
 tiny-cpm vad <model-dir> <audio-file>
