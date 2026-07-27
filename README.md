@@ -65,9 +65,12 @@ tiny-cpm tts cosyvoice3 <model-dir> "<text>" <out.wav> [--voice <name>] [--ref <
 tiny-cpm dialogue <funasr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
 tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N]
 tiny-cpm vad <model-dir> <audio-file>
+tiny-cpm codec-rt <model-dir> <in.wav> <out.wav> [--codec <codec-dir>]   # MOSS codec encode→decode round-trip (diagnostic)
 ```
 
 cosyvoice3 `--stream`: chunked streaming synthesis — first audio ~1.1 s warm (first chunk: hop 12, 3 steps, no CFG by default, upstream hop schedule afterwards; env knobs CV3_FIRST_HOP/CV3_FIRST_STEPS/CV3_FIRST_CFG; chunks are buffered and one WAV is written for now).
+
+MOSS `--ref` voice cloning: the codec encode (encoder + RVQ) runs on **CPU + f32**, not Metal — Metal f32 drifted on reference audio longer than ~16 s (async-kernel races in the projected-transformer attention + RVQ residual accumulation), producing garbage conditioning codes; a 22 s ref round-trips to noise on Metal but clean on CPU. The decoder stays on Metal (it only decodes short generated sequences). `codec-rt` round-trips a WAV through encode→decode to verify the codec reproduces the input.
 
 Output contract: the payload (chat text / transcript) goes to **stdout**; all diagnostics (load time, TTFT, tok/s) go to **stderr**. TTS writes its WAV to the given path. Keep it that way — stdout is what consumers may pipe.
 
