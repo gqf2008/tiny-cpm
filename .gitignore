@@ -30,3 +30,7 @@ target
 
 # Local dialogue test artifacts
 /dialogue_io
+
+# Local reference audio (voice-clone inputs, not committed)
+*.wav
+!models/**/*.wav
