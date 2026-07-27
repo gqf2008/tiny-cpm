@@ -146,6 +146,7 @@ fn synth_and_play(
     n: usize,
     text: &str,
     barge: Option<&AtomicBool>,
+    ref_codes: Option<&Tensor>,
 ) {
     let mut on_chunk = |pcm: Vec<f32>| -> bool {
         if let Some(b) = barge
@@ -162,7 +163,13 @@ fn synth_and_play(
         }
         true
     };
-    match tts.synthesize_pcm_stream(text, MOSS_MAX_FRAMES, TTS_CHUNK_FRAMES, &mut on_chunk) {
+    match tts.synthesize_pcm_stream_with_codes(
+        text,
+        MOSS_MAX_FRAMES,
+        TTS_CHUNK_FRAMES,
+        ref_codes,
+        &mut on_chunk,
+    ) {
         Ok(stats) => eprintln!(
             "tts[{n}]: {} frames in {:.2}s (ttft {:.2}s){}",
             stats.frames,
@@ -179,7 +186,7 @@ fn synth_and_play(
 }
 
 pub fn run(args: &[String]) -> Result<()> {
-    let usage = "usage: tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in]";
+    let usage = "usage: tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in] [--ref <wav>]";
     if args.len() < 6 {
         bail!(usage);
     }
@@ -193,6 +200,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut output_wav: Option<String> = None;
     let mut max_tokens = DEFAULT_MAX_TOKENS;
     let mut barge_in = false;
+    let mut ref_wav: Option<String> = None;
     let mut i = 6;
     while i < args.len() {
         match args[i].as_str() {
@@ -221,6 +229,14 @@ pub fn run(args: &[String]) -> Result<()> {
                     .map_err(|_| anyhow!("--max-tokens must be a positive integer. {usage}"))?;
             }
             "--barge-in" => barge_in = true,
+            "--ref" => {
+                i += 1;
+                ref_wav = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--ref requires a wav path. {usage}"))?
+                        .clone(),
+                );
+            }
             other => bail!("unknown option {other}. {usage}"),
         }
         i += 1;
@@ -258,6 +274,23 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut tts = MossEngine::load(moss_dir, codec_dir, &device)?;
     eprintln!("loaded MOSS-TTS in {:.2}s", t.elapsed().as_secs_f64());
     let tts_sr = tts.sample_rate();
+
+    // --- reference voice (optional): encode the ref once and reuse the codes
+    // for every reply sentence, so cloning doesn't re-encode a long ref per
+    // sentence (a 22 s ref is ~4 s of CPU codec encode each). ---
+    let ref_codes = if let Some(ref_path) = &ref_wav {
+        let t = Instant::now();
+        let codes = tts.encode_ref(ref_path)?;
+        eprintln!(
+            "encoded voice ref {} ({} frames) in {:.2}s",
+            ref_path,
+            codes.dim(0)?,
+            t.elapsed().as_secs_f64()
+        );
+        Some(codes)
+    } else {
+        None
+    };
 
     // --- frame source + audio sink ---
     // In barge-in mode the mic is created on the listener thread (cpal's
@@ -425,6 +458,7 @@ pub fn run(args: &[String]) -> Result<()> {
                         n_sentences,
                         &sentence,
                         Some(&barge),
+                        ref_codes.as_ref(),
                     );
                 }
             };
@@ -466,6 +500,7 @@ pub fn run(args: &[String]) -> Result<()> {
                     n_sentences,
                     &rest,
                     Some(&barge),
+                    ref_codes.as_ref(),
                 );
             }
             if n_sentences == 0 {
@@ -598,6 +633,7 @@ pub fn run(args: &[String]) -> Result<()> {
                     n_sentences,
                     &sentence,
                     None,
+                    ref_codes.as_ref(),
                 );
             }
         };
@@ -640,6 +676,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 n_sentences,
                 &rest,
                 None,
+                ref_codes.as_ref(),
             );
         }
         if n_sentences == 0 {

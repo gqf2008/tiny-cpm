@@ -117,6 +117,24 @@ impl MossTTSProcessor {
         } else {
             None
         };
+        self.build_inference_input_ids_from_codes(text, audio_code.as_ref(), prompt_text, mode, text_tokenizer, device)
+    }
+
+    /// Same as [`build_inference_input_ids`](Self::build_inference_input_ids)
+    /// but takes the reference audio already encoded to discrete codec codes
+    /// (`audio_code`) instead of a wav path. Callers that synthesize many
+    /// sentences against the same reference (e.g. `live`) encode once and pass
+    /// the cached codes here per sentence to avoid re-encoding (a 22 s ref is
+    /// ~4 s of CPU codec encode per call).
+    pub fn build_inference_input_ids_from_codes(
+        &self,
+        text: &str,
+        audio_code: Option<&Tensor>,
+        prompt_text: Option<&str>,
+        mode: MossTTSMode,
+        text_tokenizer: &SentencePieceProcessor,
+        device: &Device,
+    ) -> Result<Tensor> {
         let text = &prepare_tts_text(text)?;
         let prompt_text = if let Some(prompt_text) = prompt_text {
             Some(prepare_tts_text(prompt_text)?)
@@ -125,7 +143,7 @@ impl MossTTSProcessor {
         };
         // TODO: 长文本段切分
         if mode == MossTTSMode::VoiceClone
-            && let Some(prompt_audio_codes) = &audio_code
+            && let Some(prompt_audio_codes) = audio_code
         {
             let mut prompt_token_ids = vec![];
             prompt_token_ids.extend_from_slice(&self.prompt_token_ids);
@@ -173,7 +191,7 @@ impl MossTTSProcessor {
             prompt_ids.push(self.audio_start_token_id);
             let mut input_ids =
                 Self::build_text_raw(&prompt_ids, self.audio_pad_token_id, self.n_vq, device)?;
-            if let Some(prompt_audio_codes) = &audio_code {
+            if let Some(prompt_audio_codes) = audio_code {
                 let audio_prefix_rows = Self::build_audio_prefix_rows(
                     prompt_audio_codes,
                     self.audio_assistant_slot_token_id,

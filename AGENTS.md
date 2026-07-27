@@ -14,7 +14,7 @@ Guidance for AI coding agents working on this repository. Assumes no prior knowl
 - `tts moss` — MOSS-TTS-Nano (GPT-2-style codec-LM; `.bin` pickles + sentencepiece) + MOSS-Audio-Tokenizer-Nano codec (safetensors). Voice cloning via `--ref`.
 - `dialogue` — one-process voice pipeline: Fun-ASR-Nano transcribes an input WAV → MiniCPM5 replies → MOSS-TTS speaks the reply; per-stage latency summary on stderr. Diagnostic env probes: `DIALOGUE_PROBE=1` (MOSS steady-state ms/frame after each stage), `DIALOGUE_PROBE_ONLY=1` + `PROBE_NO_FUNASR`/`PROBE_NO_LLM` (residency isolation).
 - `vad` — FireRedVAD-Stream-VAD speech-segment detection (safetensors + `cmvn.json`; torch `.pth.tar` checkpoints rejected). stdout prints one `start end` (seconds) per segment; the streaming `detect_frame*` API is ported and ready for a realtime loop.
-- `live` — realtime voice dialogue: mic (cpal/CoreAudio) → FireRedVAD endpointing → Qwen3-ASR → MiniCPM5 (sentence-streamed) → MOSS-TTS per sentence → speaker. `--input <wav>`/`--output <wav>` give a simulation mode for testing without a mic. Default half-duplex (ducking). `--barge-in` keeps the mic live during playback and cancels the in-flight reply on speech onset (headphones required — no AEC; env knobs `LIVE_BARGE_RMS`/`LIVE_BARGE_ONSET_FRAMES`).
+- `live` — realtime voice dialogue: mic (cpal/CoreAudio) → FireRedVAD endpointing → Qwen3-ASR → MiniCPM5 (sentence-streamed) → MOSS-TTS per sentence → speaker. `--input <wav>`/`--output <wav>` give a simulation mode for testing without a mic. `--ref <wav>` clones a voice (ref encoded once, reused per sentence). Default half-duplex (ducking). `--barge-in` keeps the mic live during playback and cancels the in-flight reply on speech onset (headphones required — no AEC; env knobs `LIVE_BARGE_RMS`/`LIVE_BARGE_ONSET_FRAMES`).
 
 The four speech models are **ported from [`aha`](https://github.com/jhqxxx/aha)** (candle 0.9.2 → 0.11; rocket server / tokio / modelscope / minijinja coupling stripped; Metal-only). Ported files carry a `//! Ported from aha …` header and keep aha's names/signatures so future aha updates can be re-ported mechanically.
 
@@ -45,7 +45,7 @@ cargo run --release -- tts voxcpm <model-dir> "<text>" <out.wav> [--ref ref.wav]
 cargo run --release -- tts moss   <model-dir> "<text>" <out.wav> [--codec dir] [--ref ref.wav] [--max-len N]
 cargo run --release -- tts cosyvoice3 <model-dir> "<text>" <out.wav> [--voice name] [--ref ref.wav --ref-text "<text>"] [--steps 6] [--stream]
 cargo run --release -- dialogue <funasr-dir> <minicpm5.gguf|bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
-cargo run --release -- live <vad-dir> <qwen3asr-dir> <minicpm5.gguf|bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N]
+cargo run --release -- live <vad-dir> <qwen3asr-dir> <minicpm5.gguf|bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N] [--ref <wav>]
 cargo run --release -- vad <model-dir> <audio-file>
 
 cargo build --release

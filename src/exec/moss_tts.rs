@@ -16,7 +16,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
-use candle_core::{DType, Device, pickle::read_all_with_key};
+use candle_core::{DType, Device, Tensor, pickle::read_all_with_key};
 use candle_nn::VarBuilder;
 use sentencepiece::SentencePieceProcessor;
 
@@ -271,11 +271,57 @@ impl MossEngine {
         Ok((pcm, stats))
     }
 
-    /// Streaming variant of `synthesize_pcm`: every `chunk_frames` codec
-    /// frames, `on_chunk` receives the newly synthesized audio (interleaved
-    /// stereo f32, un-normalized — the global peak isn't known until the end).
-    /// Playback can start after the first chunk instead of the full sentence.
-    /// Each chunk costs one codec prefix re-decode (exact — codec is causal).
+    /// Encode a reference clip to discrete codec codes once, for reuse across
+    /// many `synthesize_pcm_stream_with_codes` calls (e.g. `live` clones the
+    /// same voice for every reply sentence; re-encoding a 22 s ref is ~4 s/CPU
+    /// each). Returns the codes tensor (device-side).
+    pub fn encode_ref(&self, ref_wav: &str) -> Result<Tensor> {
+        let audio = crate::utils::audio_utils::load_audio_with_resample(
+            ref_wav,
+            &self.device,
+            Some(self.audio_tokenizer.sampling_rate),
+            Some(self.audio_tokenizer.number_channels),
+        )?;
+        self.audio_tokenizer.encode_one(&audio)
+    }
+
+    /// Streaming synthesis (`synthesize_pcm_stream`) variant that takes the
+    /// reference as **pre-encoded codec codes** (from [`Self::encode_ref`])
+    /// instead of re-encoding per call. VoiceClone when `ref_codes` is Some,
+    /// Continuation (text-only) when None.
+    pub fn synthesize_pcm_stream_with_codes(
+        &mut self,
+        text: &str,
+        max_len: usize,
+        chunk_frames: usize,
+        ref_codes: Option<&Tensor>,
+        on_chunk: &mut dyn FnMut(Vec<f32>) -> bool,
+    ) -> Result<MossGenStats> {
+        let has_ref = ref_codes.is_some();
+        let mode = self
+            .processor
+            .resolved_mode(None, false, has_ref)?;
+        let mode = if has_ref { mode } else { MossTTSMode::Continuation };
+        let input_ids = self.processor.build_inference_input_ids_from_codes(
+            text,
+            ref_codes,
+            None,
+            mode,
+            &self.text_tokenizer,
+            &self.device,
+        )?;
+        let (_, stats) = self.model.generate_waveform(
+            &input_ids,
+            &self.audio_tokenizer,
+            max_len,
+            Some(StreamChunk {
+                chunk_frames,
+                on_chunk,
+            }),
+        )?;
+        Ok(stats)
+    }
+
     pub fn synthesize_pcm_stream(
         &mut self,
         text: &str,
