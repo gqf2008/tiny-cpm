@@ -92,7 +92,14 @@ impl MossEngine {
         let model_list = find_type_files(codec_dir, "safetensors")?;
         let audio_dtype = get_dtype(None, &audio_tokenizer_cfg.dtype);
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_list, audio_dtype, device)? };
-        let audio_tokenizer = MossAudioTokenizer::new(vb, &audio_tokenizer_cfg)?;
+        // CPU + f32 VarBuilder for the codec encode path: the Metal encoder +
+        // RVQ drift on long reference audio (>~16 s, async-kernel races), so the
+        // whole encode (encoder + quantizer) runs on CPU when this is supplied.
+        // The decoder stays on Metal (only decodes short generated sequences).
+        let vb_cpu = unsafe {
+            VarBuilder::from_mmaped_safetensors(&model_list, DType::F32, &Device::Cpu)?
+        };
+        let audio_tokenizer = MossAudioTokenizer::new(vb, Some(vb_cpu), &audio_tokenizer_cfg)?;
 
         // --- text tokenizer (sentencepiece) ---
         let text_tokenizer_path = model_dir.to_string() + "/tokenizer.model";
@@ -141,6 +148,29 @@ impl MossEngine {
     /// Codec output sample rate (MOSS emits stereo at this rate).
     pub fn sample_rate(&self) -> usize {
         self.audio_tokenizer.sampling_rate
+    }
+
+    /// Codec round-trip: encode `in_wav` to discrete codes, then decode those
+    /// codes back to a waveform at the codec rate, writing `out_wav`. Used to
+    /// isolate whether the codec itself reproduces the reference (encode + decode
+    /// path) independent of the TTS LM — if the round-trip transcribes, the codec
+    /// is sound and degenerate clones come from elsewhere.
+    pub fn codec_roundtrip(&self, in_wav: &str, out_wav: &str) -> Result<()> {
+        let sr = self.audio_tokenizer.sampling_rate;
+        let ch = self.audio_tokenizer.number_channels;
+        let wav = crate::utils::audio_utils::load_audio_with_resample(
+            in_wav,
+            &self.device,
+            Some(sr),
+            Some(ch),
+        )?;
+        let codes = self.audio_tokenizer.encode_one(&wav)?;
+        let pcm = self
+            .audio_tokenizer
+            .decode_audio_token_ids_to_waveform(&codes)?;
+        let pcm = pcm.squeeze(0)?;
+        crate::utils::audio_utils::save_wav(&pcm, out_wav, ch, sr as u32)?;
+        Ok(())
     }
 
     /// Synthesize `text` to `out_path` (mirrors aha MossTTSGenerate::generate).
@@ -277,6 +307,55 @@ impl MossEngine {
         )?;
         Ok(stats)
     }
+}
+
+pub fn run_codec_rt(args: &[String]) -> Result<()> {
+    let usage = "usage: tiny-cpm codec-rt <model-dir> <in.wav> <out.wav> [--codec <codec-dir>]";
+    if args.len() < 3 {
+        return Err(anyhow!(usage));
+    }
+    let model_dir = args[0].clone();
+    let in_wav = args[1].clone();
+    let out_wav = args[2].clone();
+    let mut codec_path: Option<String> = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--codec" => {
+                i += 1;
+                codec_path = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--codec requires a directory. {usage}"))?
+                        .clone(),
+                );
+            }
+            other => return Err(anyhow!("unknown option {other}. {usage}")),
+        }
+        i += 1;
+    }
+    let codec_path = match codec_path {
+        Some(p) => p,
+        None => {
+            let default = Path::new(&model_dir).join("..").join("MOSS-Audio-Tokenizer-Nano");
+            if !default.is_dir() {
+                return Err(anyhow!(
+                    "MOSS-Audio-Tokenizer-Nano codec directory not found at {}; pass it explicitly via --codec <codec-dir>",
+                    default.display()
+                ));
+            }
+            default.to_string_lossy().to_string()
+        }
+    };
+    let device = if std::env::var("TINY_CPM_DEVICE").as_deref() == Ok("cpu") {
+        Device::Cpu
+    } else {
+        Device::new_metal(0)?
+    };
+    eprintln!("device: {device:?}");
+    let engine = MossEngine::load(&model_dir, &codec_path, &device)?;
+    engine.codec_roundtrip(&in_wav, &out_wav)?;
+    eprintln!("codec round-trip -> {out_wav}");
+    Ok(())
 }
 
 pub fn run(args: &[String]) -> Result<()> {

@@ -489,6 +489,13 @@ impl MossAudioTokenizerResidualLFQ {
             all_indices.push(indices_i);
             let z_q_i_mask = mask_reshape.where_cond(&z_q_i, &on_false)?;
             residual = residual.sub(&z_q_i_mask)?;
+            // Inter-layer barrier: each RVQ layer's residual update feeds the next
+            // layer's input. On Metal the async kernels can outrun completion, so
+            // layer N+1 reads layer N's residual before its writes retire,
+            // corrupting the deeper codebooks (manifests as out-of-range token ids
+            // on reference audio longer than ~10 s). Force a device sync between
+            // layers. audio.cpp runs its LFQ on CPU and is immune.
+            let _ = residual.to_dtype(candle_core::DType::F32)?.sum_all()?.to_scalar::<f32>()?;
         }
         let all_indices = Tensor::stack(&all_indices, 0)?;
         Ok(all_indices)
@@ -519,23 +526,30 @@ pub struct MossAudioTokenizer {
     pub enable_channel_interleave: bool,
     encoder: Vec<MossAudioTokenizerModule>,
     quantizer: MossAudioTokenizerResidualLFQ,
+    // CPU + f32 mirror of `quantizer`, used on the encode path when the primary
+    // device is Metal. The Metal encoder + RVQ drift on reference audio longer
+    // than ~16 s (async-kernel races in the projected-transformer attention +
+    // RVQ residual accumulation), producing garbage conditioning codes — a 22 s
+    // ref round-trips to noise while an 8 s one round-trips clean. Running the
+    // whole encode path (encoder + RVQ) on CPU — deterministic, no async races
+    // — matches audio.cpp (whose LFQ runs on CPU) and is stable. The decoder
+    // stays on Metal (it only decodes short generated sequences).
+    quantizer_cpu: Option<MossAudioTokenizerResidualLFQ>,
+    // CPU + f32 mirror of the encoder (see `quantizer_cpu`).
+    encoder_cpu: Option<Vec<MossAudioTokenizerModule>>,
     decoder: Vec<MossAudioTokenizerModule>,
 }
 
 impl MossAudioTokenizer {
-    pub fn new(vb: VarBuilder, config: &MossAudioTokenizerConfig) -> Result<Self> {
-        let channel_interleave_factor =
-            if config.enable_channel_interleave && config.number_channels > 1 {
-                config.number_channels
-            } else {
-                1
-            };
-        // Python reference (modeling_moss_audio_tokenizer.py:2369-2385): the
-        // running frame rate starts at sampling_rate * channel_interleave_factor
-        // and is divided by each encoder module's downsample_ratio as the loop
-        // proceeds, so transformer contexts are computed at the module's rate.
-        let mut current_frame_rate = config.sampling_rate as f64 * channel_interleave_factor as f64;
-        let vb_encoder = vb.pp("encoder");
+    /// Build the encoder module stack from `vb`, mirroring the Python reference's
+    /// running frame-rate division so transformer contexts are computed at each
+    /// module's rate. Factored so both the Metal encoder and the CPU + f64 mirror
+    /// (used to avoid Metal f32 drift on long reference audio) can share it.
+    fn build_encoder_modules(
+        vb_encoder: &VarBuilder,
+        config: &MossAudioTokenizerConfig,
+        current_frame_rate: &mut f64,
+    ) -> Result<Vec<MossAudioTokenizerModule>> {
         let mut encoder = vec![];
         for (layer_id, cfg) in config.encoder_kwargs.iter().enumerate() {
             let downsample_ratio = if cfg.module_type == "PatchedPretransform"
@@ -548,7 +562,7 @@ impl MossAudioTokenizer {
                 let context_duration = cfg
                     .context_duration
                     .unwrap_or(config.causal_transformer_context_duration);
-                let context = (current_frame_rate * context_duration).round() as usize;
+                let context = (*current_frame_rate * context_duration).round() as usize;
                 let layer = MossAudioTokenizerProjectedTransformer::new(
                     vb_encoder.pp(layer_id),
                     cfg,
@@ -562,10 +576,47 @@ impl MossAudioTokenizer {
                     cfg.module_type
                 ));
             };
-            current_frame_rate /= downsample_ratio;
+            *current_frame_rate /= downsample_ratio;
         }
+        Ok(encoder)
+    }
+
+    pub fn new(
+        vb: VarBuilder,
+        vb_quantizer_cpu: Option<VarBuilder>,
+        config: &MossAudioTokenizerConfig,
+    ) -> Result<Self> {
+        let channel_interleave_factor =
+            if config.enable_channel_interleave && config.number_channels > 1 {
+                config.number_channels
+            } else {
+                1
+            };
+        // Python reference (modeling_moss_audio_tokenizer.py:2369-2385): the
+        // running frame rate starts at sampling_rate * channel_interleave_factor
+        // and is divided by each encoder module's downsample_ratio as the loop
+        // proceeds, so transformer contexts are computed at the module's rate.
+        let mut current_frame_rate = config.sampling_rate as f64 * channel_interleave_factor as f64;
+        let mut encoder =
+            Self::build_encoder_modules(&vb.pp("encoder"), config, &mut current_frame_rate)?;
         let quantizer =
             MossAudioTokenizerResidualLFQ::new(vb.pp("quantizer"), &config.quantizer_kwargs)?;
+        // CPU + f64 mirror of the quantizer for stable RVQ on long reference
+        // audio (Metal f32 drifts past ~16 s). Only built when an explicit CPU
+        // VarBuilder is supplied (Metal path); the Metal quantizer is still used
+        // when running on CPU or when no CPU vb is provided.
+        let (encoder_cpu, quantizer_cpu) = if let Some(vb_cpu) = vb_quantizer_cpu {
+            let mut cpu_frame_rate =
+                config.sampling_rate as f64 * channel_interleave_factor as f64;
+            let enc_cpu = Self::build_encoder_modules(&vb_cpu.pp("encoder"), config, &mut cpu_frame_rate)?;
+            let q_cpu = MossAudioTokenizerResidualLFQ::new(
+                vb_cpu.pp("quantizer"),
+                &config.quantizer_kwargs,
+            )?;
+            (Some(enc_cpu), Some(q_cpu))
+        } else {
+            (None, None)
+        };
         let vb_decoder = vb.pp("decoder");
         let mut decoder = vec![];
         for (layer_id, cfg) in config.decoder_kwargs.iter().enumerate() {
@@ -606,6 +657,8 @@ impl MossAudioTokenizer {
             enable_channel_interleave: config.enable_channel_interleave,
             encoder,
             quantizer,
+            quantizer_cpu,
+            encoder_cpu,
             decoder,
         })
     }
@@ -635,15 +688,38 @@ impl MossAudioTokenizer {
     }
 
     pub fn batch_encode(&self, input_values: &Tensor, length: &Tensor) -> Result<Vec<Tensor>> {
-        let (mut encoder_hidden_states, mut encoder_hidden_lengths) =
+        let (encoder_hidden_states, encoder_hidden_lengths) =
             self.flatten_channels_for_codec(input_values, length)?;
-        for layer in &self.encoder {
-            (encoder_hidden_states, encoder_hidden_lengths) =
-                layer.forward(&encoder_hidden_states, &encoder_hidden_lengths)?;
-        }
-        let audio_codes = self
-            .quantizer
-            .forward(&encoder_hidden_states, &encoder_hidden_lengths)?;
+        // On Metal, the encoder + RVQ drift in f32 on reference audio longer than
+        // ~16 s (a 22 s ref round-trips to garbage while an 8 s one round-trips
+        // clean). When a CPU + f64 mirror is present, run the whole encode path on
+        // CPU and move only the integer codes back to the primary device. audio.cpp
+        // runs its codec LFQ on CPU (double) and is immune. The decoder stays on
+        // Metal (it only decodes short generated sequences).
+        let (audio_codes, encoder_hidden_lengths) =
+            if let (Some(enc_cpu), Some(qcpu)) = (&self.encoder_cpu, &self.quantizer_cpu) {
+                let device = encoder_hidden_states.device();
+                let mut z = encoder_hidden_states
+                    .to_device(&candle_core::Device::Cpu)?
+                    .to_dtype(candle_core::DType::F32)?;
+                let mut lens = encoder_hidden_lengths
+                    .to_device(&candle_core::Device::Cpu)?;
+                for layer in enc_cpu {
+                    (z, lens) = layer.forward(&z, &lens)?;
+                }
+                let codes_cpu = qcpu.forward(&z, &lens)?;
+                let codes = codes_cpu.to_device(device)?;
+                // lengths live on CPU after the encoder loop; reflect that for the
+                // narrow loop below by moving back to the primary device too.
+                (codes, lens.to_device(device)?)
+            } else {
+                let (mut z, mut lens) = (encoder_hidden_states, encoder_hidden_lengths);
+                for layer in &self.encoder {
+                    (z, lens) = layer.forward(&z, &lens)?;
+                }
+                let codes = self.quantizer.forward(&z, &lens)?;
+                (codes, lens)
+            };
         // (dim, bs, len) -> (bs, len, dim)
         let audio_codes = audio_codes.permute((1, 2, 0))?;
         let mut audio_codes_vec = vec![];

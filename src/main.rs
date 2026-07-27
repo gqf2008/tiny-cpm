@@ -53,6 +53,7 @@ fn main() -> Result<()> {
         },
         "vad" => exec::vad::run(rest),
         "live" => exec::live::run(rest),
+        "codec-rt" => exec::moss_tts::run_codec_rt(rest),
         _ => {
             usage();
             std::process::exit(1);
