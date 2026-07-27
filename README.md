@@ -67,7 +67,7 @@ tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.jso
 tiny-cpm vad <model-dir> <audio-file>
 ```
 
-cosyvoice3 `--stream`: chunked streaming synthesis — first audio in ~2.7 s instead of a full-utterance wait (flow steps default 4; chunks are buffered and one WAV is written for now).
+cosyvoice3 `--stream`: chunked streaming synthesis — first audio ~1.1 s warm (first chunk: hop 12, 3 steps, no CFG by default, upstream hop schedule afterwards; env knobs CV3_FIRST_HOP/CV3_FIRST_STEPS/CV3_FIRST_CFG; chunks are buffered and one WAV is written for now).
 
 Output contract: the payload (chat text / transcript) goes to **stdout**; all diagnostics (load time, TTFT, tok/s) go to **stderr**. TTS writes its WAV to the given path. Keep it that way — stdout is what consumers may pipe.
 

@@ -784,8 +784,25 @@ fn flush_stream_chunks(
 ) -> Result<()> {
     let t_flush = Instant::now();
     loop {
+        // First-chunk overrides (env, for low first-audio latency):
+        // CV3_FIRST_HOP (>0): flush the first chunk after this many tokens
+        //   instead of the upstream 25+prompt_pad — smaller first chunk =
+        //   less LM wait and less flow/HiFT compute. Default 12 (warm
+        //   first-audio ~1.2s; 8 reaches ~0.75s warm with a 0.16s blip).
+        // CV3_FIRST_STEPS: Euler steps for chunk 0 only (default: 3 vs the
+        //   usual 4 — ears are least sensitive at utterance onset).
+        // CV3_FIRST_CFG: CFG rate for chunk 0 only (default: 0.0 — skips the
+        //   uncond branch, halving chunk-0 flow cost; set 0.7 for full CFG).
+        let first_hop: usize = std::env::var("CV3_FIRST_HOP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(12);
         let this_hop = if st.first {
-            TOKEN_HOP_LEN + st.prompt_pad
+            if first_hop > 0 {
+                first_hop
+            } else {
+                TOKEN_HOP_LEN + st.prompt_pad
+            }
         } else {
             st.hop
         };
@@ -797,9 +814,23 @@ fn flush_stream_chunks(
         full_tokens.extend_from_slice(prompt_tokens);
         full_tokens.extend_from_slice(&gen_tokens[..n_gen]);
 
+        let (steps_i, cfg_i) = if st.first {
+            (
+                std::env::var("CV3_FIRST_STEPS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3),
+                std::env::var("CV3_FIRST_CFG")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0),
+            )
+        } else {
+            (n_steps, cfg)
+        };
         let t0 = Instant::now();
         let mel_full =
-            flow.synthesize_mel_chunk(&full_tokens, spk_emb, ref_mel, n_steps, cfg, seed, false)?;
+            flow.synthesize_mel_chunk(&full_tokens, spk_emb, ref_mel, steps_i, cfg_i, seed, false)?;
         st.flow_secs += t0.elapsed().as_secs_f64();
 
         // Keep only the new tail (cli/model.py:303: token_offset * ratio).
