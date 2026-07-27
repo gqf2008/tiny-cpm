@@ -237,6 +237,14 @@ impl Speaker {
     pub fn clear(&self) {
         self.queue.lock().unwrap().clear();
     }
+
+    /// A clone of the shared playback queue handle. The queue is
+    /// `Arc<Mutex<..>>` (Send) so it can be handed to another thread that
+    /// needs to clear the queue (e.g. barge-in listener) without moving the
+    /// !Send `Speaker` (which owns the cpal playback stream).
+    pub fn shared_queue(&self) -> Arc<Mutex<VecDeque<f32>>> {
+        Arc::clone(&self.queue)
+    }
 }
 
 /// Interleaved multi-channel -> mono (average).

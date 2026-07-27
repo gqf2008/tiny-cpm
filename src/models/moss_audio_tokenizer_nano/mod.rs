@@ -495,7 +495,10 @@ impl MossAudioTokenizerResidualLFQ {
             // corrupting the deeper codebooks (manifests as out-of-range token ids
             // on reference audio longer than ~10 s). Force a device sync between
             // layers. audio.cpp runs its LFQ on CPU and is immune.
-            let _ = residual.to_dtype(candle_core::DType::F32)?.sum_all()?.to_scalar::<f32>()?;
+            let _ = residual
+                .to_dtype(candle_core::DType::F32)?
+                .sum_all()?
+                .to_scalar::<f32>()?;
         }
         let all_indices = Tensor::stack(&all_indices, 0)?;
         Ok(all_indices)
@@ -606,9 +609,9 @@ impl MossAudioTokenizer {
         // VarBuilder is supplied (Metal path); the Metal quantizer is still used
         // when running on CPU or when no CPU vb is provided.
         let (encoder_cpu, quantizer_cpu) = if let Some(vb_cpu) = vb_quantizer_cpu {
-            let mut cpu_frame_rate =
-                config.sampling_rate as f64 * channel_interleave_factor as f64;
-            let enc_cpu = Self::build_encoder_modules(&vb_cpu.pp("encoder"), config, &mut cpu_frame_rate)?;
+            let mut cpu_frame_rate = config.sampling_rate as f64 * channel_interleave_factor as f64;
+            let enc_cpu =
+                Self::build_encoder_modules(&vb_cpu.pp("encoder"), config, &mut cpu_frame_rate)?;
             let q_cpu = MossAudioTokenizerResidualLFQ::new(
                 vb_cpu.pp("quantizer"),
                 &config.quantizer_kwargs,
@@ -702,8 +705,7 @@ impl MossAudioTokenizer {
                 let mut z = encoder_hidden_states
                     .to_device(&candle_core::Device::Cpu)?
                     .to_dtype(candle_core::DType::F32)?;
-                let mut lens = encoder_hidden_lengths
-                    .to_device(&candle_core::Device::Cpu)?;
+                let mut lens = encoder_hidden_lengths.to_device(&candle_core::Device::Cpu)?;
                 for layer in enc_cpu {
                     (z, lens) = layer.forward(&z, &lens)?;
                 }

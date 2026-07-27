@@ -63,7 +63,7 @@ pub fn generate_reply(
     sink: &mut dyn FnMut(&str),
 ) -> Result<ChatGenStats> {
     generate_reply_with_system(
-        model, tokenizer, device, None, prompt, false, max_tokens, sink,
+        model, tokenizer, device, None, prompt, false, max_tokens, sink, None,
     )
 }
 
@@ -82,6 +82,7 @@ pub fn generate_reply_with_system(
     no_think: bool,
     max_tokens: usize,
     sink: &mut dyn FnMut(&str),
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<ChatGenStats> {
     // MiniCPM5 uses ChatML. Render [optional system +] one user message +
     // generation prompt.
@@ -135,6 +136,12 @@ pub fn generate_reply_with_system(
     let t_dec = std::time::Instant::now();
     let mut generated = 0usize;
     for index in 0..max_tokens {
+        if let Some(c) = cancel
+            && c.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!("llm: cancelled by barge-in after {generated} tokens");
+            break;
+        }
         let input = Tensor::new(&[next], device)?.unsqueeze(0)?;
         let logits = model.forward(&input, n_prompt + index)?.squeeze(0)?;
         next = lp.sample(&logits)?;

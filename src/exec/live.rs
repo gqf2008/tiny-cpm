@@ -26,6 +26,8 @@
 //! Ctrl-C exits immediately without draining playback.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
@@ -54,6 +56,23 @@ const TTS_CHUNK_FRAMES: usize = 25;
 const MIN_SEGMENT_SAMPLES: usize = 8000;
 /// Silence appended in simulation mode so the last utterance endpoints.
 const SIM_TRAILING_SILENCE_SEC: usize = 1;
+/// Barge-in onset RMS threshold (mic-frame RMS above this while speaking
+/// counts as an interrupt). Override with `LIVE_BARGE_RMS`. Headphones-only:
+/// with speakers, TTS echo has high RMS and false-triggers.
+fn barge_onset_rms() -> f32 {
+    std::env::var("LIVE_BARGE_RMS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.02)
+}
+/// Consecutive onset frames required before firing barge-in (avoids a single
+/// loud transient). Override with `LIVE_BARGE_ONSET_FRAMES`.
+fn barge_onset_frames() -> usize {
+    std::env::var("LIVE_BARGE_ONSET_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3)
+}
 
 /// Splits a streamed text into sentences at [.!?;] and their full-width
 /// variants (plus …). Sentences include their terminator.
@@ -116,16 +135,24 @@ impl SentenceSplitter {
 
 /// Synthesize one sentence, streaming audio chunks to the speaker (or the
 /// simulation buffer) as they are generated instead of waiting for the whole
-/// sentence. Errors are logged, not propagated (the show goes on).
+/// sentence. When `barge` is Some and set, the chunk callback returns `false`
+/// to abort synthesis mid-sentence and stops pushing. Errors are logged, not
+/// propagated (the show goes on).
 fn synth_and_play(
     tts: &mut MossEngine,
-    speaker: &Option<Speaker>,
+    speaker: &Option<Arc<Speaker>>,
     sim_out: &mut Vec<f32>,
     tts_sr: usize,
     n: usize,
     text: &str,
+    barge: Option<&AtomicBool>,
 ) {
-    let mut on_chunk = |pcm: Vec<f32>| {
+    let mut on_chunk = |pcm: Vec<f32>| -> bool {
+        if let Some(b) = barge
+            && b.load(Ordering::Relaxed)
+        {
+            return false;
+        }
         if let Some(speaker) = speaker {
             if let Err(e) = speaker.push(&pcm, tts_sr, 2) {
                 eprintln!("playback error: {e}");
@@ -133,20 +160,26 @@ fn synth_and_play(
         } else {
             sim_out.extend_from_slice(&pcm);
         }
+        true
     };
     match tts.synthesize_pcm_stream(text, MOSS_MAX_FRAMES, TTS_CHUNK_FRAMES, &mut on_chunk) {
         Ok(stats) => eprintln!(
-            "tts[{n}]: {} frames in {:.2}s (ttft {:.2}s)",
+            "tts[{n}]: {} frames in {:.2}s (ttft {:.2}s){}",
             stats.frames,
             stats.total.as_secs_f64(),
-            stats.ttft.as_secs_f64()
+            stats.ttft.as_secs_f64(),
+            if barge.is_some_and(|b| b.load(Ordering::Relaxed)) {
+                " [aborted by barge-in]"
+            } else {
+                ""
+            },
         ),
         Err(e) => eprintln!("tts[{n}] error: {e}; continuing"),
     }
 }
 
 pub fn run(args: &[String]) -> Result<()> {
-    let usage = "usage: tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N]";
+    let usage = "usage: tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in]";
     if args.len() < 6 {
         bail!(usage);
     }
@@ -159,6 +192,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut input_wav: Option<String> = None;
     let mut output_wav: Option<String> = None;
     let mut max_tokens = DEFAULT_MAX_TOKENS;
+    let mut barge_in = false;
     let mut i = 6;
     while i < args.len() {
         match args[i].as_str() {
@@ -186,6 +220,7 @@ pub fn run(args: &[String]) -> Result<()> {
                     .parse()
                     .map_err(|_| anyhow!("--max-tokens must be a positive integer. {usage}"))?;
             }
+            "--barge-in" => barge_in = true,
             other => bail!("unknown option {other}. {usage}"),
         }
         i += 1;
@@ -193,6 +228,9 @@ pub fn run(args: &[String]) -> Result<()> {
     let sim_mode = input_wav.is_some();
     if !sim_mode && output_wav.is_some() {
         bail!("--output is only meaningful with --input (simulation mode)");
+    }
+    if barge_in && sim_mode {
+        bail!("--barge-in is only meaningful in mic mode (not with --input)");
     }
 
     // --- load all five models on one Metal device ---
@@ -222,7 +260,9 @@ pub fn run(args: &[String]) -> Result<()> {
     let tts_sr = tts.sample_rate();
 
     // --- frame source + audio sink ---
-    let mic = if sim_mode {
+    // In barge-in mode the mic is created on the listener thread (cpal's
+    // Stream is !Send on macOS, so it must live on the thread that owns it).
+    let mic = if sim_mode || barge_in {
         None
     } else {
         Some(MicCapture::start()?)
@@ -242,10 +282,10 @@ pub fn run(args: &[String]) -> Result<()> {
     } else {
         Vec::new()
     };
-    let speaker = if sim_mode {
+    let speaker: Option<Arc<Speaker>> = if sim_mode {
         None
     } else {
-        Some(Speaker::start()?)
+        Some(Arc::new(Speaker::start()?))
     };
     // Simulation mode accumulates the reply PCM (interleaved stereo) here.
     let mut sim_out: Vec<f32> = Vec::new();
@@ -254,11 +294,198 @@ pub fn run(args: &[String]) -> Result<()> {
         "live: {} — listening (Ctrl-C to quit)",
         if sim_mode {
             "simulation mode"
+        } else if barge_in {
+            "mic mode, barge-in ON (HEADPHONES REQUIRED — no AEC, speaker echo false-triggers)"
         } else {
             "mic mode (no barge-in; use headphones)"
         }
     );
 
+    // --- barge-in path: a listener thread owns the mic + VAD and runs
+    // continuously (no ducking); on speech onset while speaking it sets a
+    // shared `barge` flag and clears the speaker queue. The main thread
+    // processes utterances and aborts the in-flight LLM/TTS via the flag. ---
+    if barge_in {
+        let speaker_arc = speaker.clone().unwrap();
+        // Speaker is !Send (owns the cpal playback stream); hand the listener
+        // just the shared queue Arc (Send) so it can clear playback on barge.
+        let speaker_queue = speaker_arc.shared_queue();
+        let speaking = Arc::new(AtomicBool::new(false));
+        let barge = Arc::new(AtomicBool::new(false));
+        let (seg_tx, seg_rx) = mpsc::channel::<Vec<f32>>();
+
+        let speaking_l = speaking.clone();
+        let barge_l = barge.clone();
+        let speaker_q_l = speaker_queue.clone();
+        let onset_rms = barge_onset_rms();
+        let onset_frames = barge_onset_frames();
+        std::thread::spawn(move || {
+            // cpal::Stream is !Send on macOS — create the mic on this thread
+            // and keep it here for the life of the listener.
+            let mic = match MicCapture::start() {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("barge-in listener: mic capture failed: {e}");
+                    return;
+                }
+            };
+            let mut vad = vad;
+            let mut onset_count = 0usize;
+            loop {
+                let frame = match mic.next_frame() {
+                    Ok(f) => f,
+                    Err(_) => break,
+                };
+                let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
+                if speaking_l.load(Ordering::Relaxed) && rms > onset_rms {
+                    onset_count += 1;
+                    if onset_count >= onset_frames && !barge_l.swap(true, Ordering::Relaxed) {
+                        eprintln!("barge-in: onset rms {rms:.3} — cancelling reply");
+                        speaker_q_l.lock().unwrap().clear();
+                    }
+                } else {
+                    onset_count = 0;
+                }
+                let Some(result) = (match vad.detect_frame_f32(frame, 1, Some(VAD_SAMPLE_RATE)) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                }) else {
+                    continue;
+                };
+                let Some(segment) = result.orig_audio else {
+                    continue;
+                };
+                let samples = match segment.to_vec1::<f32>() {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                if samples.len() < MIN_SEGMENT_SAMPLES {
+                    continue;
+                }
+                let _ = seg_tx.send(samples);
+            }
+        });
+
+        let mut turn = 0usize;
+        loop {
+            let samples = match seg_rx.recv() {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            // If the listener raised barge during the previous reply, this
+            // segment is the interrupting utterance. Clear the flag for the
+            // new reply, and flush any audio that snuck into the queue.
+            let was_barge = barge.swap(false, Ordering::Relaxed);
+            if was_barge {
+                speaker_arc.clear();
+            }
+            speaking.store(true, Ordering::Relaxed);
+            turn += 1;
+            eprintln!(
+                "=== turn {turn}: utterance {:.2}s{} ===",
+                samples.len() as f32 / VAD_SAMPLE_RATE as f32,
+                if was_barge { " (barge-in)" } else { "" }
+            );
+
+            // ASR
+            let t = Instant::now();
+            let transcript = asr.transcribe_samples(&samples, ASR_MAX_TOKENS)?;
+            let asr_secs = t.elapsed().as_secs_f64();
+            if transcript.trim().is_empty() {
+                eprintln!("turn {turn}: empty transcript, skipping (asr {asr_secs:.2}s)");
+                speaking.store(false, Ordering::Relaxed);
+                continue;
+            }
+            println!("you: {transcript}");
+            let _ = std::io::stdout().flush();
+
+            // LLM streamed; sentences synthesized as they complete. The sink
+            // and synth_and_play both check `barge` so a new interrupt aborts
+            // the reply mid-stream.
+            let t_llm = Instant::now();
+            let mut splitter = SentenceSplitter::new();
+            let mut first_sentence_at: Option<f64> = None;
+            let mut n_sentences = 0usize;
+            let mut sink = |delta: &str| {
+                if barge.load(Ordering::Relaxed) {
+                    return; // barge-in: stop producing new sentences
+                }
+                for sentence in splitter.push(delta) {
+                    if first_sentence_at.is_none() {
+                        first_sentence_at = Some(t_llm.elapsed().as_secs_f64());
+                    }
+                    n_sentences += 1;
+                    println!("tiny: {sentence}");
+                    let _ = std::io::stdout().flush();
+                    synth_and_play(
+                        &mut tts,
+                        &speaker,
+                        &mut sim_out,
+                        tts_sr,
+                        n_sentences,
+                        &sentence,
+                        Some(&barge),
+                    );
+                }
+            };
+            let llm_stats = match chat::generate_reply_with_system(
+                &mut llm,
+                &tokenizer,
+                &device,
+                Some(
+                    "你是一个语音助手的回复模块。直接用一两句简短的口语回答用户，禁止输出思考过程、分析、复述用户问题或任何 markdown 格式。",
+                ),
+                &transcript,
+                true,
+                max_tokens,
+                &mut sink,
+                Some(&barge),
+            ) {
+                Ok(stats) => stats,
+                Err(e) => {
+                    eprintln!("turn {turn}: llm error: {e}; skipping turn");
+                    speaking.store(false, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            drop(sink);
+            if !barge.load(Ordering::Relaxed)
+                && let Some(rest) = splitter.flush()
+            {
+                if first_sentence_at.is_none() {
+                    first_sentence_at = Some(t_llm.elapsed().as_secs_f64());
+                }
+                n_sentences += 1;
+                println!("tiny: {rest}");
+                let _ = std::io::stdout().flush();
+                synth_and_play(
+                    &mut tts,
+                    &speaker,
+                    &mut sim_out,
+                    tts_sr,
+                    n_sentences,
+                    &rest,
+                    Some(&barge),
+                );
+            }
+            if n_sentences == 0 {
+                eprintln!("turn {turn}: empty reply, skipping");
+                speaking.store(false, Ordering::Relaxed);
+                continue;
+            }
+            eprintln!(
+                "turn {turn} timings: asr {asr_secs:.2}s, llm first sentence {:.2}s ({} tokens, {:.1} tok/s), {n_sentences} sentence(s)",
+                first_sentence_at.unwrap_or_default(),
+                llm_stats.tokens,
+                llm_stats.tokens as f64 / llm_stats.decode.as_secs_f64().max(1e-9),
+            );
+            if barge.load(Ordering::Relaxed) {
+                speaker_arc.clear();
+            }
+            speaking.store(false, Ordering::Relaxed);
+        }
+        return Ok(());
+    }
     // --- main loop: VAD frames -> utterance -> ASR -> LLM -> TTS ---
     let mut sim_pos = 0usize;
     let mut turn = 0usize;
@@ -370,6 +597,7 @@ pub fn run(args: &[String]) -> Result<()> {
                     tts_sr,
                     n_sentences,
                     &sentence,
+                    None,
                 );
             }
         };
@@ -386,6 +614,7 @@ pub fn run(args: &[String]) -> Result<()> {
             true, // no_think: append an empty think block (enable_thinking=false)
             max_tokens,
             &mut sink,
+            None,
         ) {
             Ok(stats) => stats,
             // The model is stateless per call, so a transient decode error
@@ -403,7 +632,15 @@ pub fn run(args: &[String]) -> Result<()> {
             n_sentences += 1;
             println!("tiny: {rest}");
             let _ = std::io::stdout().flush();
-            synth_and_play(&mut tts, &speaker, &mut sim_out, tts_sr, n_sentences, &rest);
+            synth_and_play(
+                &mut tts,
+                &speaker,
+                &mut sim_out,
+                tts_sr,
+                n_sentences,
+                &rest,
+                None,
+            );
         }
         if n_sentences == 0 {
             eprintln!("turn {turn}: empty reply, skipping");

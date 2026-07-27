@@ -59,22 +59,25 @@ pub struct MossGenStats {
 
 /// Streaming sink for `MossTTSModel::generate_waveform`: every `chunk_frames`
 /// codec frames, the prefix generated so far is decoded and the new audio
-/// tail is handed to `on_chunk` (interleaved stereo f32, [-1,1]).
+/// tail is handed to `on_chunk` (interleaved stereo f32, [-1,1]). `on_chunk`
+/// returns `false` to request an early abort (used by `live --barge-in` to
+/// cut off synthesis mid-utterance).
 pub struct StreamChunk<'a> {
     pub chunk_frames: usize,
-    pub on_chunk: &'a mut dyn FnMut(Vec<f32>),
+    pub on_chunk: &'a mut dyn FnMut(Vec<f32>) -> bool,
 }
 
 /// Emit the not-yet-emitted tail of a (channels, len) waveform as interleaved
-/// f32. Returns the new emitted count (per channel).
+/// f32. Returns `(emitted, continue)` — `continue` is `false` if `on_chunk`
+/// asked to abort.
 fn emit_tail(
     waveform: &Tensor,
     emitted: usize,
-    on_chunk: &mut dyn FnMut(Vec<f32>),
-) -> Result<usize> {
+    on_chunk: &mut dyn FnMut(Vec<f32>) -> bool,
+) -> Result<(usize, bool)> {
     let (channels, len) = waveform.dims2()?;
     if len <= emitted {
-        return Ok(emitted);
+        return Ok((emitted, true));
     }
     // One bulk GPU→CPU copy, then interleave on the host.
     let w = waveform
@@ -86,8 +89,8 @@ fn emit_tail(
             pcm.push(row[i]);
         }
     }
-    on_chunk(pcm);
-    Ok(len)
+    let cont = on_chunk(pcm);
+    Ok((len, cont))
 }
 
 pub struct MossTTSModel {
@@ -290,6 +293,7 @@ impl MossTTSModel {
         // frames generated in this call, prompt frames are NOT included).
         let mut audio_history: Vec<Vec<u32>> = vec![Vec::new(); self.n_vq];
         let mut current_model_input_ids = input_ids.clone();
+        let mut aborted = false;
         for _ in 0..sample_len {
             let inputs_embeds = self.build_inputs_embeds(&current_model_input_ids)?;
             let outputs = self.transformer.forward(&inputs_embeds, seqlen_offset)?;
@@ -363,7 +367,12 @@ impl MossTTSModel {
                 let waveform = audio_tokenizer
                     .decode_audio_token_ids_to_waveform(&audio_token_ids)?
                     .squeeze(0)?;
-                emitted = emit_tail(&waveform, emitted, &mut s.on_chunk)?;
+                let (new_emitted, cont) = emit_tail(&waveform, emitted, &mut s.on_chunk)?;
+                emitted = new_emitted;
+                if !cont {
+                    aborted = true;
+                    break;
+                }
             }
         }
         let num_frames = generated_frames.len();
@@ -380,7 +389,9 @@ impl MossTTSModel {
             .decode_audio_token_ids_to_waveform(&audio_token_ids)?
             .squeeze(0)?;
         if let Some(s) = stream.as_mut() {
-            emit_tail(&waveform, emitted, &mut s.on_chunk)?;
+            if !aborted {
+                emit_tail(&waveform, emitted, &mut s.on_chunk)?;
+            }
         }
         let stats = MossGenStats {
             frames: num_frames,

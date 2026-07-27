@@ -96,9 +96,8 @@ impl MossEngine {
         // RVQ drift on long reference audio (>~16 s, async-kernel races), so the
         // whole encode (encoder + quantizer) runs on CPU when this is supplied.
         // The decoder stays on Metal (only decodes short generated sequences).
-        let vb_cpu = unsafe {
-            VarBuilder::from_mmaped_safetensors(&model_list, DType::F32, &Device::Cpu)?
-        };
+        let vb_cpu =
+            unsafe { VarBuilder::from_mmaped_safetensors(&model_list, DType::F32, &Device::Cpu)? };
         let audio_tokenizer = MossAudioTokenizer::new(vb, Some(vb_cpu), &audio_tokenizer_cfg)?;
 
         // --- text tokenizer (sentencepiece) ---
@@ -282,7 +281,7 @@ impl MossEngine {
         text: &str,
         max_len: usize,
         chunk_frames: usize,
-        on_chunk: &mut dyn FnMut(Vec<f32>),
+        on_chunk: &mut dyn FnMut(Vec<f32>) -> bool,
     ) -> Result<MossGenStats> {
         let mode = self
             .processor
@@ -336,7 +335,9 @@ pub fn run_codec_rt(args: &[String]) -> Result<()> {
     let codec_path = match codec_path {
         Some(p) => p,
         None => {
-            let default = Path::new(&model_dir).join("..").join("MOSS-Audio-Tokenizer-Nano");
+            let default = Path::new(&model_dir)
+                .join("..")
+                .join("MOSS-Audio-Tokenizer-Nano");
             if !default.is_dir() {
                 return Err(anyhow!(
                     "MOSS-Audio-Tokenizer-Nano codec directory not found at {}; pass it explicitly via --codec <codec-dir>",
