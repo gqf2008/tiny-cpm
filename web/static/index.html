@@ -22,6 +22,9 @@
   #micMeter { width: 100%; height: 8px; background: #333; border-radius: 4px; margin-top: 6px; }
   #micMeter > div { height: 100%; width: 0; background: #4ec9b0; border-radius: 4px; transition: width .05s; }
   .hint { color: #888; font-size: 11px; margin-top: 6px; }
+  .param { margin-bottom: 8px; }
+  .param label { width: auto; margin-right: 8px; font-family: ui-monospace, monospace; font-size: 12px; }
+  .param .desc { color: #888; font-size: 11px; margin-top: 2px; line-height: 1.3; }
 </style>
 </head>
 <body>
@@ -41,13 +44,13 @@
   </div>
   <div class="panel">
     <h2>VAD params (live)</h2>
-    <div><label>speech_threshold <span id="speech_threshold_v">0.5</span></label><input type="range" id="speech_threshold" min="0.1" max="0.9" step="0.05" value="0.5"></div>
-    <div><label>min_silence <span id="min_silence_v">45</span></label><input type="range" id="min_silence" min="4" max="100" step="1" value="45"></div>
-    <div><label>min_speech_frame <span id="min_speech_frame_v">8</span></label><input type="range" id="min_speech_frame" min="2" max="40" step="1" value="8"></div>
-    <div><label>end_silence_ratio <span id="end_silence_ratio_v">0.9</span></label><input type="range" id="end_silence_ratio" min="0.4" max="0.99" step="0.01" value="0.9"></div>
-    <div><label>look_back_frames <span id="look_back_frames_v">50</span></label><input type="range" id="look_back_frames" min="8" max="120" step="1" value="50"></div>
-    <div><label>min_speach_ratio <span id="min_speach_ratio_v">0.1</span></label><input type="range" id="min_speach_ratio" min="0.02" max="0.6" step="0.02" value="0.1"></div>
-    <div><label>min_speach_frames <span id="min_speach_frames_v">30</span></label><input type="range" id="min_speach_frames" min="4" max="80" step="1" value="30"></div>
+    <div class="param"><label>speech_threshold <span id="speech_threshold_v">0.5</span></label><input type="range" id="speech_threshold" min="0.1" max="0.9" step="0.05" value="0.5"><div class="desc">神经输出概率 &gt;此值算"语音帧"。降→认更弱的语音（也可能把噪声当语音）；升→只认清晰语音。</div></div>
+    <div class="param"><label>min_silence <span id="min_silence_v">45</span></label><input type="range" id="min_silence" min="4" max="100" step="1" value="45"><div class="desc">出段（endpoint）前所需的最小连续静音帧数。降→说完更快出段；升→要停更久才出。</div></div>
+    <div class="param"><label>min_speech_frame <span id="min_speech_frame_v">8</span></label><input type="range" id="min_speech_frame" min="2" max="40" step="1" value="8"><div class="desc">最短语音段帧数。短于此的段被丢弃。降→保留更短的语音。</div></div>
+    <div class="param"><label>end_silence_ratio <span id="end_silence_ratio_v">0.9</span></label><input type="range" id="end_silence_ratio" min="0.4" max="0.99" step="0.01" value="0.9"><div class="desc">回看窗口里 ≥此比例是静音才出段。降→更易出段（句中短停顿就断）；升→要更完整静音。</div></div>
+    <div class="param"><label>look_back_frames <span id="look_back_frames_v">50</span></label><input type="range" id="look_back_frames" min="8" max="120" step="1" value="50"><div class="desc">判断结尾静音的回看窗口长度。升→需更持续静音才出段（抗句中停顿）。</div></div>
+    <div class="param"><label>min_speach_ratio <span id="min_speach_ratio_v">0.1</span></label><input type="range" id="min_speach_ratio" min="0.02" max="0.6" step="0.02" value="0.1"><div class="desc">单帧里 &gt;此比例子帧是语音→该帧算有人声（barge 也用它）。降→更灵敏认语音。</div></div>
+    <div class="param"><label>min_speach_frames <span id="min_speach_frames_v">30</span></label><input type="range" id="min_speach_frames" min="4" max="80" step="1" value="30"><div class="desc">语音累计到此帧数才开始考虑出段。升→需更长语音才可能出段。</div></div>
   </div>
 </div>
 <div class="panel" style="margin-top:12px">
