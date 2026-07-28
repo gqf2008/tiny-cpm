@@ -364,11 +364,13 @@ pub fn run(args: &[String]) -> Result<()> {
             };
             let mut vad = vad;
             let mut onset_count = 0usize;
+            let mut frame_count = 0usize;
             loop {
                 let frame = match mic.next_frame() {
                     Ok(f) => f,
                     Err(_) => break,
                 };
+                frame_count += 1;
                 let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
                 if speaking_l.load(Ordering::Relaxed) && rms > onset_rms {
                     onset_count += 1;
@@ -378,6 +380,18 @@ pub fn run(args: &[String]) -> Result<()> {
                     }
                 } else {
                     onset_count = 0;
+                }
+                // Heartbeat so the user can tell capture/VAD are alive (a silent
+                // mic or a VAD that never fires otherwise looks like a hang).
+                if frame_count % 80 == 0 {
+                    eprintln!(
+                        "heartbeat: mic rms {rms:.4} ({})",
+                        if speaking_l.load(Ordering::Relaxed) {
+                            "speaking"
+                        } else {
+                            "listening"
+                        }
+                    );
                 }
                 let Some(result) = (match vad.detect_frame_f32(frame, 1, Some(VAD_SAMPLE_RATE)) {
                     Ok(r) => r,
