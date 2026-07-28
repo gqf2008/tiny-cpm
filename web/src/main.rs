@@ -582,6 +582,15 @@ fn main_loop(
             (s.instructions.clone(), hist)
         };
         let persona = instructions.unwrap_or_else(|| DEFAULT_PERSONA.to_string());
+        eprintln!(
+            "turn {turn}: history={} items, prompt=\"{}\", persona=\"{}\"",
+            history.len(),
+            transcript.chars().take(80).collect::<String>(),
+            persona.chars().take(40).collect::<String>(),
+        );
+        for (i, (is_user, text)) in history.iter().enumerate() {
+            eprintln!("  hist[{i}] {}: \"{}\"", if *is_user { "user" } else { "asst" }, text.chars().take(60).collect::<String>());
+        }
 
         let _ = out_tx.blocking_send(Out(json!({
             "type":"response.audio_transcript.delta","response_id":resp_id,"delta":""
