@@ -109,22 +109,22 @@ impl FireRedVad {
         cfg.min_silence_frame =
             ov.min_silence_frame
                 .or_else(|| std::env::var("VAD_MIN_SILENCE_FRAME").ok().and_then(|s| s.parse().ok()))
-                .unwrap_or(28);
+                .unwrap_or(45);
         let vad_postprocessor = VadPostprocessor::new(&cfg);
         // Env overrides for the streaming segment logic in detect_frame.
         let min_speach_ratio = env_f32("VAD_MIN_SPEACH_RATIO", 0.1);
-        // Default end_silence_ratio raised 0.8 -> 0.85: require 85% silence in
-        // the look-back window (vs 80%) so a brief mid-sentence pause doesn't
-        // endpoint. Lower (e.g. 0.7) if the system waits too long after you
-        // finish.
+        // Default end_silence_ratio 0.9: require 90% silence in the look-back
+        // window. Spiky mics (bone-conduction headsets) produce periodic dips in
+        // continuous speech that a lower ratio endpoints on, fragmenting one
+        // utterance into many short turns.
         let end_silence_ratio = ov
             .end_silence_ratio
             .or_else(|| std::env::var("VAD_END_SILENCE_RATIO").ok().and_then(|s| s.parse().ok()))
-            .unwrap_or(0.85);
+            .unwrap_or(0.9);
         let min_speach_frames = env_usize("VAD_MIN_SPEACH_FRAMES", 30);
-        // Default look_back_frames raised 15 -> 25: a longer window needs
-        // sustained silence, filtering inter-word pauses.
-        let look_back_frames = env_usize("VAD_LOOK_BACK_FRAMES", 25);
+        // Default look_back_frames 50: a longer window needs sustained silence,
+        // so inter-phrase dips don't endpoint.
+        let look_back_frames = env_usize("VAD_LOOK_BACK_FRAMES", 50);
         eprintln!(
             "vad params: speech_threshold={} min_speech_frame={} min_silence_frame={} | min_speach_ratio={} end_silence_ratio={} min_speach_frames={} look_back_frames={}",
             cfg.speech_threshold, cfg.min_speech_frame, cfg.min_silence_frame,

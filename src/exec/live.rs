@@ -88,6 +88,18 @@ fn barge_onset_frames(cli: Option<usize>) -> usize {
     })
     .unwrap_or(3)
 }
+/// Minimum mic RMS for a neural-speech frame to count toward barge. The neural
+/// VAD can false-positive on near-silence with spiky mics (bone-conduction
+/// headsets) — this floor filters rms~0.001 false positives so barge only fires
+/// on real (audible) speech. Priority: --min-barge-rms > LIVE_BARGE_RMS > 0.015.
+fn min_barge_rms(cli: Option<f32>) -> f32 {
+    cli.or_else(|| {
+        std::env::var("LIVE_BARGE_RMS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    })
+    .unwrap_or(0.015)
+}
 
 /// Splits a streamed text into sentences at [.!?;] and their full-width
 /// variants (plus …). Sentences include their terminator.
@@ -201,7 +213,7 @@ fn synth_and_play(
 }
 
 pub fn run(args: &[String]) -> Result<()> {
-    let usage = "usage: tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in] [--ref <wav>] [--vad-end-silence-ratio <f>] [--vad-min-silence <n>] [--min-seg-peak <f>] [--barge-onset-frames <n>]";
+    let usage = "usage: tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in] [--ref <wav>] [--vad-end-silence-ratio <f>] [--vad-min-silence <n>] [--min-seg-peak <f>] [--barge-onset-frames <n>] [--min-barge-rms <f>]";
     if args.len() < 6 {
         bail!(usage);
     }
@@ -222,6 +234,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut vad_min_silence: Option<usize> = None;
     let mut min_seg_peak_cli: Option<f32> = None;
     let mut barge_onset_cli: Option<usize> = None;
+    let mut min_barge_rms_cli: Option<f32> = None;
     let mut i = 6;
     while i < args.len() {
         match args[i].as_str() {
@@ -292,6 +305,15 @@ pub fn run(args: &[String]) -> Result<()> {
                         .ok_or_else(|| anyhow!("--barge-onset-frames requires a count. {usage}"))?
                         .parse()
                         .map_err(|_| anyhow!("--barge-onset-frames must be a positive integer. {usage}"))?,
+                );
+            }
+            "--min-barge-rms" => {
+                i += 1;
+                min_barge_rms_cli = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--min-barge-rms requires a float. {usage}"))?
+                        .parse()
+                        .map_err(|_| anyhow!("--min-barge-rms must be a float. {usage}"))?,
                 );
             }
             other => bail!("unknown option {other}. {usage}"),
@@ -416,6 +438,7 @@ pub fn run(args: &[String]) -> Result<()> {
         let barge_l = barge.clone();
         let speaker_q_l = speaker_queue.clone();
         let onset_frames = barge_onset_frames(barge_onset_cli);
+        let min_barge_rms_val = min_barge_rms(min_barge_rms_cli);
         std::thread::spawn(move || {
             // cpal::Stream is !Send on macOS — create the mic on this thread
             // and keep it here for the life of the listener.
@@ -444,11 +467,16 @@ pub fn run(args: &[String]) -> Result<()> {
                 };
                 let is_speech = vad.last_frame_speech();
                 // Barge only while audio is actually playing (speaker queue
-                // non-empty) AND the neural VAD says this frame is speech —
-                // RMS can't separate soft speech from headphone bleed / breath
-                // (they sit at the same RMS), but the neural VAD can.
+                // non-empty) AND the neural VAD says this frame is speech AND
+                // the mic RMS is above a floor — the neural VAD can false-
+                // positive on near-silence with spiky mics (bone-conduction
+                // headsets), and the RMS floor filters that.
                 let playing = !speaker_q_l.lock().unwrap().is_empty();
-                if speaking_l.load(Ordering::Relaxed) && playing && is_speech {
+                if speaking_l.load(Ordering::Relaxed)
+                    && playing
+                    && is_speech
+                    && rms >= min_barge_rms_val
+                {
                     onset_count += 1;
                     if onset_count >= onset_frames && !barge_l.swap(true, Ordering::Relaxed) {
                         eprintln!(
