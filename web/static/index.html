@@ -67,7 +67,8 @@ const FRAME = 400;            // 16k mono, 25ms — matches server VAD_FRAME_SAM
 const wsUrl = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws';
 let ws = null, ctx = null, micStream = null, recNode = null, playNode = null;
 let micGain = 1.0;
-const playBuf = [];           // queued Float32Array (interleaved stereo 48k)
+let playStream = new Float32Array(0);  // TTS PCM, interleaved ttsCh @ ttsSr
+let playPos = 0;                       // fractional FRAME position in playStream
 
 const $ = id => document.getElementById(id);
 const status = s => $('status').textContent = s;
@@ -115,9 +116,9 @@ async function start() {
       else if (m.type === 'state') status(m.value);
       else if (m.type === 'you') log('you', '你: ' + m.text);
       else if (m.type === 'tiny') log('tiny', '小: ' + m.text);
-      else if (m.type === 'stop_audio') playBuf.length = 0;
+      else if (m.type === 'stop_audio') { playStream = new Float32Array(0); playPos = 0; }
     } else {
-      playBuf.push(new Float32Array(ev.data));   // ttsSr, ttsCh interleaved
+      playStream = appendF32(playStream, new Float32Array(ev.data));   // ttsSr, ttsCh interleaved
     }
   };
   ws.onclose = () => { status('closed'); stop(); };
@@ -158,14 +159,34 @@ function setupAudio() {
   src.connect(recNode); recNode.connect(ctx.destination);
   // playback: ttsCh-channel interleaved → deinterleave; pop ttsCh samples per
   // output frame (1 for mono→both, 2 for stereo→L/R). Correct speed + channels.
+  // playback: resample TTS (ttsSr, ttsCh interleaved) → ctx.sampleRate output.
+  // If ctx.sampleRate == ttsSr the ratio is 1.0 (plain passthrough); otherwise
+  // linear interpolation keeps the rate aligned (no slow/fast drift).
   playNode = ctx.createScriptProcessor(4096, 0, 2);
   playNode.onaudioprocess = e => {
     const L = e.outputBuffer.getChannelData(0);
     const R = e.outputBuffer.getChannelData(1);
+    const ch = ttsCh;
+    const ratio = ttsSr / ctx.sampleRate;          // input frames per output frame
+    const n = playStream.length;
+    const avail = n / ch - 1;                       // frames available (−1 for interp)
     for (let i = 0; i < L.length; i++) {
-      if (ttsCh >= 2) { L[i] = shiftOne(); R[i] = shiftOne(); }
-      else { const v = shiftOne(); L[i] = v; R[i] = v; }
+      const fp = playPos + i * ratio;
+      if (fp < avail) {
+        const f0 = Math.floor(fp), frac = fp - f0;
+        const s0 = f0 * ch, s1 = s0 + ch;
+        if (ch >= 2) {
+          L[i] = playStream[s0]   * (1 - frac) + playStream[s1]   * frac;
+          R[i] = playStream[s0+1] * (1 - frac) + playStream[s1+1] * frac;
+        } else {
+          const v = playStream[s0] * (1 - frac) + playStream[s1] * frac;
+          L[i] = v; R[i] = v;
+        }
+      } else { L[i] = 0; R[i] = 0; }   // underrun → silence
     }
+    playPos = Math.min(playPos + L.length * ratio, avail);
+    const cf = Math.floor(playPos);               // consumed frames
+    if (cf > 0) { playStream = playStream.subarray(cf * ch); playPos -= cf; }
   };
   playNode.connect(ctx.destination);
   status('listening');
@@ -182,6 +203,7 @@ function stop() {
   if (playNode) { playNode.disconnect(); playNode = null; }
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
   if (ctx) { ctx.close(); ctx = null; }
+  playStream = new Float32Array(0); playPos = 0;
   $('micMeter').firstElementChild.style.width = '0';
   status('idle');
 }
@@ -216,13 +238,12 @@ function take(n) {
   }
   return out;
 }
-// playback queue stores interleaved stereo f32; shiftOne pops one sample
-function shiftOne() {
-  while (playBuf.length && playBuf[0].length === 0) playBuf.shift();
-  if (!playBuf.length) return 0;
-  const c = playBuf[0]; const v = c[0];
-  if (c.length > 1) playBuf[0] = c.subarray(1); else playBuf.shift();
-  return v;
+// Append two Float32Arrays into a new one (used to grow the TTS stream).
+function appendF32(a, b) {
+  if (a.length === 0) return b.slice();
+  const c = new Float32Array(a.length + b.length);
+  c.set(a); c.set(b, a.length);
+  return c;
 }
 </script>
 </body>
