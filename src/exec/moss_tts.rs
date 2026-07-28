@@ -149,6 +149,11 @@ impl MossEngine {
         self.audio_tokenizer.sampling_rate
     }
 
+    /// Codec output channel count (MOSS is stereo = 2).
+    pub fn channels(&self) -> usize {
+        self.audio_tokenizer.number_channels
+    }
+
     /// Codec round-trip: encode `in_wav` to discrete codes, then decode those
     /// codes back to a waveform at the codec rate, writing `out_wav`. Used to
     /// isolate whether the codec itself reproduces the reference (encode + decode

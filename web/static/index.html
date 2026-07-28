@@ -33,7 +33,7 @@
   <div class="panel">
     <h2>Session</h2>
     <div>status: <span id="status">idle</span></div>
-    <div style="margin-top:8px"><button id="start">start (mic)</button><button id="stop" disabled>stop</button></div>
+    <div style="margin-top:8px"><button id="start">start (mic)</button><button id="muteMic" disabled>mute mic</button><button id="stop" disabled>stop</button></div>
     <div id="micMeter"><div></div></div>
     <div class="hint">点 start → 授权麦克风 → 直接说话（连续，不用按住）。或下方文本框打字。</div>
     <h2 style="margin-top:12px">Persona / 人设 (LLM system prompt)</h2>
@@ -97,28 +97,51 @@ $('persona').onchange = () => {
 };
 
 // ---- audio ----
+let ttsSr = 48000, ttsCh = 2, micMuted = false;
+
 async function start() {
   $('start').disabled = true; $('stop').disabled = false; status('starting');
   micStream = await navigator.mediaDevices.getUserMedia({
     audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
     video: false
   });
-  ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+  ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { status('connecting'); sendVad(); };
+  ws.onmessage = ev => {
+    if (typeof ev.data === 'string') {
+      const m = JSON.parse(ev.data);
+      if (m.type === 'format') { ttsSr = m.sample_rate; ttsCh = m.channels; setupAudio(); }
+      else if (m.type === 'state') status(m.value);
+      else if (m.type === 'you') log('you', '你: ' + m.text);
+      else if (m.type === 'tiny') log('tiny', '小: ' + m.text);
+      else if (m.type === 'stop_audio') playBuf.length = 0;
+    } else {
+      playBuf.push(new Float32Array(ev.data));   // ttsSr, ttsCh interleaved
+    }
+  };
+  ws.onclose = () => { status('closed'); stop(); };
+  ws.onerror = () => status('error');
+}
+
+// Build the AudioContext at the TTS sample rate + wire capture/playback. Called
+// once the server sends the {format} message (so rate/channels are exact, not
+// hardcoded — a wrong rate = slow/fast, wrong channels = 2x speed + garbage).
+function setupAudio() {
+  if (ctx) return; // already set up
+  ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: ttsSr });
+  if (ctx.sampleRate !== ttsSr)
+    console.warn('AudioContext rate', ctx.sampleRate, '!= TTS rate', ttsSr, '(playback may be off-speed)');
   const src = ctx.createMediaStreamSource(micStream);
-  // capture: 48k mono → downsample to 16k, send 400-sample f32 binary frames
   const meter = $('micMeter').firstElementChild;
+  // capture: ctx.sampleRate mono → linear-resample to 16k, send 400-sample f32 frames
   recNode = ctx.createScriptProcessor(4096, 1, 1);
   recNode.onaudioprocess = e => {
-    // Zero the output so the mic never leaks to the speakers (feedback).
-    e.outputBuffer.getChannelData(0).fill(0);
-    if (!ws || ws.readyState !== 1) return;
-    const in0 = e.inputBuffer.getChannelData(0);   // ctx.sampleRate mono
-    // mic-level meter (rms of the input)
+    e.outputBuffer.getChannelData(0).fill(0);   // no mic→speaker leak
+    const in0 = e.inputBuffer.getChannelData(0);
     let s = 0; for (let i = 0; i < in0.length; i++) s += in0[i]*in0[i];
-    const r = Math.sqrt(s / in0.length);
-    meter.style.width = Math.min(100, r * 300) + '%';
-    // Linear-resample ctx.sampleRate → 16k (NOT every-3rd — the AudioContext
-    // may not be exactly 48000, and a wrong ratio corrupts the VAD/ASR fbank).
+    meter.style.width = Math.min(100, Math.sqrt(s / in0.length) * 300) + '%';
+    if (micMuted || !ws || ws.readyState !== 1) return;   // mic监听关闭：不发送
     const ratio = ctx.sampleRate / 16000;
     const outLen = Math.floor(in0.length / ratio);
     const out = new Float32Array(outLen);
@@ -127,58 +150,47 @@ async function start() {
       const i0 = Math.floor(idx);
       const i1 = Math.min(i0 + 1, in0.length - 1);
       const frac = idx - i0;
-      const v = in0[i0] * (1 - frac) + in0[i1] * frac;
-      out[i] = Math.max(-1, Math.min(1, v * micGain));
+      out[i] = Math.max(-1, Math.min(1, (in0[i0] * (1 - frac) + in0[i1] * frac) * micGain));
     }
-    // buffer + send 400-sample chunks
     pend.push(out);
-    while (pendLen() >= FRAME) {
-      const f = take(FRAME);
-      ws.send(f.buffer);
-    }
+    while (pendLen() >= FRAME) ws.send(take(FRAME).buffer);
   };
-  src.connect(recNode); recNode.connect(ctx.destination);  // connect to destination or it won't fire
-  // playback: 48k stereo → drain playBuf
+  src.connect(recNode); recNode.connect(ctx.destination);
+  // playback: ttsCh-channel interleaved → deinterleave; pop ttsCh samples per
+  // output frame (1 for mono→both, 2 for stereo→L/R). Correct speed + channels.
   playNode = ctx.createScriptProcessor(4096, 0, 2);
   playNode.onaudioprocess = e => {
     const L = e.outputBuffer.getChannelData(0);
     const R = e.outputBuffer.getChannelData(1);
     for (let i = 0; i < L.length; i++) {
-      const fr = shiftOne();
-      L[i] = fr; R[i] = fr;
+      if (ttsCh >= 2) { L[i] = shiftOne(); R[i] = shiftOne(); }
+      else { const v = shiftOne(); L[i] = v; R[i] = v; }
     }
   };
   playNode.connect(ctx.destination);
-
-  ws = new WebSocket(wsUrl);
-  ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { status('listening'); sendVad(); $('textInput').disabled = false; $('sendText').disabled = false; };
-  ws.onmessage = ev => {
-    if (typeof ev.data === 'string') {
-      const m = JSON.parse(ev.data);
-      if (m.type === 'state') status(m.value);
-      else if (m.type === 'you') log('you', '你: ' + m.text);
-      else if (m.type === 'tiny') log('tiny', '小: ' + m.text);
-      else if (m.type === 'stop_audio') playBuf.length = 0;
-    } else {
-      const f = new Float32Array(ev.data);   // 48k stereo interleaved
-      playBuf.push(f);
-    }
-  };
-  ws.onclose = () => { status('closed'); stop(); };
-  ws.onerror = () => status('error');
+  status('listening');
+  $('textInput').disabled = false; $('sendText').disabled = false;
+  $('muteMic').disabled = false;
 }
+
 function stop() {
   $('start').disabled = false; $('stop').disabled = true;
+  $('muteMic').disabled = true; $('muteMic').textContent = 'mute mic'; micMuted = false;
   $('textInput').disabled = true; $('sendText').disabled = true;
   if (ws) { ws.onclose = null; ws.close(); ws = null; }
   if (recNode) { recNode.disconnect(); recNode = null; }
   if (playNode) { playNode.disconnect(); playNode = null; }
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
   if (ctx) { ctx.close(); ctx = null; }
+  $('micMeter').firstElementChild.style.width = '0';
   status('idle');
 }
 $('start').onclick = start; $('stop').onclick = stop;
+$('muteMic').onclick = () => {
+  micMuted = !micMuted;
+  $('muteMic').textContent = micMuted ? 'unmute mic' : 'mute mic';
+  status(micMuted ? 'mic muted' : 'listening');
+};
 
 // text input: type + enter (or send btn) → {type:text}, server skips ASR
 function sendText() {

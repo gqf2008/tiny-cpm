@@ -47,6 +47,7 @@ struct Engines {
     tts: MossEngine,
     ref_codes: Option<Tensor>,
     tts_sr: usize,
+    tts_channels: usize,
 }
 
 enum OutMsg {
@@ -152,6 +153,8 @@ async fn main() -> Result<()> {
     let tts = MossEngine::load(&moss_dir, &codec_dir, &device)?;
     eprintln!("loaded MOSS-TTS in {:.2}s", t.elapsed().as_secs_f64());
     let tts_sr = tts.sample_rate();
+    let tts_channels = tts.channels();
+    eprintln!("MOSS-TTS output: {tts_sr} Hz, {tts_channels} ch");
     let ref_codes = if let Some(ref_path) = &ref_wav {
         let t = Instant::now();
         let codes = tts.encode_ref(ref_path)?;
@@ -174,6 +177,7 @@ async fn main() -> Result<()> {
         tts,
         ref_codes,
         tts_sr,
+        tts_channels,
     }));
     let st = Arc::new(ServerState { eng, vad_dir });
 
@@ -203,6 +207,21 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
     let (seg_tx, seg_rx) = mpsc::channel::<TurnInput>(16);
     let seg_tx_listener = seg_tx.clone(); // listener + read-task both send
     let (param_tx, param_rx) = mpsc::channel::<VadOverrides>(64);
+
+    // Tell the browser the TTS output format so it creates the AudioContext at
+    // the right rate + plays the right channel count (a wrong rate = slow/fast
+    // playback; wrong channel count = 2x speed + garbage).
+    let (tts_sr, tts_ch) = {
+        let e = st.eng.lock().unwrap();
+        (e.tts_sr, e.tts_channels)
+    };
+    let _ = out_tx
+        .send(OutMsg::Text(format!(
+            r#"{{"type":"format","sample_rate":{},"channels":{}}}"#,
+            tts_sr, tts_ch
+        )))
+        .await
+        .ok();
 
     let speaking = Arc::new(AtomicBool::new(false));
     let streaming = Arc::new(AtomicBool::new(false));
