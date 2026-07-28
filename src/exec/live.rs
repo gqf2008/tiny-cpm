@@ -479,6 +479,8 @@ pub fn run(args: &[String]) -> Result<()> {
             let mut vad = vad;
             let mut onset_count = 0usize;
             let mut frame_count = 0usize;
+            let mut speech_frames_since_hb = 0usize;
+            let mut max_rms_since_hb = 0.0f32;
             loop {
                 let frame = match mic.next_frame() {
                     Ok(f) => f,
@@ -494,6 +496,9 @@ pub fn run(args: &[String]) -> Result<()> {
                     frame
                 };
                 let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
+                if rms > max_rms_since_hb {
+                    max_rms_since_hb = rms;
+                }
                 // Neural VAD per frame (sets last_frame_speech, may return a
                 // completed segment). detect_frame_f32 consumes `frame`.
                 let vad_result = match vad.detect_frame_f32(frame, 1, Some(VAD_SAMPLE_RATE)) {
@@ -501,6 +506,9 @@ pub fn run(args: &[String]) -> Result<()> {
                     Err(_) => continue,
                 };
                 let is_speech = vad.last_frame_speech();
+                if is_speech {
+                    speech_frames_since_hb += 1;
+                }
                 // Barge only while audio is actually playing (speaker queue
                 // non-empty) AND the neural VAD says this frame is speech AND
                 // the mic RMS is above a floor — the neural VAD can false-
@@ -522,13 +530,18 @@ pub fn run(args: &[String]) -> Result<()> {
                 } else {
                     onset_count = 0;
                 }
-                // Heartbeat so the user can tell capture/VAD are alive (a silent
-                // mic or a VAD that never fires otherwise looks like a hang).
+                // Heartbeat: print this frame's rms + how many of the last 80
+                // frames the neural VAD called speech + the max rms in that
+                // window. <10/80 with a high max means the mic only captures
+                // bursts (not sustained speech) — a hardware limitation no
+                // software gain can fix.
                 if frame_count % 80 == 0 {
                     eprintln!(
-                        "heartbeat: mic rms {rms:.4} speech={is_speech} ({})",
+                        "heartbeat: rms {rms:.4} max_rms {max_rms_since_hb:.4} speech {is_speech} ({speech_frames_since_hb}/80 frames) ({})",
                         if playing { "playing" } else { "listening" }
                     );
+                    speech_frames_since_hb = 0;
+                    max_rms_since_hb = 0.0;
                 }
                 let Some(result) = vad_result else {
                     continue;
