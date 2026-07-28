@@ -28,6 +28,16 @@ pub struct VadResult {
     pub mode: String,
 }
 
+/// Optional CLI overrides for the FireRedVAD streaming params that callers
+/// (e.g. `live`) want to expose as flags. Each field is `Some` when set on the
+/// command line; `None` falls back to the env var, then the realtime default.
+/// Priority: CLI flag > env var > default.
+#[derive(Default, Clone)]
+pub struct VadOverrides {
+    pub end_silence_ratio: Option<f32>,
+    pub min_silence_frame: Option<usize>,
+}
+
 pub struct FireRedVad {
     audio_feat: AudioFeat,
     vad_model: DetectModel,
@@ -52,7 +62,12 @@ pub struct FireRedVad {
 }
 
 impl FireRedVad {
-    pub fn init(path: &str, device: Option<&Device>, dtype: Option<DType>) -> Result<Self> {
+    pub fn init(
+        path: &str,
+        device: Option<&Device>,
+        dtype: Option<DType>,
+        overrides: Option<VadOverrides>,
+    ) -> Result<Self> {
         let device = get_device(device);
         let audio_feat = AudioFeat::new(path, &device)?;
         let model_list = find_type_files(path, "safetensors")?;
@@ -80,9 +95,10 @@ impl FireRedVad {
             )
         };
         let vad_model = DetectModel::new(vb, model_cfg)?;
-        // Env overrides for the postprocessor config (VadPostprocessor reads
-        // these). Lower speech_threshold / min_speech_frame to catch softer or
-        // briefer utterances; lower min_silence_frame to endpoint sooner.
+        // CLI overrides (from live flags) take priority over env, which takes
+        // priority over the realtime defaults.
+        let ov = overrides.unwrap_or_default();
+        // Postprocessor config (VadPostprocessor reads these).
         cfg.speech_threshold = env_f32("VAD_SPEECH_THRESHOLD", cfg.speech_threshold);
         cfg.min_speech_frame = env_usize("VAD_MIN_SPEECH_FRAME", cfg.min_speech_frame);
         // Default min_silence_frame raised from upstream 20 to 28 for realtime
@@ -90,7 +106,10 @@ impl FireRedVad {
         // mid-sentence pauses (200-300 ms between words/clauses) don't cut the
         // user off. The `vad` subcommand processes whole files so this doesn't
         // affect it.
-        cfg.min_silence_frame = env_usize("VAD_MIN_SILENCE_FRAME", 28);
+        cfg.min_silence_frame =
+            ov.min_silence_frame
+                .or_else(|| std::env::var("VAD_MIN_SILENCE_FRAME").ok().and_then(|s| s.parse().ok()))
+                .unwrap_or(28);
         let vad_postprocessor = VadPostprocessor::new(&cfg);
         // Env overrides for the streaming segment logic in detect_frame.
         let min_speach_ratio = env_f32("VAD_MIN_SPEACH_RATIO", 0.1);
@@ -98,7 +117,10 @@ impl FireRedVad {
         // the look-back window (vs 80%) so a brief mid-sentence pause doesn't
         // endpoint. Lower (e.g. 0.7) if the system waits too long after you
         // finish.
-        let end_silence_ratio = env_f32("VAD_END_SILENCE_RATIO", 0.85);
+        let end_silence_ratio = ov
+            .end_silence_ratio
+            .or_else(|| std::env::var("VAD_END_SILENCE_RATIO").ok().and_then(|s| s.parse().ok()))
+            .unwrap_or(0.85);
         let min_speach_frames = env_usize("VAD_MIN_SPEACH_FRAMES", 30);
         // Default look_back_frames raised 15 -> 25: a longer window needs
         // sustained silence, filtering inter-word pauses.

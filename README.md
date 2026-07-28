@@ -63,14 +63,16 @@ tiny-cpm asr <funasr|qwen3> <model-dir> <audio-file> [max_tokens]
 tiny-cpm tts <voxcpm|moss> <model-dir> "<text>" <out.wav> [--codec <codec-dir>] [--ref <ref.wav>] [--max-len N]
 tiny-cpm tts cosyvoice3 <model-dir> "<text>" <out.wav> [--voice <name>] [--ref <ref.wav> --ref-text "<text>"] [--steps N] [--max-tokens N] [--stream]
 tiny-cpm dialogue <funasr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
-tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in] [--ref <wav>]
+tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in] [--ref <wav>] [--vad-end-silence-ratio <f>] [--vad-min-silence <n>] [--min-seg-peak <f>] [--barge-onset-frames <n>]
 tiny-cpm vad <model-dir> <audio-file>
 tiny-cpm codec-rt <model-dir> <in.wav> <out.wav> [--codec <codec-dir>]   # MOSS codec encode→decode round-trip (diagnostic)
 ```
 
 cosyvoice3 `--stream`: chunked streaming synthesis — first audio ~1.1 s warm (first chunk: hop 12, 3 steps, no CFG by default, upstream hop schedule afterwards; env knobs CV3_FIRST_HOP/CV3_FIRST_STEPS/CV3_FIRST_CFG; chunks are buffered and one WAV is written for now).
 
-`live --barge-in`: keeps the mic live during TTS playback and cancels the in-flight reply (LLM decode loop + TTS stream) on speech onset, then processes the interrupting utterance. **Headphones required** — there's no AEC, so speaker echo would false-trigger barge-in. Default (no flag) is half-duplex (mic ducked during playback). Tune onset with `LIVE_BARGE_RMS` (default 0.02) and `LIVE_BARGE_ONSET_FRAMES` (default 3).
+`live --barge-in`: keeps the mic live during TTS playback and cancels the in-flight reply (LLM decode loop + TTS stream) on speech onset, then processes the interrupting utterance. **Headphones required** — there's no AEC, so speaker echo would false-trigger barge-in. Default (no flag) is half-duplex (mic ducked during playback). Tune onset with `--barge-onset-frames` (default 3).
+
+VAD/tuning flags (priority: flag > env var > default): `--vad-end-silence-ratio` (default 0.85, raise to endpoint later), `--vad-min-silence` (default 28), `--min-seg-peak` (default 0.0 = off; drop distant/bystander speech below this peak abs-sample), `--barge-onset-frames`. Further expert knobs remain env-only: `VAD_SPEECH_THRESHOLD`, `VAD_MIN_SPEACH_RATIO`, `VAD_MIN_SPEACH_FRAMES`, `VAD_LOOK_BACK_FRAMES`, `LIVE_MIN_SEGMENT_SAMPLES`.
 
 MOSS `--ref` voice cloning: the codec encode (encoder + RVQ) runs on **CPU + f32**, not Metal — Metal f32 drifted on reference audio longer than ~16 s (async-kernel races in the projected-transformer attention + RVQ residual accumulation), producing garbage conditioning codes; a 22 s ref round-trips to noise on Metal but clean on CPU. The decoder stays on Metal (it only decodes short generated sequences). `codec-rt` round-trips a WAV through encode→decode to verify the codec reproduces the input.
 

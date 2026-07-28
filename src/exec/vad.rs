@@ -47,7 +47,7 @@ pub fn run(args: &[String]) -> Result<()> {
     eprintln!("device: {device:?}");
 
     let start = Instant::now();
-    let vad = FireRedVad::init(model_dir, Some(&device), None)?;
+    let vad = FireRedVad::init(model_dir, Some(&device), None, None)?;
     eprintln!("loaded model in {:.2?}", start.elapsed());
 
     let res = vad.detect_file(audio_file)?;

@@ -36,7 +36,7 @@ use tokenizers::Tokenizer;
 
 use crate::{
     exec::{chat, moss_tts::MossEngine, qwen3_asr::Qwen3AsrEngine},
-    models::fire_red_vad::vad::FireRedVad,
+    models::fire_red_vad::vad::{FireRedVad, VadOverrides},
     utils::{
         audio_utils::{load_audio_with_resample, save_wav},
         live_audio::{MicCapture, Speaker, VAD_FRAME_SAMPLES, VAD_SAMPLE_RATE},
@@ -64,25 +64,29 @@ fn min_segment_samples() -> usize {
 /// A single mic can't beamform, but distant speech (a coworker across the
 /// desk) has a much lower peak than the user close to the mic — set this just
 /// below YOUR speech peak (read from the `segment peak` log line) to drop
-/// bystanders. Override with `LIVE_MIN_SEG_PEAK`.
-fn min_seg_peak() -> f32 {
-    std::env::var("LIVE_MIN_SEG_PEAK")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0)
+/// bystanders. Priority: --min-seg-peak flag > LIVE_MIN_SEG_PEAK env > 0.0.
+fn min_seg_peak(cli: Option<f32>) -> f32 {
+    cli.or_else(|| {
+        std::env::var("LIVE_MIN_SEG_PEAK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    })
+    .unwrap_or(0.0)
 }
 /// Silence appended in simulation mode so the last utterance endpoints.
 const SIM_TRAILING_SILENCE_SEC: usize = 1;
 /// Consecutive neural-speech frames required before firing barge-in (hysteresis
-/// so a single borderline frame doesn't trigger). Override with
-/// `LIVE_BARGE_ONSET_FRAMES`. Barge uses the FireRedVAD neural per-frame
-/// is_speech (not RMS) so it can tell the user's speech apart from headphone
-/// bleed / breath, which sit at the same RMS as soft speech.
-fn barge_onset_frames() -> usize {
-    std::env::var("LIVE_BARGE_ONSET_FRAMES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3)
+/// so a single borderline frame doesn't trigger). Priority: --barge-onset-frames
+/// flag > LIVE_BARGE_ONSET_FRAMES env > 3. Barge uses the FireRedVAD neural
+/// per-frame is_speech (not RMS) so it can tell the user's speech apart from
+/// headphone bleed / breath, which sit at the same RMS as soft speech.
+fn barge_onset_frames(cli: Option<usize>) -> usize {
+    cli.or_else(|| {
+        std::env::var("LIVE_BARGE_ONSET_FRAMES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    })
+    .unwrap_or(3)
 }
 
 /// Splits a streamed text into sentences at [.!?;] and their full-width
@@ -197,7 +201,7 @@ fn synth_and_play(
 }
 
 pub fn run(args: &[String]) -> Result<()> {
-    let usage = "usage: tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in] [--ref <wav>]";
+    let usage = "usage: tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in] [--ref <wav>] [--vad-end-silence-ratio <f>] [--vad-min-silence <n>] [--min-seg-peak <f>] [--barge-onset-frames <n>]";
     if args.len() < 6 {
         bail!(usage);
     }
@@ -212,6 +216,12 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut max_tokens = DEFAULT_MAX_TOKENS;
     let mut barge_in = false;
     let mut ref_wav: Option<String> = None;
+    // High-frequency VAD/tuning knobs exposed as flags (the rest stay env-only;
+    // these take priority over env, which takes priority over the defaults).
+    let mut vad_end_silence_ratio: Option<f32> = None;
+    let mut vad_min_silence: Option<usize> = None;
+    let mut min_seg_peak_cli: Option<f32> = None;
+    let mut barge_onset_cli: Option<usize> = None;
     let mut i = 6;
     while i < args.len() {
         match args[i].as_str() {
@@ -248,6 +258,42 @@ pub fn run(args: &[String]) -> Result<()> {
                         .clone(),
                 );
             }
+            "--vad-end-silence-ratio" => {
+                i += 1;
+                vad_end_silence_ratio = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--vad-end-silence-ratio requires a float. {usage}"))?
+                        .parse()
+                        .map_err(|_| anyhow!("--vad-end-silence-ratio must be a float. {usage}"))?,
+                );
+            }
+            "--vad-min-silence" => {
+                i += 1;
+                vad_min_silence = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--vad-min-silence requires a count. {usage}"))?
+                        .parse()
+                        .map_err(|_| anyhow!("--vad-min-silence must be a positive integer. {usage}"))?,
+                );
+            }
+            "--min-seg-peak" => {
+                i += 1;
+                min_seg_peak_cli = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--min-seg-peak requires a float. {usage}"))?
+                        .parse()
+                        .map_err(|_| anyhow!("--min-seg-peak must be a float. {usage}"))?,
+                );
+            }
+            "--barge-onset-frames" => {
+                i += 1;
+                barge_onset_cli = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--barge-onset-frames requires a count. {usage}"))?
+                        .parse()
+                        .map_err(|_| anyhow!("--barge-onset-frames must be a positive integer. {usage}"))?,
+                );
+            }
             other => bail!("unknown option {other}. {usage}"),
         }
         i += 1;
@@ -266,7 +312,15 @@ pub fn run(args: &[String]) -> Result<()> {
     let t = Instant::now();
     // VAD runs on CPU: it is tiny (2MB), and keeping it off Metal leaves the
     // GPU free for TTS generation (measured ~1.5x faster MOSS in-process).
-    let mut vad = FireRedVad::init(vad_dir, Some(&Device::Cpu), None)?;
+    let mut vad = FireRedVad::init(
+        vad_dir,
+        Some(&Device::Cpu),
+        None,
+        Some(VadOverrides {
+            end_silence_ratio: vad_end_silence_ratio,
+            min_silence_frame: vad_min_silence,
+        }),
+    )?;
     eprintln!(
         "loaded FireRedVAD (cpu) in {:.2}s",
         t.elapsed().as_secs_f64()
@@ -361,7 +415,7 @@ pub fn run(args: &[String]) -> Result<()> {
         let speaking_l = speaking.clone();
         let barge_l = barge.clone();
         let speaker_q_l = speaker_queue.clone();
-        let onset_frames = barge_onset_frames();
+        let onset_frames = barge_onset_frames(barge_onset_cli);
         std::thread::spawn(move || {
             // cpal::Stream is !Send on macOS — create the mic on this thread
             // and keep it here for the life of the listener.
@@ -432,7 +486,7 @@ pub fn run(args: &[String]) -> Result<()> {
                     .iter()
                     .map(|s| s.abs())
                     .fold(0.0f32, |a, b| a.max(b));
-                let gate = min_seg_peak();
+                let gate = min_seg_peak(min_seg_peak_cli);
                 if peak < gate {
                     eprintln!(
                         "segment dropped: peak {peak:.3} < gate {gate:.3} (distant/noise)"
@@ -645,7 +699,7 @@ pub fn run(args: &[String]) -> Result<()> {
             .iter()
             .map(|s| s.abs())
             .fold(0.0f32, |a, b| a.max(b));
-        let gate = min_seg_peak();
+        let gate = min_seg_peak(min_seg_peak_cli);
         if peak < gate {
             eprintln!(
                 "turn skipped: peak {peak:.3} < gate {gate:.3} (distant/noise)"
