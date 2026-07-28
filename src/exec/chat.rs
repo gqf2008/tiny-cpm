@@ -124,6 +124,7 @@ pub fn generate_reply_with_history(
     } else {
         chat
     };
+    eprintln!("=== ChatML ({} chars) ===\n{chat}\n=== end ChatML ===", chat.len());
     let enc = tokenizer
         .encode(chat, true)
         .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
