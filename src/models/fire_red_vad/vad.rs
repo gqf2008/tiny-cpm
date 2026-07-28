@@ -298,6 +298,35 @@ impl FireRedVad {
         self.caches = None;
     }
 
+    /// Runtime-update the streaming + postprocessor params (used by the web
+    /// UI's live sliders). Each `Some` field is applied; `None` leaves it. The
+    /// streaming fields are read per `detect_frame` call; the postprocessor
+    /// fields are `pub` on `VadPostprocessor` and read per call too, so changes
+    /// take effect on the next frame.
+    pub fn update_params(&mut self, o: &VadOverrides) {
+        if let Some(v) = o.speech_threshold {
+            self.vad_postprocessor.prob_threshold = v;
+        }
+        if let Some(v) = o.min_speech_frame {
+            self.vad_postprocessor.min_speech_frame = v;
+        }
+        if let Some(v) = o.min_silence_frame {
+            self.vad_postprocessor.min_silence_frame = v;
+        }
+        if let Some(v) = o.min_speach_ratio {
+            self.min_speach_ratio = v;
+        }
+        if let Some(v) = o.end_silence_ratio {
+            self.end_silence_ratio = v;
+        }
+        if let Some(v) = o.min_speach_frames {
+            self.min_speach_frames = v;
+        }
+        if let Some(v) = o.look_back_frames {
+            self.look_back_frames = v;
+        }
+    }
+
     /// Whether the neural VAD judged the **last** `detect_frame` call's frame as
     /// speech (`preds_sum > probs_len * min_speach_ratio`). Read after
     /// `detect_frame_f32` to drive realtime barge-in at speech onset without a

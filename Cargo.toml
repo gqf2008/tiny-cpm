@@ -28,3 +28,6 @@ byteorder = "1.5"
 needless_range_loop = "allow"
 single_range_in_vec_init = "allow"
 manual_div_ceil = "allow"
+
+[workspace]
+members = ["web"]

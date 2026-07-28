@@ -17,14 +17,7 @@
 //!     tiny-cpm dialogue <funasr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
 //!     tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N]
 
-mod common;
-mod exec;
-mod models;
-mod position_embed;
-mod quantized_minicpm5;
-mod token_output_stream;
-mod tokenizer;
-mod utils;
+use tiny_cpm::{common, exec, models, position_embed, quantized_minicpm5, token_output_stream, tokenizer, utils};
 
 use anyhow::{Result, bail};
 
