@@ -34,8 +34,13 @@ pub struct VadResult {
 /// Priority: CLI flag > env var > default.
 #[derive(Default, Clone)]
 pub struct VadOverrides {
-    pub end_silence_ratio: Option<f32>,
+    pub speech_threshold: Option<f32>,
+    pub min_speech_frame: Option<usize>,
     pub min_silence_frame: Option<usize>,
+    pub min_speach_ratio: Option<f32>,
+    pub end_silence_ratio: Option<f32>,
+    pub min_speach_frames: Option<usize>,
+    pub look_back_frames: Option<usize>,
 }
 
 pub struct FireRedVad {
@@ -96,35 +101,36 @@ impl FireRedVad {
         };
         let vad_model = DetectModel::new(vb, model_cfg)?;
         // CLI overrides (from live flags) take priority over env, which takes
-        // priority over the realtime defaults.
+        // priority over the realtime defaults. Helper: cli > env > default.
         let ov = overrides.unwrap_or_default();
+        let envf = |key: &str, cli: Option<f32>, default: f32| -> f32 {
+            cli.or_else(|| std::env::var(key).ok().and_then(|s| s.parse().ok()))
+                .unwrap_or(default)
+        };
+        let envu = |key: &str, cli: Option<usize>, default: usize| -> usize {
+            cli.or_else(|| std::env::var(key).ok().and_then(|s| s.parse().ok()))
+                .unwrap_or(default)
+        };
         // Postprocessor config (VadPostprocessor reads these).
-        cfg.speech_threshold = env_f32("VAD_SPEECH_THRESHOLD", cfg.speech_threshold);
-        cfg.min_speech_frame = env_usize("VAD_MIN_SPEECH_FRAME", cfg.min_speech_frame);
-        // Default min_silence_frame raised from upstream 20 to 28 for realtime
+        cfg.speech_threshold = envf("VAD_SPEECH_THRESHOLD", ov.speech_threshold, cfg.speech_threshold);
+        cfg.min_speech_frame = envu("VAD_MIN_SPEECH_FRAME", ov.min_speech_frame, cfg.min_speech_frame);
+        // Default min_silence_frame 45 (raised from upstream 20) for realtime
         // dialogue: a longer minimum trailing silence before endpointing, so
-        // mid-sentence pauses (200-300 ms between words/clauses) don't cut the
-        // user off. The `vad` subcommand processes whole files so this doesn't
-        // affect it.
-        cfg.min_silence_frame =
-            ov.min_silence_frame
-                .or_else(|| std::env::var("VAD_MIN_SILENCE_FRAME").ok().and_then(|s| s.parse().ok()))
-                .unwrap_or(45);
+        // mid-sentence pauses don't cut the user off. The `vad` subcommand
+        // processes whole files so this doesn't affect it.
+        cfg.min_silence_frame = envu("VAD_MIN_SILENCE_FRAME", ov.min_silence_frame, 45);
         let vad_postprocessor = VadPostprocessor::new(&cfg);
-        // Env overrides for the streaming segment logic in detect_frame.
-        let min_speach_ratio = env_f32("VAD_MIN_SPEACH_RATIO", 0.1);
+        // Streaming segment logic in detect_frame.
+        let min_speach_ratio = envf("VAD_MIN_SPEACH_RATIO", ov.min_speach_ratio, 0.1);
         // Default end_silence_ratio 0.9: require 90% silence in the look-back
         // window. Spiky mics (bone-conduction headsets) produce periodic dips in
         // continuous speech that a lower ratio endpoints on, fragmenting one
         // utterance into many short turns.
-        let end_silence_ratio = ov
-            .end_silence_ratio
-            .or_else(|| std::env::var("VAD_END_SILENCE_RATIO").ok().and_then(|s| s.parse().ok()))
-            .unwrap_or(0.9);
-        let min_speach_frames = env_usize("VAD_MIN_SPEACH_FRAMES", 30);
+        let end_silence_ratio = envf("VAD_END_SILENCE_RATIO", ov.end_silence_ratio, 0.9);
+        let min_speach_frames = envu("VAD_MIN_SPEACH_FRAMES", ov.min_speach_frames, 30);
         // Default look_back_frames 50: a longer window needs sustained silence,
         // so inter-phrase dips don't endpoint.
-        let look_back_frames = env_usize("VAD_LOOK_BACK_FRAMES", 50);
+        let look_back_frames = envu("VAD_LOOK_BACK_FRAMES", ov.look_back_frames, 50);
         eprintln!(
             "vad params: speech_threshold={} min_speech_frame={} min_silence_frame={} | min_speach_ratio={} end_silence_ratio={} min_speach_frames={} look_back_frames={}",
             cfg.speech_threshold, cfg.min_speech_frame, cfg.min_silence_frame,
@@ -302,19 +308,6 @@ impl FireRedVad {
     }
 }
 
-fn env_f32(key: &str, default: f32) -> f32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 /// aha `utils::get_device` (metal-build branch; tiny-cpm is Metal-only).
 fn get_device(device: Option<&Device>) -> Device {

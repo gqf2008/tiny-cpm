@@ -52,13 +52,16 @@ const MOSS_MAX_FRAMES: usize = 300;
 /// TTS streaming granularity: decode+emit every this many codec frames
 /// (25 frames @ 12.5 fps ~= 2 s of audio per chunk).
 const TTS_CHUNK_FRAMES: usize = 25;
-/// Skip VAD segments shorter than this (default 0.5 s at 16kHz). Lower to keep
-/// briefer utterances (e.g. 0.3 s). Override with `LIVE_MIN_SEGMENT_SAMPLES`.
-fn min_segment_samples() -> usize {
-    std::env::var("LIVE_MIN_SEGMENT_SAMPLES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8000)
+/// Skip VAD segments shorter than this (default 0.5 s at 16kHz = 8000). Lower
+/// to keep briefer utterances (e.g. 0.3 s = 4800). Priority: --min-segment-
+/// samples flag > LIVE_MIN_SEGMENT_SAMPLES env > 8000.
+fn min_segment_samples(cli: Option<usize>) -> usize {
+    cli.or_else(|| {
+        std::env::var("LIVE_MIN_SEGMENT_SAMPLES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    })
+    .unwrap_or(8000)
 }
 /// Minimum peak abs-sample for a segment to be accepted (default 0.0 = off).
 /// A single mic can't beamform, but distant speech (a coworker across the
@@ -226,7 +229,7 @@ fn synth_and_play(
 }
 
 pub fn run(args: &[String]) -> Result<()> {
-    let usage = "usage: tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in] [--ref <wav>] [--vad-end-silence-ratio <f>] [--vad-min-silence <n>] [--min-seg-peak <f>] [--barge-onset-frames <n>] [--min-barge-rms <f>] [--mic-gain <f>]";
+    let usage = "usage: tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in] [--ref <wav>] [--vad-speech-threshold <f>] [--vad-min-speech-frame <n>] [--vad-min-silence <n>] [--vad-min-speach-ratio <f>] [--vad-min-speach-frames <n>] [--vad-end-silence-ratio <f>] [--vad-look-back-frames <n>] [--min-segment-samples <n>] [--min-seg-peak <f>] [--barge-onset-frames <n>] [--min-barge-rms <f>] [--mic-gain <f>]";
     if args.len() < 6 {
         bail!(usage);
     }
@@ -241,11 +244,17 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut max_tokens = DEFAULT_MAX_TOKENS;
     let mut barge_in = false;
     let mut ref_wav: Option<String> = None;
-    // High-frequency VAD/tuning knobs exposed as flags (the rest stay env-only;
-    // these take priority over env, which takes priority over the defaults).
+    // High-frequency VAD/tuning knobs exposed as flags (priority: flag > env >
+    // default). See `vad params:` at startup for the effective values.
     let mut vad_end_silence_ratio: Option<f32> = None;
     let mut vad_min_silence: Option<usize> = None;
+    let mut vad_speech_threshold: Option<f32> = None;
+    let mut vad_min_speech_frame: Option<usize> = None;
+    let mut vad_min_speach_ratio: Option<f32> = None;
+    let mut vad_min_speach_frames: Option<usize> = None;
+    let mut vad_look_back_frames: Option<usize> = None;
     let mut min_seg_peak_cli: Option<f32> = None;
+    let mut min_segment_samples_cli: Option<usize> = None;
     let mut barge_onset_cli: Option<usize> = None;
     let mut min_barge_rms_cli: Option<f32> = None;
     let mut mic_gain_cli: Option<f32> = None;
@@ -301,6 +310,60 @@ pub fn run(args: &[String]) -> Result<()> {
                         .ok_or_else(|| anyhow!("--vad-min-silence requires a count. {usage}"))?
                         .parse()
                         .map_err(|_| anyhow!("--vad-min-silence must be a positive integer. {usage}"))?,
+                );
+            }
+            "--vad-speech-threshold" => {
+                i += 1;
+                vad_speech_threshold = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--vad-speech-threshold requires a float. {usage}"))?
+                        .parse()
+                        .map_err(|_| anyhow!("--vad-speech-threshold must be a float. {usage}"))?,
+                );
+            }
+            "--vad-min-speech-frame" => {
+                i += 1;
+                vad_min_speech_frame = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--vad-min-speech-frame requires a count. {usage}"))?
+                        .parse()
+                        .map_err(|_| anyhow!("--vad-min-speech-frame must be a positive integer. {usage}"))?,
+                );
+            }
+            "--vad-min-speach-ratio" => {
+                i += 1;
+                vad_min_speach_ratio = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--vad-min-speach-ratio requires a float. {usage}"))?
+                        .parse()
+                        .map_err(|_| anyhow!("--vad-min-speach-ratio must be a float. {usage}"))?,
+                );
+            }
+            "--vad-min-speach-frames" => {
+                i += 1;
+                vad_min_speach_frames = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--vad-min-speach-frames requires a count. {usage}"))?
+                        .parse()
+                        .map_err(|_| anyhow!("--vad-min-speach-frames must be a positive integer. {usage}"))?,
+                );
+            }
+            "--vad-look-back-frames" => {
+                i += 1;
+                vad_look_back_frames = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--vad-look-back-frames requires a count. {usage}"))?
+                        .parse()
+                        .map_err(|_| anyhow!("--vad-look-back-frames must be a positive integer. {usage}"))?,
+                );
+            }
+            "--min-segment-samples" => {
+                i += 1;
+                min_segment_samples_cli = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--min-segment-samples requires a count. {usage}"))?
+                        .parse()
+                        .map_err(|_| anyhow!("--min-segment-samples must be a positive integer. {usage}"))?,
                 );
             }
             "--min-seg-peak" => {
@@ -362,8 +425,13 @@ pub fn run(args: &[String]) -> Result<()> {
         Some(&Device::Cpu),
         None,
         Some(VadOverrides {
-            end_silence_ratio: vad_end_silence_ratio,
+            speech_threshold: vad_speech_threshold,
+            min_speech_frame: vad_min_speech_frame,
             min_silence_frame: vad_min_silence,
+            min_speach_ratio: vad_min_speach_ratio,
+            end_silence_ratio: vad_end_silence_ratio,
+            min_speach_frames: vad_min_speach_frames,
+            look_back_frames: vad_look_back_frames,
         }),
     )?;
     eprintln!(
@@ -553,7 +621,7 @@ pub fn run(args: &[String]) -> Result<()> {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
-                if samples.len() < min_segment_samples() {
+                if samples.len() < min_segment_samples(min_segment_samples_cli) {
                     continue;
                 }
                 // Energy gate: drop distant/bystander speech (a coworker across
@@ -768,7 +836,7 @@ pub fn run(args: &[String]) -> Result<()> {
         // orig_audio holds the raw 16kHz mono samples as fed (the x32768
         // scaling inside detect_frame is only used for feature extraction).
         let samples = segment.to_vec1::<f32>()?;
-        if samples.len() < min_segment_samples() {
+        if samples.len() < min_segment_samples(min_segment_samples_cli) {
             eprintln!(
                 "turn skipped: segment too short ({:.2}s)",
                 samples.len() as f32 / VAD_SAMPLE_RATE as f32
