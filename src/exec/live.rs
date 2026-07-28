@@ -60,6 +60,17 @@ fn min_segment_samples() -> usize {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8000)
 }
+/// Minimum peak abs-sample for a segment to be accepted (default 0.0 = off).
+/// A single mic can't beamform, but distant speech (a coworker across the
+/// desk) has a much lower peak than the user close to the mic — set this just
+/// below YOUR speech peak (read from the `segment peak` log line) to drop
+/// bystanders. Override with `LIVE_MIN_SEG_PEAK`.
+fn min_seg_peak() -> f32 {
+    std::env::var("LIVE_MIN_SEG_PEAK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0)
+}
 /// Silence appended in simulation mode so the last utterance endpoints.
 const SIM_TRAILING_SILENCE_SEC: usize = 1;
 /// Consecutive neural-speech frames required before firing barge-in (hysteresis
@@ -415,6 +426,20 @@ pub fn run(args: &[String]) -> Result<()> {
                 if samples.len() < min_segment_samples() {
                     continue;
                 }
+                // Energy gate: drop distant/bystander speech (a coworker across
+                // the desk has a much lower peak than the user close to the mic).
+                let peak = samples
+                    .iter()
+                    .map(|s| s.abs())
+                    .fold(0.0f32, |a, b| a.max(b));
+                let gate = min_seg_peak();
+                if peak < gate {
+                    eprintln!(
+                        "segment dropped: peak {peak:.3} < gate {gate:.3} (distant/noise)"
+                    );
+                    continue;
+                }
+                eprintln!("segment peak {peak:.3}");
                 let _ = seg_tx.send(samples);
             }
         });
@@ -615,6 +640,19 @@ pub fn run(args: &[String]) -> Result<()> {
             );
             continue;
         }
+        // Energy gate: drop distant/bystander speech.
+        let peak = samples
+            .iter()
+            .map(|s| s.abs())
+            .fold(0.0f32, |a, b| a.max(b));
+        let gate = min_seg_peak();
+        if peak < gate {
+            eprintln!(
+                "turn skipped: peak {peak:.3} < gate {gate:.3} (distant/noise)"
+            );
+            continue;
+        }
+        eprintln!("segment peak {peak:.3}");
         turn += 1;
         eprintln!(
             "=== turn {turn}: utterance {:.2}s ===",
