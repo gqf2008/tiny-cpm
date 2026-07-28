@@ -56,17 +56,11 @@ const TTS_CHUNK_FRAMES: usize = 25;
 const MIN_SEGMENT_SAMPLES: usize = 8000;
 /// Silence appended in simulation mode so the last utterance endpoints.
 const SIM_TRAILING_SILENCE_SEC: usize = 1;
-/// Barge-in onset RMS threshold (mic-frame RMS above this while speaking
-/// counts as an interrupt). Override with `LIVE_BARGE_RMS`. Headphones-only:
-/// with speakers, TTS echo has high RMS and false-triggers.
-fn barge_onset_rms() -> f32 {
-    std::env::var("LIVE_BARGE_RMS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.02)
-}
-/// Consecutive onset frames required before firing barge-in (avoids a single
-/// loud transient). Override with `LIVE_BARGE_ONSET_FRAMES`.
+/// Consecutive neural-speech frames required before firing barge-in (hysteresis
+/// so a single borderline frame doesn't trigger). Override with
+/// `LIVE_BARGE_ONSET_FRAMES`. Barge uses the FireRedVAD neural per-frame
+/// is_speech (not RMS) so it can tell the user's speech apart from headphone
+/// bleed / breath, which sit at the same RMS as soft speech.
 fn barge_onset_frames() -> usize {
     std::env::var("LIVE_BARGE_ONSET_FRAMES")
         .ok()
@@ -350,7 +344,6 @@ pub fn run(args: &[String]) -> Result<()> {
         let speaking_l = speaking.clone();
         let barge_l = barge.clone();
         let speaker_q_l = speaker_queue.clone();
-        let onset_rms = barge_onset_rms();
         let onset_frames = barge_onset_frames();
         std::thread::spawn(move || {
             // cpal::Stream is !Send on macOS — create the mic on this thread
@@ -372,18 +365,24 @@ pub fn run(args: &[String]) -> Result<()> {
                 };
                 frame_count += 1;
                 let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
+                // Neural VAD per frame (sets last_frame_speech, may return a
+                // completed segment). detect_frame_f32 consumes `frame`.
+                let vad_result = match vad.detect_frame_f32(frame, 1, Some(VAD_SAMPLE_RATE)) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let is_speech = vad.last_frame_speech();
                 // Barge only while audio is actually playing (speaker queue
-                // non-empty) — during ASR/LLM there's nothing to interrupt and a
-                // transient (breath / headphone bleed / keypress) would falsely
-                // abort the reply and yield "sometimes no audio".
+                // non-empty) AND the neural VAD says this frame is speech —
+                // RMS can't separate soft speech from headphone bleed / breath
+                // (they sit at the same RMS), but the neural VAD can.
                 let playing = !speaker_q_l.lock().unwrap().is_empty();
-                if speaking_l.load(Ordering::Relaxed)
-                    && playing
-                    && rms > onset_rms
-                {
+                if speaking_l.load(Ordering::Relaxed) && playing && is_speech {
                     onset_count += 1;
                     if onset_count >= onset_frames && !barge_l.swap(true, Ordering::Relaxed) {
-                        eprintln!("barge-in: onset rms {rms:.3} — cancelling reply");
+                        eprintln!(
+                            "barge-in: neural speech onset (rms {rms:.3}) — cancelling reply"
+                        );
                         speaker_q_l.lock().unwrap().clear();
                     }
                 } else {
@@ -393,14 +392,11 @@ pub fn run(args: &[String]) -> Result<()> {
                 // mic or a VAD that never fires otherwise looks like a hang).
                 if frame_count % 80 == 0 {
                     eprintln!(
-                        "heartbeat: mic rms {rms:.4} ({})",
+                        "heartbeat: mic rms {rms:.4} speech={is_speech} ({})",
                         if playing { "playing" } else { "listening" }
                     );
                 }
-                let Some(result) = (match vad.detect_frame_f32(frame, 1, Some(VAD_SAMPLE_RATE)) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                }) else {
+                let Some(result) = vad_result else {
                     continue;
                 };
                 let Some(segment) = result.orig_audio else {

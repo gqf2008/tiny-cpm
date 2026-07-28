@@ -43,6 +43,12 @@ pub struct FireRedVad {
     look_back_frames: usize,
     min_speach_ratio: f32,
     end_silence_ratio: f32,
+    // Per-frame neural speech flag from the last `detect_frame` call — set from
+    // `preds_sum > probs_len * min_speach_ratio` (the same threshold the segment
+    // accumulator uses). Exposed for realtime barge-in: a caller can read it to
+    // react at speech onset (neural, robust to headphone bleed / breath) instead
+    // of a crude RMS threshold.
+    last_frame_speech: bool,
 }
 
 impl FireRedVad {
@@ -90,6 +96,7 @@ impl FireRedVad {
             look_back_frames: 15,  // 约 80ms
             min_speach_ratio: 0.1,
             end_silence_ratio: 0.8,
+            last_frame_speech: false,
         })
     }
 
@@ -115,7 +122,9 @@ impl FireRedVad {
         let preds_sum = binary_preds.sum_all()?.to_scalar::<u32>()?;
         let probs_len = probs.dim(0)?;
         // 输入数据中 is_speech > 0.1, 认为这帧数据有人声
-        let final_data = if preds_sum as f32 > probs_len as f32 * self.min_speach_ratio {
+        let frame_is_speech = preds_sum as f32 > probs_len as f32 * self.min_speach_ratio;
+        self.last_frame_speech = frame_is_speech;
+        let final_data = if frame_is_speech {
             self.speech_cache.push(audio_frame.clone());
             let preds = binary_preds.to_vec1::<u32>()?;
             self.pred_cache.extend_from_slice(&preds);
@@ -232,6 +241,15 @@ impl FireRedVad {
 
     pub fn reset(&mut self) {
         self.caches = None;
+    }
+
+    /// Whether the neural VAD judged the **last** `detect_frame` call's frame as
+    /// speech (`preds_sum > probs_len * min_speach_ratio`). Read after
+    /// `detect_frame_f32` to drive realtime barge-in at speech onset without a
+    /// crude RMS threshold (which can't separate soft speech from headphone
+    /// bleed / breath).
+    pub fn last_frame_speech(&self) -> bool {
+        self.last_frame_speech
     }
 }
 
