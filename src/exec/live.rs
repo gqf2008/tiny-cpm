@@ -372,7 +372,15 @@ pub fn run(args: &[String]) -> Result<()> {
                 };
                 frame_count += 1;
                 let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
-                if speaking_l.load(Ordering::Relaxed) && rms > onset_rms {
+                // Barge only while audio is actually playing (speaker queue
+                // non-empty) — during ASR/LLM there's nothing to interrupt and a
+                // transient (breath / headphone bleed / keypress) would falsely
+                // abort the reply and yield "sometimes no audio".
+                let playing = !speaker_q_l.lock().unwrap().is_empty();
+                if speaking_l.load(Ordering::Relaxed)
+                    && playing
+                    && rms > onset_rms
+                {
                     onset_count += 1;
                     if onset_count >= onset_frames && !barge_l.swap(true, Ordering::Relaxed) {
                         eprintln!("barge-in: onset rms {rms:.3} — cancelling reply");
@@ -386,11 +394,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 if frame_count % 80 == 0 {
                     eprintln!(
                         "heartbeat: mic rms {rms:.4} ({})",
-                        if speaking_l.load(Ordering::Relaxed) {
-                            "speaking"
-                        } else {
-                            "listening"
-                        }
+                        if playing { "playing" } else { "listening" }
                     );
                 }
                 let Some(result) = (match vad.detect_frame_f32(frame, 1, Some(VAD_SAMPLE_RATE)) {

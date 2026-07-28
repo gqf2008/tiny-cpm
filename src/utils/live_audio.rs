@@ -43,8 +43,10 @@ impl MicCapture {
             .map_err(|e| anyhow!("default_input_config: {e}"))?;
         let device_sr = config.sample_rate().0 as usize;
         let device_channels = config.channels() as usize;
+        let device_name = device.name().unwrap_or_default();
         eprintln!(
-            "mic: {} Hz, {} ch, {:?}",
+            "mic: \"{}\" ({} Hz, {} ch, {:?})",
+            device_name,
             device_sr,
             device_channels,
             config.sample_format()
