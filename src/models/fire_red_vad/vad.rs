@@ -63,7 +63,7 @@ impl FireRedVad {
             .and_then(|s| s.to_str())
             .unwrap_or("VAD")
             .to_string();
-        let (model_cfg, cfg) = if model_name.to_lowercase().contains("stream") {
+        let (model_cfg, mut cfg) = if model_name.to_lowercase().contains("stream") {
             (
                 DetectModelConfig::default_stream_vad(),
                 FireRedVadConfig::default_stream_vad(),
@@ -80,7 +80,23 @@ impl FireRedVad {
             )
         };
         let vad_model = DetectModel::new(vb, model_cfg)?;
+        // Env overrides for the postprocessor config (VadPostprocessor reads
+        // these). Lower speech_threshold / min_speech_frame to catch softer or
+        // briefer utterances; lower min_silence_frame to endpoint sooner.
+        cfg.speech_threshold = env_f32("VAD_SPEECH_THRESHOLD", cfg.speech_threshold);
+        cfg.min_speech_frame = env_usize("VAD_MIN_SPEECH_FRAME", cfg.min_speech_frame);
+        cfg.min_silence_frame = env_usize("VAD_MIN_SILENCE_FRAME", cfg.min_silence_frame);
         let vad_postprocessor = VadPostprocessor::new(&cfg);
+        // Env overrides for the streaming segment logic in detect_frame.
+        let min_speach_ratio = env_f32("VAD_MIN_SPEACH_RATIO", 0.1);
+        let end_silence_ratio = env_f32("VAD_END_SILENCE_RATIO", 0.8);
+        let min_speach_frames = env_usize("VAD_MIN_SPEACH_FRAMES", 30);
+        let look_back_frames = env_usize("VAD_LOOK_BACK_FRAMES", 15);
+        eprintln!(
+            "vad params: speech_threshold={} min_speech_frame={} min_silence_frame={} | min_speach_ratio={} end_silence_ratio={} min_speach_frames={} look_back_frames={}",
+            cfg.speech_threshold, cfg.min_speech_frame, cfg.min_silence_frame,
+            min_speach_ratio, end_silence_ratio, min_speach_frames, look_back_frames
+        );
         Ok(Self {
             audio_feat,
             vad_model,
@@ -92,10 +108,10 @@ impl FireRedVad {
             frame_length_sample: 400,
             speech_cache: vec![],
             pred_cache: vec![],
-            min_speach_frames: 30, // 约 250ms
-            look_back_frames: 15,  // 约 80ms
-            min_speach_ratio: 0.1,
-            end_silence_ratio: 0.8,
+            min_speach_frames, // 约 250ms
+            look_back_frames,  // 约 80ms
+            min_speach_ratio,
+            end_silence_ratio,
             last_frame_speech: false,
         })
     }
@@ -251,6 +267,20 @@ impl FireRedVad {
     pub fn last_frame_speech(&self) -> bool {
         self.last_frame_speech
     }
+}
+
+fn env_f32(key: &str, default: f32) -> f32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 /// aha `utils::get_device` (metal-build branch; tiny-cpm is Metal-only).

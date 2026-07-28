@@ -52,8 +52,14 @@ const MOSS_MAX_FRAMES: usize = 300;
 /// TTS streaming granularity: decode+emit every this many codec frames
 /// (25 frames @ 12.5 fps ~= 2 s of audio per chunk).
 const TTS_CHUNK_FRAMES: usize = 25;
-/// Skip VAD segments shorter than this (0.5 s at 16kHz).
-const MIN_SEGMENT_SAMPLES: usize = 8000;
+/// Skip VAD segments shorter than this (default 0.5 s at 16kHz). Lower to keep
+/// briefer utterances (e.g. 0.3 s). Override with `LIVE_MIN_SEGMENT_SAMPLES`.
+fn min_segment_samples() -> usize {
+    std::env::var("LIVE_MIN_SEGMENT_SAMPLES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8000)
+}
 /// Silence appended in simulation mode so the last utterance endpoints.
 const SIM_TRAILING_SILENCE_SEC: usize = 1;
 /// Consecutive neural-speech frames required before firing barge-in (hysteresis
@@ -406,7 +412,7 @@ pub fn run(args: &[String]) -> Result<()> {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
-                if samples.len() < MIN_SEGMENT_SAMPLES {
+                if samples.len() < min_segment_samples() {
                     continue;
                 }
                 let _ = seg_tx.send(samples);
@@ -602,7 +608,7 @@ pub fn run(args: &[String]) -> Result<()> {
         // orig_audio holds the raw 16kHz mono samples as fed (the x32768
         // scaling inside detect_frame is only used for feature extraction).
         let samples = segment.to_vec1::<f32>()?;
-        if samples.len() < MIN_SEGMENT_SAMPLES {
+        if samples.len() < min_segment_samples() {
             eprintln!(
                 "turn skipped: segment too short ({:.2}s)",
                 samples.len() as f32 / VAD_SAMPLE_RATE as f32
