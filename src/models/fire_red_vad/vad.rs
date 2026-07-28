@@ -184,8 +184,10 @@ impl FireRedVad {
             let preds = binary_preds.to_vec1::<u32>()?;
             self.pred_cache.extend_from_slice(&preds);
 
-            // 人声缓存数据过少，等待下一帧
-            if self.pred_cache.len() < self.min_speach_frames {
+            // 人声缓存数据过少，等待下一帧。需要同时积累够 min_speach_frames
+            // AND 至少 look_back_frames（否则下面 `len - look_back_frames` 在
+            // usize 上下溢）；取两者最大值作门槛。
+            if self.pred_cache.len() < self.min_speach_frames.max(self.look_back_frames) {
                 None
             } else {
                 // 判断是否停止说话

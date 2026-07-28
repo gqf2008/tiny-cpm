@@ -109,15 +109,24 @@ async function start() {
     // Zero the output so the mic never leaks to the speakers (feedback).
     e.outputBuffer.getChannelData(0).fill(0);
     if (!ws || ws.readyState !== 1) return;
-    const in0 = e.inputBuffer.getChannelData(0);   // 48k mono, length 4096
+    const in0 = e.inputBuffer.getChannelData(0);   // ctx.sampleRate mono
     // mic-level meter (rms of the input)
     let s = 0; for (let i = 0; i < in0.length; i++) s += in0[i]*in0[i];
     const r = Math.sqrt(s / in0.length);
     meter.style.width = Math.min(100, r * 300) + '%';
-    // downsample 48k→16k: take every 3rd sample, apply gain
-    const n = Math.floor(in0.length / 3);
-    const out = new Float32Array(n);
-    for (let i = 0; i < n; i++) out[i] = Math.max(-1, Math.min(1, in0[i*3] * micGain));
+    // Linear-resample ctx.sampleRate → 16k (NOT every-3rd — the AudioContext
+    // may not be exactly 48000, and a wrong ratio corrupts the VAD/ASR fbank).
+    const ratio = ctx.sampleRate / 16000;
+    const outLen = Math.floor(in0.length / ratio);
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const idx = i * ratio;
+      const i0 = Math.floor(idx);
+      const i1 = Math.min(i0 + 1, in0.length - 1);
+      const frac = idx - i0;
+      const v = in0[i0] * (1 - frac) + in0[i1] * frac;
+      out[i] = Math.max(-1, Math.min(1, v * micGain));
+    }
     // buffer + send 400-sample chunks
     pend.push(out);
     while (pendLen() >= FRAME) {
