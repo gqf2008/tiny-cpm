@@ -42,7 +42,7 @@ use tiny_cpm::{
 };
 
 const ASR_MAX_TOKENS: usize = 512;
-const DEFAULT_MAX_TOKENS: usize = 256;
+const DEFAULT_MAX_TOKENS: usize = 1024;
 const MOSS_MAX_FRAMES: usize = 300;
 const TTS_CHUNK_FRAMES: usize = 5; // small chunks → smaller base64 deltas → less main-thread blocking in the browser
 const VAD_FRAME_SAMPLES: usize = 400;
@@ -50,7 +50,7 @@ const VAD_SAMPLE_RATE: usize = 16_000;
 const MIN_SEGMENT_SAMPLES: usize = 8000;
 const OUT_SR: usize = 24_000;     // output sample rate (per doc)
 const DEFAULT_PERSONA: &str =
-    "你是一个语音助手的回复模块。直接用一两句简短的口语回答用户，禁止输出思考过程、分析、复述用户问题或任何 markdown 格式。";
+    "你是一个语音助手。先简短思考用户的问题，然后用一两句简短的口语回答。不要输出 markdown 格式。";
 
 struct Engines {
     device: Device,
@@ -627,7 +627,7 @@ fn main_loop(
             Some(&persona),
             &history,
             &transcript,
-            true,
+            false,
             DEFAULT_MAX_TOKENS,
             &mut sink,
             Some(&barge),
