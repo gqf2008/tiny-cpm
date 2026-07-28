@@ -76,6 +76,19 @@ VAD/tuning flags (priority: flag > env var > default). VAD: `--vad-speech-thresh
 
 MOSS `--ref` voice cloning: the codec encode (encoder + RVQ) runs on **CPU + f32**, not Metal — Metal f32 drifted on reference audio longer than ~16 s (async-kernel races in the projected-transformer attention + RVQ residual accumulation), producing garbage conditioning codes; a 22 s ref round-trips to noise on Metal but clean on CPU. The decoder stays on Metal (it only decodes short generated sequences). `codec-rt` round-trips a WAV through encode→decode to verify the codec reproduces the input.
 
+A seventh entry point, the `web` crate, is a WebSocket voice-dialogue server in `web/` (a workspace member). The browser does mic capture via `getUserMedia` (echoCancellation/noiseSuppression/autoGainControl — so **speakers work without headphones**, no AEC needed in our code), TTS playback, **live VAD-param sliders**, and a **persona field** (LLM system prompt). It reuses the same engines; barge-in works with speakers because the browser AEC removes the echo.
+
+```bash
+cargo run --release --manifest-path web/Cargo.toml -- \
+  --vad-dir models/FireRedVAD-Stream-VAD --asr-dir models/Qwen3-ASR-0.6B \
+  --minicpm-dir models/MiniCPM5-1B --tokenizer models/MiniCPM5-1B/tokenizer.json \
+  --moss-dir models/MOSS-TTS-Nano --codec-dir models/MOSS-Audio-Tokenizer-Nano \
+  --ref bailian-console-aliyun-com.wav [--addr 127.0.0.1:8080]
+# open the printed URL in Chrome, grant mic permission
+```
+
+tiny-cpm is lib+bin (`src/lib.rs` exposes the modules) so the `web` crate depends on it via path.
+
 Output contract: the payload (chat text / transcript) goes to **stdout**; all diagnostics (load time, TTFT, tok/s) go to **stderr**. TTS writes its WAV to the given path. Keep it that way — stdout is what consumers may pipe.
 
 Other commands:
