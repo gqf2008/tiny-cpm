@@ -55,6 +55,12 @@ enum OutMsg {
     StopAudio,
 }
 
+/// A turn's input: either captured audio (VAD → ASR) or typed text (skip ASR).
+enum TurnInput {
+    Audio(Vec<f32>),
+    Text(String),
+}
+
 #[derive(Deserialize, Default, Clone)]
 #[serde(default)]
 struct VadMsg {
@@ -73,12 +79,19 @@ struct PersonaMsg {
 }
 
 #[derive(Deserialize)]
+struct TextMsg {
+    text: String,
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "type")]
 enum ClientMsg {
     #[serde(rename = "vad")]
     Vad(VadMsg),
     #[serde(rename = "persona")]
     Persona(PersonaMsg),
+    #[serde(rename = "text")]
+    Text(TextMsg),
 }
 
 struct ServerState {
@@ -187,7 +200,8 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
     let (sink, stream) = socket.split();
     let (out_tx, out_rx) = mpsc::channel::<OutMsg>(64);
     let (mic_tx, mic_rx) = mpsc::channel::<Vec<f32>>(256);
-    let (seg_tx, seg_rx) = mpsc::channel::<Vec<f32>>(16);
+    let (seg_tx, seg_rx) = mpsc::channel::<TurnInput>(16);
+    let seg_tx_listener = seg_tx.clone(); // listener + read-task both send
     let (param_tx, param_rx) = mpsc::channel::<VadOverrides>(64);
 
     let speaking = Arc::new(AtomicBool::new(false));
@@ -247,6 +261,12 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
                         *persona_r.lock().unwrap() =
                             p.text.filter(|s| !s.trim().is_empty());
                     }
+                    Ok(ClientMsg::Text(tx)) => {
+                        let s = tx.text.trim().to_string();
+                        if !s.is_empty() {
+                            let _ = seg_tx.try_send(TurnInput::Text(s));
+                        }
+                    }
                     Err(e) => eprintln!("bad client json: {e}: {t}"),
                 },
                 Message::Close(_) => break,
@@ -265,7 +285,7 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
         listener_loop(
             vad_dir,
             mic_rx,
-            seg_tx,
+            seg_tx_listener,
             param_rx,
             speaking_l,
             streaming_l,
@@ -295,7 +315,7 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
 fn listener_loop(
     vad_dir: String,
     mut mic_rx: mpsc::Receiver<Vec<f32>>,
-    seg_tx: mpsc::Sender<Vec<f32>>,
+    seg_tx: mpsc::Sender<TurnInput>,
     mut param_rx: mpsc::Receiver<VadOverrides>,
     _speaking: Arc<AtomicBool>,
     streaming: Arc<AtomicBool>,
@@ -355,7 +375,7 @@ fn listener_loop(
         if samples.len() < MIN_SEGMENT_SAMPLES {
             continue;
         }
-        if seg_tx.blocking_send(samples).is_err() {
+        if seg_tx.blocking_send(TurnInput::Audio(samples)).is_err() {
             break;
         }
     }
@@ -363,7 +383,7 @@ fn listener_loop(
 
 fn main_loop(
     eng: Arc<Mutex<Engines>>,
-    mut seg_rx: mpsc::Receiver<Vec<f32>>,
+    mut seg_rx: mpsc::Receiver<TurnInput>,
     out_tx: mpsc::Sender<OutMsg>,
     persona: Arc<Mutex<Option<String>>>,
     barge: Arc<AtomicBool>,
@@ -372,27 +392,35 @@ fn main_loop(
 ) {
     let mut turn = 0usize;
     loop {
-        let samples = match seg_rx.blocking_recv() {
+        let input = match seg_rx.blocking_recv() {
             Some(s) => s,
             None => break,
         };
         barge.store(false, Ordering::Relaxed);
         speaking.store(true, Ordering::Relaxed);
         turn += 1;
-        eprintln!(
-            "=== turn {turn}: utterance {:.2}s ===",
-            samples.len() as f32 / VAD_SAMPLE_RATE as f32
-        );
-
-        let mut eng = eng.lock().unwrap();
-        let transcript = match eng.asr.transcribe_samples(&samples, ASR_MAX_TOKENS) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("turn {turn}: asr error: {e}");
-                speaking.store(false, Ordering::Relaxed);
-                continue;
+        let transcript = match input {
+            TurnInput::Audio(samples) => {
+                eprintln!(
+                    "=== turn {turn}: utterance {:.2}s ===",
+                    samples.len() as f32 / VAD_SAMPLE_RATE as f32
+                );
+                let mut eng = eng.lock().unwrap();
+                match eng.asr.transcribe_samples(&samples, ASR_MAX_TOKENS) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("turn {turn}: asr error: {e}");
+                        speaking.store(false, Ordering::Relaxed);
+                        continue;
+                    }
+                }
+            }
+            TurnInput::Text(t) => {
+                eprintln!("=== turn {turn}: text input ===");
+                t
             }
         };
+        let mut eng = eng.lock().unwrap();
         if transcript.trim().is_empty() {
             eprintln!("turn {turn}: empty transcript, skipping");
             speaking.store(false, Ordering::Relaxed);

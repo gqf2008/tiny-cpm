@@ -15,9 +15,13 @@
   .you { color: #9cdcfe; } .tiny { color: #d7ba7d; }
   input[type=range] { width: 200px; vertical-align: middle; }
   label { display: inline-block; width: 150px; }
-  textarea { width: 100%; box-sizing: border-box; height: 50px; background: #2d2d2d; color: #e0e0e0; border: 1px solid #444; border-radius: 4px; }
+  textarea, #textInput { width: 100%; box-sizing: border-box; background: #2d2d2d; color: #e0e0e0; border: 1px solid #444; border-radius: 4px; }
+  textarea { height: 50px; } #textInput { height: 30px; padding: 4px 6px; }
   button { background: #0e639c; color: #fff; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; }
   button:disabled { opacity: .4; }
+  #micMeter { width: 100%; height: 8px; background: #333; border-radius: 4px; margin-top: 6px; }
+  #micMeter > div { height: 100%; width: 0; background: #4ec9b0; border-radius: 4px; transition: width .05s; }
+  .hint { color: #888; font-size: 11px; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -26,7 +30,9 @@
   <div class="panel">
     <h2>Session</h2>
     <div>status: <span id="status">idle</span></div>
-    <div style="margin-top:8px"><button id="start">start</button><button id="stop" disabled>stop</button></div>
+    <div style="margin-top:8px"><button id="start">start (mic)</button><button id="stop" disabled>stop</button></div>
+    <div id="micMeter"><div></div></div>
+    <div class="hint">点 start → 授权麦克风 → 直接说话（连续，不用按住）。或下方文本框打字。</div>
     <h2 style="margin-top:12px">Persona / 人设 (LLM system prompt)</h2>
     <textarea id="persona" placeholder="留空=默认助手。例：你是毒舌但热心的技术顾问"></textarea>
     <div style="font-size:11px;color:#888">mic gain (client-side, before AEC)</div>
@@ -47,6 +53,10 @@
 <div class="panel" style="margin-top:12px">
   <h2>Conversation</h2>
   <div id="log"></div>
+  <div style="margin-top:8px;display:flex;gap:6px">
+    <input id="textInput" placeholder="打字回车 = 文本输入（跳过 ASR，直接 LLM→TTS）" disabled>
+    <button id="sendText" disabled>send</button>
+  </div>
 </div>
 
 <script>
@@ -93,10 +103,17 @@ async function start() {
   ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
   const src = ctx.createMediaStreamSource(micStream);
   // capture: 48k mono → downsample to 16k, send 400-sample f32 binary frames
+  const meter = $('micMeter').firstElementChild;
   recNode = ctx.createScriptProcessor(4096, 1, 1);
   recNode.onaudioprocess = e => {
+    // Zero the output so the mic never leaks to the speakers (feedback).
+    e.outputBuffer.getChannelData(0).fill(0);
     if (!ws || ws.readyState !== 1) return;
     const in0 = e.inputBuffer.getChannelData(0);   // 48k mono, length 4096
+    // mic-level meter (rms of the input)
+    let s = 0; for (let i = 0; i < in0.length; i++) s += in0[i]*in0[i];
+    const r = Math.sqrt(s / in0.length);
+    meter.style.width = Math.min(100, r * 300) + '%';
     // downsample 48k→16k: take every 3rd sample, apply gain
     const n = Math.floor(in0.length / 3);
     const out = new Float32Array(n);
@@ -123,7 +140,7 @@ async function start() {
 
   ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { status('listening'); sendVad(); };
+  ws.onopen = () => { status('listening'); sendVad(); $('textInput').disabled = false; $('sendText').disabled = false; };
   ws.onmessage = ev => {
     if (typeof ev.data === 'string') {
       const m = JSON.parse(ev.data);
@@ -141,6 +158,7 @@ async function start() {
 }
 function stop() {
   $('start').disabled = false; $('stop').disabled = true;
+  $('textInput').disabled = true; $('sendText').disabled = true;
   if (ws) { ws.onclose = null; ws.close(); ws = null; }
   if (recNode) { recNode.disconnect(); recNode = null; }
   if (playNode) { playNode.disconnect(); playNode = null; }
@@ -149,6 +167,16 @@ function stop() {
   status('idle');
 }
 $('start').onclick = start; $('stop').onclick = stop;
+
+// text input: type + enter (or send btn) → {type:text}, server skips ASR
+function sendText() {
+  const v = $('textInput').value.trim();
+  if (!v || !ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({type:'text', text: v}));  // server echoes as {you:...}
+  $('textInput').value = '';
+}
+$('sendText').onclick = sendText;
+$('textInput').onkeydown = e => { if (e.key === 'Enter') sendText(); };
 
 // interleaved-stereo → deinterleaved: shiftOne returns the next mono sample
 // (stereo pairs are identical here since TTS is the same on L/R after our
