@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>tiny-cpm voice</title>
+<title>tiny-cpm realtime voice</title>
 <style>
   body { font: 14px/1.5 -apple-system, system-ui, sans-serif; margin: 0; padding: 16px; background: #1a1a1a; color: #e0e0e0; }
   h1 { font-size: 16px; margin: 0 0 12px; }
@@ -11,10 +11,10 @@
   .panel { background: #242424; border-radius: 8px; padding: 12px; flex: 1; min-width: 260px; }
   .panel h2 { font-size: 13px; margin: 0 0 8px; color: #9cdcfe; }
   #status { font-weight: bold; }
-  #log { white-space: pre-wrap; max-height: 320px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 12px; }
-  .you { color: #9cdcfe; } .tiny { color: #d7ba7d; }
+  #log { white-space: pre-wrap; max-height: 280px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 12px; }
+  .you { color: #9cdcfe; } .tiny { color: #d7ba7d; } .ev { color: #666; }
   input[type=range] { width: 200px; vertical-align: middle; }
-  label { display: inline-block; width: 150px; }
+  label { display: inline-block; width: 160px; font-family: ui-monospace, monospace; font-size: 12px; }
   textarea, #textInput { width: 100%; box-sizing: border-box; background: #2d2d2d; color: #e0e0e0; border: 1px solid #444; border-radius: 4px; }
   textarea { height: 50px; } #textInput { height: 30px; padding: 4px 6px; }
   button { background: #0e639c; color: #fff; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; }
@@ -22,53 +22,47 @@
   #micMeter { width: 100%; height: 8px; background: #333; border-radius: 4px; margin-top: 6px; }
   #micMeter > div { height: 100%; width: 0; background: #4ec9b0; border-radius: 4px; transition: width .05s; }
   .hint { color: #888; font-size: 11px; margin-top: 6px; }
-  .param { margin-bottom: 8px; }
-  .param label { width: auto; margin-right: 8px; font-family: ui-monospace, monospace; font-size: 12px; }
-  .param .desc { color: #888; font-size: 11px; margin-top: 2px; line-height: 1.3; }
 </style>
 </head>
 <body>
-<h1>tiny-cpm voice dialogue (browser AEC + live VAD tuning)</h1>
+<h1>tiny-cpm realtime voice (Qwen-Audio protocol)</h1>
 <div class="row">
   <div class="panel">
     <h2>Session</h2>
     <div>status: <span id="status">idle</span></div>
-    <div style="margin-top:8px"><button id="start">start (mic)</button><button id="muteMic" disabled>mute mic</button><button id="stop" disabled>stop</button></div>
+    <div style="margin-top:8px"><button id="start">start</button><button id="muteMic" disabled>mute mic</button><button id="stop" disabled>stop</button></div>
     <div id="micMeter"><div></div></div>
-    <div class="hint">点 start → 授权麦克风 → 直接说话（连续，不用按住）。或下方文本框打字。</div>
-    <h2 style="margin-top:12px">Persona / 人设 (LLM system prompt)</h2>
+    <div class="hint">点 start → 授权麦克风 → 直接说话。或下方文本框打字（回车）。</div>
+    <h2 style="margin-top:12px">Persona / instructions</h2>
     <textarea id="persona" placeholder="留空=默认助手。例：你是毒舌但热心的技术顾问"></textarea>
-    <div style="font-size:11px;color:#888">mic gain (client-side, before AEC)</div>
-    <label>mic gain <span id="micGainV">1.0</span>×</label>
-    <input type="range" id="micGain" min="1" max="16" step="0.5" value="1">
+    <div><label>mic gain <span id="micGainV">1.0</span>×</label><input type="range" id="micGain" min="1" max="16" step="0.5" value="1"></div>
   </div>
   <div class="panel">
-    <h2>VAD params (live)</h2>
-    <div class="param"><label>speech_threshold <span id="speech_threshold_v">0.5</span></label><input type="range" id="speech_threshold" min="0.1" max="0.9" step="0.05" value="0.5"><div class="desc">神经输出概率 &gt;此值算"语音帧"。降→认更弱的语音（也可能把噪声当语音）；升→只认清晰语音。</div></div>
-    <div class="param"><label>min_silence <span id="min_silence_v">45</span></label><input type="range" id="min_silence" min="4" max="100" step="1" value="45"><div class="desc">出段（endpoint）前所需的最小连续静音帧数。降→说完更快出段；升→要停更久才出。</div></div>
-    <div class="param"><label>min_speech_frame <span id="min_speech_frame_v">8</span></label><input type="range" id="min_speech_frame" min="2" max="40" step="1" value="8"><div class="desc">最短语音段帧数。短于此的段被丢弃。降→保留更短的语音。</div></div>
-    <div class="param"><label>end_silence_ratio <span id="end_silence_ratio_v">0.9</span></label><input type="range" id="end_silence_ratio" min="0.4" max="0.99" step="0.01" value="0.9"><div class="desc">回看窗口里 ≥此比例是静音才出段。降→更易出段（句中短停顿就断）；升→要更完整静音。</div></div>
-    <div class="param"><label>look_back_frames <span id="look_back_frames_v">50</span></label><input type="range" id="look_back_frames" min="8" max="120" step="1" value="50"><div class="desc">判断结尾静音的回看窗口长度。升→需更持续静音才出段（抗句中停顿）。</div></div>
-    <div class="param"><label>min_speach_ratio <span id="min_speach_ratio_v">0.1</span></label><input type="range" id="min_speach_ratio" min="0.02" max="0.6" step="0.02" value="0.1"><div class="desc">单帧里 &gt;此比例子帧是语音→该帧算有人声（barge 也用它）。降→更灵敏认语音。</div></div>
-    <div class="param"><label>min_speach_frames <span id="min_speach_frames_v">30</span></label><input type="range" id="min_speach_frames" min="4" max="80" step="1" value="30"><div class="desc">语音累计到此帧数才开始考虑出段。升→需更长语音才可能出段。</div></div>
+    <h2>server_vad params</h2>
+    <div><label>threshold <span id="threshold_v">0.5</span></label><input type="range" id="threshold" min="0.1" max="0.9" step="0.05" value="0.5"></div>
+    <div class="hint">VAD 灵敏度。降→更灵敏（噪声也易触发）；升→只认清晰语音。</div>
+    <div><label>silence_duration_ms <span id="silence_v">800</span></label><input type="range" id="silence" min="200" max="6000" step="100" value="800"></div>
+    <div class="hint">说完后保持静音多久才出回复。降→更快回（句中停顿易误触）；升→要停更久。</div>
+    <div><label>max_history_turns <span id="hist_v">20</span></label><input type="range" id="hist" min="1" max="50" step="1" value="20"></div>
+    <div class="hint">LLM 回顾的对话轮数（上下文窗口）。</div>
+    <div class="hint" style="margin-top:8px">改完滑块/人设会自动发 session.update。</div>
   </div>
 </div>
 <div class="panel" style="margin-top:12px">
   <h2>Conversation</h2>
   <div id="log"></div>
   <div style="margin-top:8px;display:flex;gap:6px">
-    <input id="textInput" placeholder="打字回车 = 文本输入（跳过 ASR，直接 LLM→TTS）" disabled>
+    <input id="textInput" placeholder="打字回车 = conversation.item.create + response.create" disabled>
     <button id="sendText" disabled>send</button>
   </div>
 </div>
 
 <script>
-const FRAME = 400;            // 16k mono, 25ms — matches server VAD_FRAME_SAMPLES
 const wsUrl = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws';
 let ws = null, ctx = null, micStream = null, recNode = null, playNode = null;
-let micGain = 1.0;
-let playStream = new Float32Array(0);  // TTS PCM, interleaved ttsCh @ ttsSr
-let playPos = 0;                       // fractional FRAME position in playStream
+let micGain = 1.0, micMuted = false;
+const playBuf = [];            // queued Float32Array (24k mono f32)
+const IN_SR = 16000, OUT_SR = 24000;
 
 const $ = id => document.getElementById(id);
 const status = s => $('status').textContent = s;
@@ -76,174 +70,141 @@ const log = (cls, txt) => {
   const d = document.createElement('div'); d.className = cls; d.textContent = txt;
   $('log').appendChild(d); $('log').scrollTop = $('log').scrollHeight;
 };
+const evlog = t => log('ev', '⟵ ' + t);
 
-// ---- mic gain slider (client-side) ----
-$('micGain').oninput = e => { micGain = parseFloat(e.target.value); $('micGainV').textContent = micGain.toFixed(1); };
-
-// ---- VAD sliders → send to server (mic_gain stays client-side) ----
-const vadIds = ['speech_threshold','min_silence','min_speech_frame','end_silence_ratio','look_back_frames','min_speach_ratio','min_speach_frames'];
-function sendVad() {
-  if (!ws || ws.readyState !== 1) return;
-  const o = {type:'vad'};
-  for (const k of vadIds) o[k] = parseFloat($(k).value);
-  ws.send(JSON.stringify(o));
+function buildSession() {
+  return {
+    type: 'session.update',
+    session: {
+      instructions: $('persona').value || null,
+      voice: 'ref',
+      input_audio_format: 'pcm',
+      output_audio_format: 'pcm',
+      turn_detection: {
+        type: 'server_vad',
+        threshold: parseFloat($('threshold').value),
+        silence_duration_ms: parseInt($('silence').value),
+      },
+      max_history_turns: parseInt($('hist').value),
+    },
+  };
 }
-for (const k of vadIds) {
-  $(k).oninput = e => { $(k+'_v').textContent = e.target.value; };
-  $(k).onchange = sendVad;
-}
-// persona
-$('persona').onchange = () => {
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'persona', text: $('persona').value}));
-};
-
-// ---- audio ----
-let ttsSr = 48000, ttsCh = 2, micMuted = false;
 
 async function start() {
   $('start').disabled = true; $('stop').disabled = false; status('starting');
   micStream = await navigator.mediaDevices.getUserMedia({
     audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
-    video: false
+    video: false,
   });
+  ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: OUT_SR });
+  const src = ctx.createMediaStreamSource(micStream);
+  const meter = $('micMeter').firstElementChild;
+  // capture: ctx.sampleRate mono → resample to 16k → i16 → base64 → append
+  recNode = ctx.createScriptProcessor(4096, 1, 1);
+  recNode.onaudioprocess = e => {
+    e.outputBuffer.getChannelData(0).fill(0);
+    const in0 = e.inputBuffer.getChannelData(0);
+    let s = 0; for (let i = 0; i < in0.length; i++) s += in0[i] * in0[i];
+    meter.style.width = Math.min(100, Math.sqrt(s / in0.length) * 300) + '%';
+    if (micMuted || !ws || ws.readyState !== 1) return;
+    // resample ctx.sampleRate → 16k
+    const ratio = ctx.sampleRate / IN_SR;
+    const outLen = Math.floor(in0.length / ratio);
+    const out = new Int16Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const idx = i * ratio, i0 = Math.floor(idx), i1 = Math.min(i0 + 1, in0.length - 1);
+      const frac = idx - i0;
+      const v = (in0[i0] * (1 - frac) + in0[i1] * frac) * micGain;
+      out[i] = Math.max(-32768, Math.min(32767, v * 32767));
+    }
+    // base64 the i16 PCM (little-endian bytes)
+    const bytes = new Uint8Array(out.buffer);
+    let bin = ''; for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: btoa(bin) }));
+  };
+  src.connect(recNode); recNode.connect(ctx.destination);
+  // playback: 24k mono i16 (base64) → f32 → drain at ctx.sampleRate (== OUT_SR)
+  playNode = ctx.createScriptProcessor(4096, 0, 1);
+  playNode.onaudioprocess = e => {
+    const L = e.outputBuffer.getChannelData(0);
+    for (let i = 0; i < L.length; i++) L[i] = shiftOne();
+  };
+  playNode.connect(ctx.destination);
+
   ws = new WebSocket(wsUrl);
-  ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { status('connecting'); sendVad(); };
+  ws.onopen = () => { status('listening'); ws.send(JSON.stringify(buildSession())); $('textInput').disabled = false; $('sendText').disabled = false; $('muteMic').disabled = false; };
   ws.onmessage = ev => {
-    if (typeof ev.data === 'string') {
-      const m = JSON.parse(ev.data);
-      if (m.type === 'format') { ttsSr = m.sample_rate; ttsCh = m.channels; setupAudio(); }
-      else if (m.type === 'state') status(m.value);
-      else if (m.type === 'you') log('you', '你: ' + m.text);
-      else if (m.type === 'tiny') log('tiny', '小: ' + m.text);
-      else if (m.type === 'stop_audio') { playStream = new Float32Array(0); playPos = 0; }
-    } else {
-      playStream = appendF32(playStream, new Float32Array(ev.data));   // ttsSr, ttsCh interleaved
+    const m = JSON.parse(ev.data);
+    switch (m.type) {
+      case 'session.created': evlog('session.created'); break;
+      case 'session.updated': evlog('session.updated'); break;
+      case 'input_audio_buffer.speech_started':
+        evlog('speech_started'); if (responding) { playBuf.length = 0; } break;
+      case 'input_audio_buffer.speech_stopped': evlog('speech_stopped'); break;
+      case 'conversation.item.input_audio_transcription.completed':
+        log('you', '你: ' + m.transcript); break;
+      case 'response.created': evlog('response.created'); responding = true; status('thinking'); break;
+      case 'response.audio_transcript.delta':
+        if (m.delta) { replyBuf += m.delta; if (!replyShown) { log('tiny', '小: ' + replyBuf); replyShown = true; replyEl = $('log').lastChild; } else replyEl.textContent = '小: ' + replyBuf; }
+        if (m.delta) status('speaking');
+        break;
+      case 'response.audio.delta':
+        if (m.delta) { const raw = atob(m.delta); const arr = new Uint8Array(raw.length); for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i); const i16 = new Int16Array(arr.buffer); const f = new Float32Array(i16.length); for (let i = 0; i < i16.length; i++) f[i] = i16[i] / 32768; playBuf.push(f); }
+        break;
+      case 'response.audio_transcript.done': evlog('audio_transcript.done'); break;
+      case 'response.done':
+        evlog('response.done (' + (m.response?.status || '?') + ')');
+        responding = false; replyBuf = ''; replyShown = false; replyEl = null; status('listening');
+        break;
+      case 'error': log('ev', '⚠ error: ' + (m.error?.message || JSON.stringify(m.error))); break;
+      default: evlog(m.type);
     }
   };
   ws.onclose = () => { status('closed'); stop(); };
   ws.onerror = () => status('error');
 }
-
-// Build the AudioContext at the TTS sample rate + wire capture/playback. Called
-// once the server sends the {format} message (so rate/channels are exact, not
-// hardcoded — a wrong rate = slow/fast, wrong channels = 2x speed + garbage).
-function setupAudio() {
-  if (ctx) return; // already set up
-  ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: ttsSr });
-  if (ctx.sampleRate !== ttsSr)
-    console.warn('AudioContext rate', ctx.sampleRate, '!= TTS rate', ttsSr, '(playback may be off-speed)');
-  const src = ctx.createMediaStreamSource(micStream);
-  const meter = $('micMeter').firstElementChild;
-  // capture: ctx.sampleRate mono → linear-resample to 16k, send 400-sample f32 frames
-  recNode = ctx.createScriptProcessor(4096, 1, 1);
-  recNode.onaudioprocess = e => {
-    e.outputBuffer.getChannelData(0).fill(0);   // no mic→speaker leak
-    const in0 = e.inputBuffer.getChannelData(0);
-    let s = 0; for (let i = 0; i < in0.length; i++) s += in0[i]*in0[i];
-    meter.style.width = Math.min(100, Math.sqrt(s / in0.length) * 300) + '%';
-    if (micMuted || !ws || ws.readyState !== 1) return;   // mic监听关闭：不发送
-    const ratio = ctx.sampleRate / 16000;
-    const outLen = Math.floor(in0.length / ratio);
-    const out = new Float32Array(outLen);
-    for (let i = 0; i < outLen; i++) {
-      const idx = i * ratio;
-      const i0 = Math.floor(idx);
-      const i1 = Math.min(i0 + 1, in0.length - 1);
-      const frac = idx - i0;
-      out[i] = Math.max(-1, Math.min(1, (in0[i0] * (1 - frac) + in0[i1] * frac) * micGain));
-    }
-    pend.push(out);
-    while (pendLen() >= FRAME) ws.send(take(FRAME).buffer);
-  };
-  src.connect(recNode); recNode.connect(ctx.destination);
-  // playback: ttsCh-channel interleaved → deinterleave; pop ttsCh samples per
-  // output frame (1 for mono→both, 2 for stereo→L/R). Correct speed + channels.
-  // playback: resample TTS (ttsSr, ttsCh interleaved) → ctx.sampleRate output.
-  // If ctx.sampleRate == ttsSr the ratio is 1.0 (plain passthrough); otherwise
-  // linear interpolation keeps the rate aligned (no slow/fast drift).
-  playNode = ctx.createScriptProcessor(4096, 0, 2);
-  playNode.onaudioprocess = e => {
-    const L = e.outputBuffer.getChannelData(0);
-    const R = e.outputBuffer.getChannelData(1);
-    const ch = ttsCh;
-    const ratio = ttsSr / ctx.sampleRate;          // input frames per output frame
-    const n = playStream.length;
-    const avail = n / ch - 1;                       // frames available (−1 for interp)
-    for (let i = 0; i < L.length; i++) {
-      const fp = playPos + i * ratio;
-      if (fp < avail) {
-        const f0 = Math.floor(fp), frac = fp - f0;
-        const s0 = f0 * ch, s1 = s0 + ch;
-        if (ch >= 2) {
-          L[i] = playStream[s0]   * (1 - frac) + playStream[s1]   * frac;
-          R[i] = playStream[s0+1] * (1 - frac) + playStream[s1+1] * frac;
-        } else {
-          const v = playStream[s0] * (1 - frac) + playStream[s1] * frac;
-          L[i] = v; R[i] = v;
-        }
-      } else { L[i] = 0; R[i] = 0; }   // underrun → silence
-    }
-    playPos = Math.min(playPos + L.length * ratio, avail);
-    const cf = Math.floor(playPos);               // consumed frames
-    if (cf > 0) { playStream = playStream.subarray(cf * ch); playPos -= cf; }
-  };
-  playNode.connect(ctx.destination);
-  status('listening');
-  $('textInput').disabled = false; $('sendText').disabled = false;
-  $('muteMic').disabled = false;
-}
+let responding = false, replyBuf = '', replyShown = false, replyEl = null;
 
 function stop() {
   $('start').disabled = false; $('stop').disabled = true;
-  $('muteMic').disabled = true; $('muteMic').textContent = 'mute mic'; micMuted = false;
-  $('textInput').disabled = true; $('sendText').disabled = true;
+  $('muteMic').disabled = true; $('textInput').disabled = true; $('sendText').disabled = true;
   if (ws) { ws.onclose = null; ws.close(); ws = null; }
   if (recNode) { recNode.disconnect(); recNode = null; }
   if (playNode) { playNode.disconnect(); playNode = null; }
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
   if (ctx) { ctx.close(); ctx = null; }
-  playStream = new Float32Array(0); playPos = 0;
   $('micMeter').firstElementChild.style.width = '0';
   status('idle');
 }
 $('start').onclick = start; $('stop').onclick = stop;
-$('muteMic').onclick = () => {
-  micMuted = !micMuted;
-  $('muteMic').textContent = micMuted ? 'unmute mic' : 'mute mic';
-  status(micMuted ? 'mic muted' : 'listening');
-};
+$('muteMic').onclick = () => { micMuted = !micMuted; $('muteMic').textContent = micMuted ? 'unmute mic' : 'mute mic'; status(micMuted ? 'mic muted' : 'listening'); };
+$('micGain').oninput = e => { micGain = parseFloat(e.target.value); $('micGainV').textContent = micGain.toFixed(1); };
 
-// text input: type + enter (or send btn) → {type:text}, server skips ASR
+// sliders → session.update
+for (const [id, lab] of [['threshold','threshold_v'],['silence','silence_v'],['hist','hist_v']]) {
+  $(id).oninput = e => { $(lab).textContent = e.target.value; };
+  $(id).onchange = () => ws && ws.readyState === 1 && ws.send(JSON.stringify(buildSession()));
+}
+$('persona').onchange = () => ws && ws.readyState === 1 && ws.send(JSON.stringify(buildSession()));
+
+// text input
 function sendText() {
   const v = $('textInput').value.trim();
   if (!v || !ws || ws.readyState !== 1) return;
-  ws.send(JSON.stringify({type:'text', text: v}));  // server echoes as {you:...}
+  ws.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: v }] } }));
+  ws.send(JSON.stringify({ type: 'response.create' }));
   $('textInput').value = '';
 }
 $('sendText').onclick = sendText;
 $('textInput').onkeydown = e => { if (e.key === 'Enter') sendText(); };
 
-// interleaved-stereo → deinterleaved: shiftOne returns the next mono sample
-// (stereo pairs are identical here since TTS is the same on L/R after our
-// push handling; we deinterleave when enqueueing).
-let pend = [];  // Float32Array chunks (16k mono, pre-downsample)
-function pendLen() { let n=0; for (const c of pend) n += c.length; return n; }
-function take(n) {
-  const out = new Float32Array(n); let off = 0;
-  while (off < n) {
-    const c = pend[0]; const need = n - off;
-    if (c.length <= need) { out.set(c, off); off += c.length; pend.shift(); }
-    else { out.set(c.subarray(0, need), off); pend[0] = c.subarray(need); off = n; }
-  }
-  return out;
-}
-// Append two Float32Arrays into a new one (used to grow the TTS stream).
-function appendF32(a, b) {
-  if (a.length === 0) return b.slice();
-  const c = new Float32Array(a.length + b.length);
-  c.set(a); c.set(b, a.length);
-  return c;
+// playback queue: pop one f32 sample
+function shiftOne() {
+  while (playBuf.length && playBuf[0].length === 0) playBuf.shift();
+  if (!playBuf.length) return 0;
+  const c = playBuf[0]; const v = c[0];
+  if (c.length > 1) playBuf[0] = c.subarray(1); else playBuf.shift();
+  return v;
 }
 </script>
 </body>

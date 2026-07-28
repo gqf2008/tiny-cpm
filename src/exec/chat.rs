@@ -84,14 +84,41 @@ pub fn generate_reply_with_system(
     sink: &mut dyn FnMut(&str),
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<ChatGenStats> {
-    // MiniCPM5 uses ChatML. Render [optional system +] one user message +
-    // generation prompt.
-    let chat = match system {
-        Some(sys) => format!(
-            "<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-        ),
-        None => format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"),
-    };
+    generate_reply_with_history(model, tokenizer, device, system, &[], prompt, no_think, max_tokens, sink, cancel)
+}
+
+/// Multi-turn ChatML: renders [optional system +] prior `history` turns
+/// (alternating user/assistant) + the current `prompt` + the generation
+/// prompt. `history` items are `(is_user, text)`. The server is stateless —
+/// the caller (browser) owns the history and passes it per turn.
+pub fn generate_reply_with_history(
+    model: &mut ModelWeights,
+    tokenizer: &Tokenizer,
+    device: &Device,
+    system: Option<&str>,
+    history: &[(bool, String)],
+    prompt: &str,
+    no_think: bool,
+    max_tokens: usize,
+    sink: &mut dyn FnMut(&str),
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<ChatGenStats> {
+    let mut chat = String::new();
+    if let Some(sys) = system {
+        chat.push_str("<|im_start|>system\n");
+        chat.push_str(sys);
+        chat.push_str("<|im_end|>\n");
+    }
+    for (is_user, text) in history {
+        chat.push_str("<|im_start|>");
+        chat.push_str(if *is_user { "user" } else { "assistant" });
+        chat.push('\n');
+        chat.push_str(text);
+        chat.push_str("<|im_end|>\n");
+    }
+    chat.push_str("<|im_start|>user\n");
+    chat.push_str(prompt);
+    chat.push_str("<|im_end|>\n<|im_start|>assistant\n");
     let chat = if no_think {
         format!("{chat}<think>\n\n</think>\n\n")
     } else {
