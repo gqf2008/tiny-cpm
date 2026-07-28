@@ -85,13 +85,24 @@ impl FireRedVad {
         // briefer utterances; lower min_silence_frame to endpoint sooner.
         cfg.speech_threshold = env_f32("VAD_SPEECH_THRESHOLD", cfg.speech_threshold);
         cfg.min_speech_frame = env_usize("VAD_MIN_SPEECH_FRAME", cfg.min_speech_frame);
-        cfg.min_silence_frame = env_usize("VAD_MIN_SILENCE_FRAME", cfg.min_silence_frame);
+        // Default min_silence_frame raised from upstream 20 to 28 for realtime
+        // dialogue: a longer minimum trailing silence before endpointing, so
+        // mid-sentence pauses (200-300 ms between words/clauses) don't cut the
+        // user off. The `vad` subcommand processes whole files so this doesn't
+        // affect it.
+        cfg.min_silence_frame = env_usize("VAD_MIN_SILENCE_FRAME", 28);
         let vad_postprocessor = VadPostprocessor::new(&cfg);
         // Env overrides for the streaming segment logic in detect_frame.
         let min_speach_ratio = env_f32("VAD_MIN_SPEACH_RATIO", 0.1);
-        let end_silence_ratio = env_f32("VAD_END_SILENCE_RATIO", 0.8);
+        // Default end_silence_ratio raised 0.8 -> 0.85: require 85% silence in
+        // the look-back window (vs 80%) so a brief mid-sentence pause doesn't
+        // endpoint. Lower (e.g. 0.7) if the system waits too long after you
+        // finish.
+        let end_silence_ratio = env_f32("VAD_END_SILENCE_RATIO", 0.85);
         let min_speach_frames = env_usize("VAD_MIN_SPEACH_FRAMES", 30);
-        let look_back_frames = env_usize("VAD_LOOK_BACK_FRAMES", 15);
+        // Default look_back_frames raised 15 -> 25: a longer window needs
+        // sustained silence, filtering inter-word pauses.
+        let look_back_frames = env_usize("VAD_LOOK_BACK_FRAMES", 25);
         eprintln!(
             "vad params: speech_threshold={} min_speech_frame={} min_silence_frame={} | min_speach_ratio={} end_silence_ratio={} min_speach_frames={} look_back_frames={}",
             cfg.speech_threshold, cfg.min_speech_frame, cfg.min_silence_frame,
