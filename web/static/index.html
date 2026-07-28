@@ -123,7 +123,23 @@ function connect() {
   setStatus('连接中…', 'reconnect');
   ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { reconnectDelay = 1000; setStatus('已连接', 'live'); ws.send(JSON.stringify(buildSession())); enableInput(true); };
+  ws.onopen = async () => {
+    reconnectDelay = 1000;
+    // Create AudioContext + playback immediately (TTS works without mic).
+    if (!ctx) {
+      ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: OUT_SR });
+      playNode = ctx.createScriptProcessor(8192, 0, 1);
+      playNode.onaudioprocess = e => {
+        const L = e.outputBuffer.getChannelData(0);
+        const total = playBuf.reduce((n,c)=>n+c.length,0);
+        if (!playbackStarted && total < OUT_SR*0.3) { L.fill(0); return; }
+        playbackStarted = true;
+        for (let i = 0; i < L.length; i++) L[i] = shiftOne();
+      };
+      playNode.connect(ctx.destination);
+    }
+    setStatus('已连接', 'live'); ws.send(JSON.stringify(buildSession())); enableInput(true);
+  };
   ws.onmessage = onMessage;
   ws.onclose = () => { setStatus('断开，重连中…', 'reconnect'); enableInput(false); micOff(); scheduleReconnect(); };
   ws.onerror = () => { ws.close(); };
@@ -175,7 +191,6 @@ async function micOn_() {
     if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: OUT_SR });
     const src = ctx.createMediaStreamSource(micStream);
     const meter = $('micBtn').querySelector('.lvl > div');
-    recNode = ctx.createScriptProcessor(4096, 1, 1);
     recNode.onaudioprocess = e => {
       e.outputBuffer.getChannelData(0).fill(0);
       const in0 = e.inputBuffer.getChannelData(0);
@@ -197,18 +212,7 @@ async function micOn_() {
       ws.send(JSON.stringify({ type:'input_audio_buffer.append', audio: btoa(bin) }));
     };
     src.connect(recNode); recNode.connect(ctx.destination);
-    // playback node (create once)
-    if (!playNode) {
-      playNode = ctx.createScriptProcessor(8192, 0, 1);
-      playNode.onaudioprocess = e => {
-        const L = e.outputBuffer.getChannelData(0);
-        const total = playBuf.reduce((n,c)=>n+c.length,0);
-        if (!playbackStarted && total < OUT_SR*0.3) { L.fill(0); return; }
-        playbackStarted = true;
-        for (let i = 0; i < L.length; i++) L[i] = shiftOne();
-      };
-      playNode.connect(ctx.destination);
-    }
+    recNode = ctx.createScriptProcessor(4096, 1, 1);
     micOn = true;
     $('micBtn').classList.add('on');
     setStatus('监听中', 'live');

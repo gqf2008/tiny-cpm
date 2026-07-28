@@ -122,7 +122,7 @@ pub fn generate_reply_with_history(
     let chat = if no_think {
         format!("{chat}<think>\n\n</think>\n\n")
     } else {
-        chat
+        format!("{chat}<think>\n")
     };
     eprintln!("=== ChatML ({} chars) ===\n{chat}\n=== end ChatML ===", chat.len());
     let enc = tokenizer
@@ -185,6 +185,16 @@ pub fn generate_reply_with_history(
     if let Some(rest) = tos.decode_rest()? {
         stream_clean(&mut full, &mut printed, &rest, sink);
     }
+    // Fallback: if the think block never closed (model hit max_tokens or EOS
+    // mid-think), emit the accumulated text stripped of tags so the user
+    // still gets SOMETHING.
+    if printed == 0 && !full.is_empty() {
+        let fallback = full.replace("<think>", "").replace("</think>", "");
+        if !fallback.is_empty() {
+            sink(&fallback);
+            printed = fallback.len();
+        }
+    }
     let dt = t_dec.elapsed().as_secs_f64();
     eprintln!(
         "\ndecode: {generated} tokens in {:.2}s ({:.1} tok/s)",
@@ -205,7 +215,12 @@ pub fn generate_reply_with_history(
 /// decoded strings).
 fn stream_clean(full: &mut String, printed: &mut usize, s: &str, sink: &mut dyn FnMut(&str)) {
     full.push_str(s);
-    let clean = full.replace("<think>", "").replace("</think>", "");
+    // Suppress think block: emit only text AFTER </think> (the actual response).
+    // Before </think> is reasoning content — never displayed or spoken.
+    let clean = match full.find("</think>") {
+        Some(idx) => full[idx + 8..].to_string(),  // 8 = len("</think>")
+        None => String::new(),  // still thinking — suppress
+    };
     if clean.len() > *printed {
         sink(&clean[*printed..]);
         *printed = clean.len();
