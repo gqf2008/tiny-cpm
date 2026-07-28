@@ -100,6 +100,19 @@ fn min_barge_rms(cli: Option<f32>) -> f32 {
     })
     .unwrap_or(0.015)
 }
+/// Linear gain applied to mic samples before VAD/rms. Low-gain mics (bone-
+/// conduction headsets) put soft speech at the noise floor (rms ~0.002-0.02),
+/// where the neural VAD can't reliably detect it — boost to bring speech up to
+/// normal levels (the noise floor stays below the speech threshold). Priority:
+/// --mic-gain > LIVE_MIC_GAIN > 1.0.
+fn mic_gain(cli: Option<f32>) -> f32 {
+    cli.or_else(|| {
+        std::env::var("LIVE_MIC_GAIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    })
+    .unwrap_or(1.0)
+}
 
 /// Splits a streamed text into sentences at [.!?;] and their full-width
 /// variants (plus …). Sentences include their terminator.
@@ -213,7 +226,7 @@ fn synth_and_play(
 }
 
 pub fn run(args: &[String]) -> Result<()> {
-    let usage = "usage: tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in] [--ref <wav>] [--vad-end-silence-ratio <f>] [--vad-min-silence <n>] [--min-seg-peak <f>] [--barge-onset-frames <n>] [--min-barge-rms <f>]";
+    let usage = "usage: tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in] [--ref <wav>] [--vad-end-silence-ratio <f>] [--vad-min-silence <n>] [--min-seg-peak <f>] [--barge-onset-frames <n>] [--min-barge-rms <f>] [--mic-gain <f>]";
     if args.len() < 6 {
         bail!(usage);
     }
@@ -235,6 +248,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut min_seg_peak_cli: Option<f32> = None;
     let mut barge_onset_cli: Option<usize> = None;
     let mut min_barge_rms_cli: Option<f32> = None;
+    let mut mic_gain_cli: Option<f32> = None;
     let mut i = 6;
     while i < args.len() {
         match args[i].as_str() {
@@ -314,6 +328,15 @@ pub fn run(args: &[String]) -> Result<()> {
                         .ok_or_else(|| anyhow!("--min-barge-rms requires a float. {usage}"))?
                         .parse()
                         .map_err(|_| anyhow!("--min-barge-rms must be a float. {usage}"))?,
+                );
+            }
+            "--mic-gain" => {
+                i += 1;
+                mic_gain_cli = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--mic-gain requires a float. {usage}"))?
+                        .parse()
+                        .map_err(|_| anyhow!("--mic-gain must be a float. {usage}"))?,
                 );
             }
             other => bail!("unknown option {other}. {usage}"),
@@ -425,6 +448,7 @@ pub fn run(args: &[String]) -> Result<()> {
     // continuously (no ducking); on speech onset while speaking it sets a
     // shared `barge` flag and clears the speaker queue. The main thread
     // processes utterances and aborts the in-flight LLM/TTS via the flag. ---
+    let mic_gain_val = mic_gain(mic_gain_cli);
     if barge_in {
         let speaker_arc = speaker.clone().unwrap();
         // Speaker is !Send (owns the cpal playback stream); hand the listener
@@ -439,6 +463,9 @@ pub fn run(args: &[String]) -> Result<()> {
         let speaker_q_l = speaker_queue.clone();
         let onset_frames = barge_onset_frames(barge_onset_cli);
         let min_barge_rms_val = min_barge_rms(min_barge_rms_cli);
+        eprintln!(
+            "barge-in listener: mic_gain={mic_gain_val:.1} min_barge_rms={min_barge_rms_val:.3} onset_frames={onset_frames}"
+        );
         std::thread::spawn(move || {
             // cpal::Stream is !Send on macOS — create the mic on this thread
             // and keep it here for the life of the listener.
@@ -458,6 +485,14 @@ pub fn run(args: &[String]) -> Result<()> {
                     Err(_) => break,
                 };
                 frame_count += 1;
+                // Apply mic gain (low-gain mics put soft speech at the noise
+                // floor; boost before VAD so the neural model sees normal
+                // levels).
+                let frame: Vec<f32> = if mic_gain_val != 1.0 {
+                    frame.iter().map(|s| (s * mic_gain_val).clamp(-1.0, 1.0)).collect()
+                } else {
+                    frame
+                };
                 let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
                 // Neural VAD per frame (sets last_frame_speech, may return a
                 // completed segment). detect_frame_f32 consumes `frame`.
@@ -667,6 +702,11 @@ pub fn run(args: &[String]) -> Result<()> {
             let mut frame = sim_samples[sim_pos..end].to_vec();
             frame.resize(VAD_FRAME_SAMPLES, 0.0); // pad final partial frame
             sim_pos = end;
+            frame
+        };
+        let frame: Vec<f32> = if mic_gain_val != 1.0 {
+            frame.iter().map(|s| (s * mic_gain_val).clamp(-1.0, 1.0)).collect()
+        } else {
             frame
         };
         frame_count += 1;
