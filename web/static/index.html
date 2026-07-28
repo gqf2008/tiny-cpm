@@ -130,10 +130,19 @@ async function start() {
     ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: btoa(bin) }));
   };
   src.connect(recNode); recNode.connect(ctx.destination);
-  // playback: 24k mono i16 (base64) → f32 → drain at ctx.sampleRate (== OUT_SR)
-  playNode = ctx.createScriptProcessor(4096, 0, 1);
+  // playback: 24k mono i16 (base64) → f32 → drain at ctx.sampleRate (== OUT_SR).
+  // Buffer 8192 + pre-buffer 0.3s to avoid underrun from main-thread blocking
+  // (base64 JSON parse on large deltas delays the onaudioprocess callback).
+  playNode = ctx.createScriptProcessor(8192, 0, 1);
   playNode.onaudioprocess = e => {
     const L = e.outputBuffer.getChannelData(0);
+    // Pre-buffer: don't start until enough audio is queued (prevents immediate
+    // underrun on the first chunk). After the first playback, just drain.
+    const totalAvail = playBuf.reduce((n, c) => n + c.length, 0);
+    if (!playbackStarted && totalAvail < OUT_SR * 0.3) {
+      L.fill(0); return;
+    }
+    playbackStarted = true;
     for (let i = 0; i < L.length; i++) L[i] = shiftOne();
   };
   playNode.connect(ctx.destination);
@@ -146,7 +155,7 @@ async function start() {
       case 'session.created': evlog('session.created'); break;
       case 'session.updated': evlog('session.updated'); break;
       case 'input_audio_buffer.speech_started':
-        evlog('speech_started'); if (responding) { playBuf.length = 0; } break;
+        evlog('speech_started'); if (responding) { playBuf.length = 0; playbackStarted = false; } break;
       case 'input_audio_buffer.speech_stopped': evlog('speech_stopped'); break;
       case 'conversation.item.input_audio_transcription.completed':
         log('you', '你: ' + m.transcript); break;
@@ -161,7 +170,7 @@ async function start() {
       case 'response.audio_transcript.done': evlog('audio_transcript.done'); break;
       case 'response.done':
         evlog('response.done (' + (m.response?.status || '?') + ')');
-        responding = false; replyBuf = ''; replyShown = false; replyEl = null; status('listening');
+        responding = false; replyBuf = ''; replyShown = false; replyEl = null; playbackStarted = false; status('listening');
         break;
       case 'error': log('ev', '⚠ error: ' + (m.error?.message || JSON.stringify(m.error))); break;
       default: evlog(m.type);
@@ -170,7 +179,7 @@ async function start() {
   ws.onclose = () => { status('closed'); stop(); };
   ws.onerror = () => status('error');
 }
-let responding = false, replyBuf = '', replyShown = false, replyEl = null;
+let responding = false, replyBuf = '', replyShown = false, replyEl = null, playbackStarted = false;
 
 function stop() {
   $('start').disabled = false; $('stop').disabled = true;

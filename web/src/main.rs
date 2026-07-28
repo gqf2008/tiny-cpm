@@ -44,7 +44,7 @@ use tiny_cpm::{
 const ASR_MAX_TOKENS: usize = 512;
 const DEFAULT_MAX_TOKENS: usize = 256;
 const MOSS_MAX_FRAMES: usize = 300;
-const TTS_CHUNK_FRAMES: usize = 25;
+const TTS_CHUNK_FRAMES: usize = 5; // small chunks → smaller base64 deltas → less main-thread blocking in the browser
 const VAD_FRAME_SAMPLES: usize = 400;
 const VAD_SAMPLE_RATE: usize = 16_000;
 const MIN_SEGMENT_SAMPLES: usize = 8000;
