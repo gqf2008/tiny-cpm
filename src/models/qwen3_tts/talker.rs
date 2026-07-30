@@ -923,9 +923,29 @@ impl Talker {
         // GPU path: keep the running token as an on-device (1,) u32 tensor; gather its
         // embedding without a readback. Collect the 15 token tensors and read them back
         // in a single cat + to_vec1 at the end.
+        let spec_probe = std::env::var("QWEN3_TTS_SPEC_PROBE").is_ok();
         let mut token_tensors: Vec<Tensor> = Vec::with_capacity(n_groups);
         for g in 0..n_groups {
             let logits = cp.lm_head[g].forward(&hidden)?.squeeze(0)?; // (1, vocab)
+            // Speculatability probe (greedy/argmax only, read-only): how confident is the
+            // target at this step, and would cheap drafts (copy-prev-book) have hit?
+            if spec_probe {
+                let lf: Vec<f32> = logits.to_dtype(DType::F32)?.to_vec2::<f32>()?[0].clone();
+                let mut idx: Vec<usize> = (0..lf.len()).collect();
+                idx.sort_by(|&a, &b| lf[b].total_cmp(&lf[a]));
+                let (t1, t2) = (lf[idx[0]], lf[idx[1]]);
+                let max = lf.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let p1 = (lf[idx[0]] - max).exp();
+                let z: f32 = lf.iter().map(|&x| (x - max).exp()).sum();
+                eprintln!(
+                    "spec g={:2} top1_id={} top1_logit={:.2} margin={:.2} p1={:.3}",
+                    g,
+                    idx[0],
+                    t1,
+                    t1 - t2,
+                    p1 / z
+                );
+            }
             let token = gpu_sample_token(
                 &logits,
                 gen_cfg.subtalker_dosample,
