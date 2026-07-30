@@ -213,16 +213,31 @@ impl CodePredictor {
 /// Sample one token from a `(1, vocab)` logits row **entirely on-device** (no GPU→CPU
 /// readback). Temperature is a scalar multiply and the multinomial draw is Gumbel-max
 /// (`argmax(logits + Gumbel(0,1))`), which is exactly a softmax-weighted sample. Returns a
-/// `(1,)` u32 tensor on the logits' device. Repetition penalty is not handled here (the
-/// code predictor never applies one); top-k/top-p are skipped (see the note below).
+/// `(1,)` u32 tensor on the logits' device. top-k/top-p are skipped (see the note below).
+///
+/// `rep_mult`, when given, is a `(1, vocab)` repetition-penalty multiplier applied the HF
+/// way: `logit < 0 ? logit * mult : logit / mult`. The talker keeps one on the GPU and
+/// `scatter`s the penalty into the sampled column each frame, so codebook-0 history never
+/// leaves the device (the code predictor passes `None` — it applies no penalty).
 fn gpu_sample_token(
     logits: &Tensor, // (1, vocab), any float dtype
     do_sample: bool,
     temperature: f64,
     top_k: usize,
     top_p: f32,
+    rep_mult: Option<&Tensor>, // (1, vocab) f32, all-1 when no penalty
 ) -> Result<Tensor> {
     let mut lg = logits.to_dtype(DType::F32)?;
+
+    // Repetition penalty (before temperature), HF formula applied elementwise:
+    // negative logits are scaled up by mult, non-negative scaled down.
+    if let Some(mult) = rep_mult {
+        let mult = mult.to_dtype(DType::F32)?;
+        let neg = lg.lt(0.0)?;
+        let penalized_neg = (&lg * &mult)?;
+        let penalized_pos = (&lg / &mult)?;
+        lg = neg.where_cond(&penalized_neg, &penalized_pos)?;
+    }
 
     // Temperature (skip when ~1 to avoid a no-op kernel).
     if do_sample && temperature > 0.0 && (temperature - 1.0).abs() > 1e-6 {
@@ -475,11 +490,16 @@ impl Talker {
 
     /// One decoder forward over `embeds` (1, T, hidden) → (last hidden (1,1,hidden),
     /// codec_head logits (vocab,) f32).
-    fn forward_step(
+    /// One decoder forward over `embeds` (1, T, hidden), returning the last hidden
+    /// (1,1,hidden) and the codec_head logits as an **on-device** (1, vocab) tensor.
+    /// Keeping the logits on the GPU lets `generate_inner` sample codebook 0 without a
+    /// full-vector readback (the per-frame `to_vec1` used to force a `flush_and_wait`
+    /// that drained the whole pipeline).
+    fn forward_step_gpu(
         &mut self,
         embeds: &Tensor,
         seqlen_offset: usize,
-    ) -> Result<(Tensor, Vec<f32>)> {
+    ) -> Result<(Tensor, Tensor)> {
         let (bs, seq_len, _) = embeds.dims3()?;
         let mask = if seq_len <= 1 {
             None
@@ -501,21 +521,7 @@ impl Talker {
         let h = self.norm.forward(&h)?;
         let last = h.narrow(1, seq_len - 1, 1)?; // (1,1,hidden)
         let logits = self.codec_head.forward(&last)?; // (1,1,vocab)
-        let logits = logits
-            .squeeze(0)?
-            .squeeze(0)?
-            .to_dtype(DType::F32)?
-            .to_vec1::<f32>()?;
-        if std::env::var("QWEN3_TTS_NUMDBG").is_ok() {
-            let lv: Vec<f32> = last.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-            let mut idx: Vec<usize> = (0..logits.len()).collect();
-            idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
-            eprintln!(
-                "numdbg offset={seqlen_offset} seq={seq_len} last[0..4]={:?} top3={:?}",
-                &lv[..lv.len().min(4)],
-                &idx[..3].iter().map(|&i| (i, logits[i])).collect::<Vec<_>>()
-            );
-        }
+        let logits = logits.squeeze(0)?; // (1, vocab)
         Ok((last, logits))
     }
 
@@ -714,7 +720,7 @@ impl Talker {
         let codec_eos = self.cfg.codec_eos_token_id;
         let num_code_groups = self.cfg.num_code_groups;
         let mut offset = prompt.dim(1)?;
-        let (mut past_hidden, mut logits) = self.forward_step(&prompt, 0)?;
+        let (mut past_hidden, mut logits_gpu) = self.forward_step_gpu(&prompt, 0)?;
         let n_trailing = match &trailing {
             Some(t) => t.dim(1)?,
             None => 0,
@@ -723,6 +729,26 @@ impl Talker {
         let mut frames: Vec<Vec<u32>> = Vec::new();
         let mut gen_history: Vec<u32> = Vec::new(); // codebook-0 history for rep penalty
         let suppress_from = vocab_size - 1024; // suppress [2048, 3072) except codec_eos
+        // GPU suppression mask: (1, vocab) f32, -inf in [suppress_from, vocab) except codec_eos.
+        // Precomputed once; added to the logits each frame before sampling codebook 0.
+        let suppress_bias: Vec<f32> = (0..vocab_size)
+            .map(|i| {
+                if i >= suppress_from && i != codec_eos as usize {
+                    f32::NEG_INFINITY
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let suppress_bias = Tensor::from_vec(suppress_bias, (1, vocab_size), &self.device)?;
+        // GPU repetition-penalty multiplier (1, vocab), all-1 initially. After each frame
+        // the sampled code0 column is scattered to `repetition_penalty`, so the penalty
+        // compounds per distinct token exactly like the CPU path (HF applies it once per
+        // distinct token; re-scattering the same value is idempotent).
+        let rep_penalty = gen_cfg.repetition_penalty;
+        let apply_rep = (rep_penalty - 1.0).abs() > 1e-6;
+        let mut rep_mult =
+            Tensor::ones((1, vocab_size), DType::F32, &self.device)?;
         // Diagnostic: QWEN3_TTS_GREEDY=1 forces argmax (do_sample=false) to test
         // whether babbling is sampling-driven (temperature × numeric scale).
         let greedy = std::env::var("QWEN3_TTS_GREEDY").is_ok();
@@ -738,21 +764,25 @@ impl Talker {
         // `offset` tracks the KV-cache seqlen, not the loop item.
         for step in 0..max_new_tokens {
             let tt = std::time::Instant::now();
-            let mut lg = logits.clone();
-            for (i, l) in lg.iter_mut().enumerate().take(vocab_size) {
-                if i >= suppress_from && i != codec_eos as usize {
-                    *l = f32::NEG_INFINITY;
-                }
-            }
-            let code0 = sample_from_logits_vec(
+            // Sample codebook 0 on the GPU: add the suppression bias (cast to the logits
+            // dtype first — BF16 talker vs F32 bias), apply the repetition-penalty
+            // multiplier (from step>=2, matching the CPU reference), then temperature +
+            // Gumbel-max. Read back ONE u32 for EOS / predictor input.
+            let lg = logits_gpu.broadcast_add(&suppress_bias.to_dtype(logits_gpu.dtype())?)?;
+            let rep = if apply_rep && step >= 2 {
+                Some(&rep_mult)
+            } else {
+                None
+            };
+            let code0_t = gpu_sample_token(
                 &lg,
                 gen_cfg.do_sample && !greedy,
-                Some(gen_cfg.temperature),
-                Some(gen_cfg.top_k),
-                Some(gen_cfg.top_p),
-                if step >= 2 { Some(&gen_history) } else { None },
-                gen_cfg.repetition_penalty,
-            )?;
+                gen_cfg.temperature,
+                gen_cfg.top_k,
+                gen_cfg.top_p,
+                rep,
+            )?; // (1,) u32 on device
+            let code0 = code0_t.to_vec1::<u32>()?[0];
             if prof {
                 t_sample0 += tt.elapsed();
             }
@@ -760,6 +790,12 @@ impl Talker {
                 break;
             }
             gen_history.push(code0);
+            // Scatter the penalty into this token's multiplier column (idempotent per
+            // distinct token — HF applies the penalty once per distinct token).
+            if apply_rep {
+                let pen = Tensor::from_vec(vec![rep_penalty], (1, 1), &self.device)?;
+                rep_mult = rep_mult.scatter(&code0_t.reshape((1, 1))?, &pen, 1)?;
+            }
             if std::env::var("QWEN3_TTS_DEBUG").is_ok() && step % 25 == 0 {
                 eprintln!("qwen3-tts: frame {step} code0={code0} (offset={offset})");
             }
@@ -795,12 +831,12 @@ impl Talker {
             }
 
             let tt = std::time::Instant::now();
-            let (h, l) = self.forward_step(&next, offset)?;
+            let (h, l) = self.forward_step_gpu(&next, offset)?;
             if prof {
                 t_fwd += tt.elapsed();
             }
             past_hidden = h;
-            logits = l;
+            logits_gpu = l;
             offset += 1;
         }
 
@@ -896,6 +932,7 @@ impl Talker {
                 gen_cfg.subtalker_temperature,
                 gen_cfg.subtalker_top_k,
                 gen_cfg.subtalker_top_p,
+                None, // code predictor applies no repetition penalty
             )?; // (1,) u32 on device
             if g + 1 < n_groups {
                 let emb = cp.codec_embedding[g].forward(&token.reshape((1, 1))?)?;
