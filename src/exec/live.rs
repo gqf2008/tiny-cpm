@@ -1,17 +1,25 @@
 //! Realtime voice dialogue: mic -> FireRedVAD (endpointing) -> Qwen3-ASR ->
-//! MiniCPM5 (sentence-streamed) -> MOSS-TTS per sentence -> speaker. All five
-//! models load once on a single Metal device and stay resident.
+//! MiniCPM5 (sentence-streamed) -> TTS per sentence -> speaker. All five models
+//! load once on a single Metal device and stay resident.
+//!
+//! The TTS engine is selectable via `--tts moss|qwen3` (default `qwen3`):
+//! - `qwen3`: Qwen3-TTS — mono 24 kHz, sub-realtime on Q4_K. Cloning needs
+//!   `--ref <wav>` plus `--ref-text "<full transcript>"`. Its codec is bundled in
+//!   `<model-dir>/speech_tokenizer`, so it takes NO `<codec-dir>` positional.
+//! - `moss`: MOSS-TTS — stereo 48 kHz, clones from `--ref <wav>` alone
+//!   (`--ref-text` ignored). Needs the `<codec-dir>` positional.
 //!
 //! Usage:
 //!     tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> \
-//!         <tokenizer.json> <moss-dir> <codec-dir> \
+//!         <tokenizer.json> <tts-model-dir> [<codec-dir: MOSS only>] \
+//!         [--tts moss|qwen3] [--ref <wav> [--ref-text "<text>"]] \
 //!         [--input <wav>] [--output <wav>] [--max-tokens N]
 //!
 //! - `--input`: simulation mode — frames come from a wav file (fed as fast as
 //!   they process, no realtime pacing) instead of the microphone. 1s of
 //!   silence is appended so the final utterance endpoints.
 //! - `--output`: in simulation mode, write the synthesized reply audio
-//!   (stereo 48kHz wav) here instead of playing it.
+//!   (mono 24kHz for qwen3, stereo 48kHz for moss) here instead of playing it.
 //! - `--max-tokens`: LLM reply cap (default 256).
 //!
 //! stdout carries the conversational payload (`you:`/`tiny:` lines); all
@@ -35,8 +43,16 @@ use candle_core::{Device, Tensor};
 use tokenizers::Tokenizer;
 
 use crate::{
-    exec::{chat, moss_tts::MossEngine, qwen3_asr::Qwen3AsrEngine},
-    models::fire_red_vad::vad::{FireRedVad, VadOverrides},
+    exec::{
+        chat,
+        moss_tts::MossEngine,
+        qwen3_asr::Qwen3AsrEngine,
+        qwen3_tts::{Qwen3TtsEngine, TalkerQuant},
+    },
+    models::{
+        fire_red_vad::vad::{FireRedVad, VadOverrides},
+        qwen3_tts::talker::RefVoice,
+    },
     utils::{
         audio_utils::{load_audio_with_resample, save_wav},
         live_audio::{MicCapture, Speaker, VAD_FRAME_SAMPLES, VAD_SAMPLE_RATE},
@@ -45,10 +61,29 @@ use crate::{
 
 /// ASR decode cap (matches the `asr qwen3` default).
 const ASR_MAX_TOKENS: usize = 512;
+
+/// Which TTS engine speaks the replies (default Qwen3 — sub-realtime on Q4_K).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TtsChoice {
+    Moss,
+    Qwen3,
+}
+
+impl TtsChoice {
+    fn parse(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "moss" => Ok(Self::Moss),
+            "qwen3" | "qwen" => Ok(Self::Qwen3),
+            other => Err(anyhow!("unknown --tts `{other}` (expected moss | qwen3)")),
+        }
+    }
+}
 /// Default LLM reply cap.
 const DEFAULT_MAX_TOKENS: usize = 256;
 /// MOSS codec-frame cap per reply sentence (300 frames @ 12.5 fps ~= 24 s).
 const MOSS_MAX_FRAMES: usize = 300;
+/// Qwen3 codec-frame cap per reply sentence (same ~24 s budget as MOSS).
+const QWEN3_MAX_FRAMES: usize = 300;
 /// TTS streaming granularity: decode+emit every this many codec frames
 /// (25 frames @ 12.5 fps ~= 2 s of audio per chunk).
 const TTS_CHUNK_FRAMES: usize = 25;
@@ -176,74 +211,208 @@ impl SentenceSplitter {
     }
 }
 
-/// Synthesize one sentence, streaming audio chunks to the speaker (or the
-/// simulation buffer) as they are generated instead of waiting for the whole
-/// sentence. When `barge` is Some and set, the chunk callback returns `false`
-/// to abort synthesis mid-sentence and stops pushing. Errors are logged, not
-/// propagated (the show goes on).
-fn synth_and_play(
-    tts: &mut MossEngine,
-    speaker: &Option<Arc<Speaker>>,
-    sim_out: &mut Vec<f32>,
-    tts_sr: usize,
-    n: usize,
-    text: &str,
-    barge: Option<&AtomicBool>,
-    ref_codes: Option<&Tensor>,
-) {
-    let mut on_chunk = |pcm: Vec<f32>| -> bool {
-        if let Some(b) = barge
-            && b.load(Ordering::Relaxed)
-        {
-            return false;
+/// Voice-clone reference, encoded once at startup and reused per reply sentence.
+/// The two engines carry different ref state, so this mirrors `LiveTts`.
+enum LiveRef {
+    Moss(Tensor),
+    Qwen3(RefVoice),
+}
+
+/// Selectable TTS engine. Puts every per-engine difference (sample rate, channel
+/// count, ref type, abort mechanism, stats shape) in this one `impl` so the four
+/// synthesis call sites in `run` stay engine-agnostic.
+enum LiveTts {
+    Moss(MossEngine),
+    Qwen3(Qwen3TtsEngine),
+}
+
+impl LiveTts {
+    fn sample_rate(&self) -> usize {
+        match self {
+            LiveTts::Moss(e) => e.sample_rate(),  // 48000
+            LiveTts::Qwen3(e) => e.sample_rate(), // 24000
         }
-        if let Some(speaker) = speaker {
-            if let Err(e) = speaker.push(&pcm, tts_sr, 2) {
-                eprintln!("playback error: {e}");
+    }
+    fn channels(&self) -> usize {
+        match self {
+            LiveTts::Moss(e) => e.channels(), // stereo
+            LiveTts::Qwen3(_) => 1,           // mono
+        }
+    }
+    fn label(&self) -> &'static str {
+        match self {
+            LiveTts::Moss(_) => "moss",
+            LiveTts::Qwen3(_) => "qwen3",
+        }
+    }
+    /// `ref_text` is required for Qwen3 (ICL needs the full ref transcript) and
+    /// ignored for MOSS (validated in `run`).
+    fn encode_ref(&self, ref_wav: &str, ref_text: Option<&str>) -> Result<LiveRef> {
+        match self {
+            LiveTts::Moss(e) => Ok(LiveRef::Moss(e.encode_ref(ref_wav)?)),
+            LiveTts::Qwen3(e) => {
+                let text = ref_text.ok_or_else(|| {
+                    anyhow!(
+                        "--tts qwen3 --ref requires --ref-text \"<full transcript of the ref wav>\""
+                    )
+                })?;
+                Ok(LiveRef::Qwen3(e.encode_ref(ref_wav, text)?))
             }
-        } else {
-            sim_out.extend_from_slice(&pcm);
         }
-        true
-    };
-    match tts.synthesize_pcm_stream_with_codes(
-        text,
-        MOSS_MAX_FRAMES,
-        TTS_CHUNK_FRAMES,
-        ref_codes,
-        &mut on_chunk,
+    }
+
+    /// Synthesize one sentence, streaming audio chunks to the speaker (or the
+    /// simulation buffer) as they are generated instead of waiting for the whole
+    /// sentence. When `barge` is Some and set, synthesis aborts mid-sentence and
+    /// stops pushing. Errors are logged, not propagated (the show goes on).
+    #[allow(clippy::too_many_arguments)]
+    fn synth_and_play(
+        &mut self,
+        speaker: &Option<Arc<Speaker>>,
+        sim_out: &mut Vec<f32>,
+        n: usize,
+        text: &str,
+        barge: Option<&AtomicBool>,
+        ref_voice: Option<&LiveRef>,
     ) {
-        Ok(stats) => eprintln!(
-            "tts[{n}]: {} frames in {:.2}s (ttft {:.2}s){}",
-            stats.frames,
-            stats.total.as_secs_f64(),
-            stats.ttft.as_secs_f64(),
-            if barge.is_some_and(|b| b.load(Ordering::Relaxed)) {
-                " [aborted by barge-in]"
-            } else {
-                ""
-            },
-        ),
-        Err(e) => eprintln!("tts[{n}] error: {e}; continuing"),
+        match self {
+            LiveTts::Moss(e) => {
+                let tts_sr = e.sample_rate();
+                let ref_codes = match ref_voice {
+                    Some(LiveRef::Moss(c)) => Some(c),
+                    _ => None,
+                };
+                let mut on_chunk = |pcm: Vec<f32>| -> bool {
+                    if let Some(b) = barge
+                        && b.load(Ordering::Relaxed)
+                    {
+                        return false;
+                    }
+                    if let Some(speaker) = speaker {
+                        if let Err(e) = speaker.push(&pcm, tts_sr, 2) {
+                            eprintln!("playback error: {e}");
+                        }
+                    } else {
+                        sim_out.extend_from_slice(&pcm);
+                    }
+                    true
+                };
+                match e.synthesize_pcm_stream_with_codes(
+                    text,
+                    MOSS_MAX_FRAMES,
+                    TTS_CHUNK_FRAMES,
+                    ref_codes,
+                    &mut on_chunk,
+                ) {
+                    Ok(stats) => eprintln!(
+                        "tts[{n}]: {} frames in {:.2}s (ttft {:.2}s){}",
+                        stats.frames,
+                        stats.total.as_secs_f64(),
+                        stats.ttft.as_secs_f64(),
+                        if barge.is_some_and(|b| b.load(Ordering::Relaxed)) {
+                            " [aborted by barge-in]"
+                        } else {
+                            ""
+                        },
+                    ),
+                    Err(err) => eprintln!("tts[{n}] error: {err}; continuing"),
+                }
+            }
+            LiveTts::Qwen3(e) => {
+                let sr = e.sample_rate();
+                let rv = match ref_voice {
+                    Some(LiveRef::Qwen3(rv)) => Some(rv),
+                    _ => None,
+                };
+                let t0 = Instant::now();
+                // Qwen3 in the live process uses streaming GENERATION (preserves
+                // barge-in abort via the per-frame predicate) but a single batch
+                // DECODE (one `chunked_decode` after generation). The streaming
+                // sliding-window decode path — `synthesize_pcm_streaming_with_abort`
+                // — is corrupted by candle's Metal buffer pool when interleaved with
+                // the talker's GPU ops in a multi-model Metal process (Qwen3-ASR +
+                // MiniCPM5 having already run on the same `Device::new_metal(0)`):
+                // greedy code sequences come out bit-identical standalone vs live
+                // yet the streamed audio babbles, while a single batch
+                // `chunked_decode` of the same codes is clean. The batch path trades
+                // chunked first-audio for correctness; for the short sentences an
+                // assistant LLM emits this is the right call. (The standalone
+                // `tts qwen3 --stream` CLI is unaffected — it runs one model, so the
+                // streaming decode path stays clean there.)
+                let mut on_audio = |pcm: &[f32]| {
+                    // Stop pushing as soon as barge-in fires (the should_abort
+                    // predicate halts generation; this just guards the one-shot push).
+                    if barge.is_some_and(|b| b.load(Ordering::Relaxed)) {
+                        return;
+                    }
+                    if let Some(s) = speaker {
+                        if let Err(err) = s.push(pcm, sr, 1) {
+                            eprintln!("playback error: {err}");
+                        }
+                    } else {
+                        sim_out.extend_from_slice(pcm);
+                    }
+                };
+                let abort = || barge.is_some_and(|b| b.load(Ordering::Relaxed));
+                match e.synthesize_pcm_batched_with_abort(
+                    text,
+                    "auto",
+                    rv,
+                    QWEN3_MAX_FRAMES,
+                    &mut on_audio,
+                    if barge.is_some() { Some(&abort) } else { None },
+                ) {
+                    Ok((pcm, gen_secs)) => {
+                        // `gen_secs` is generation wall-time (the batch decode runs
+                        // after), not first-audio time — audio arrives in one shot at
+                        // the end of generation. `total` (t0.elapsed) covers gen +
+                        // decode + the one `on_audio` push.
+                        let samples = pcm.dim(1).unwrap_or(0);
+                        let frames = (samples as f64 / sr as f64 * 12.5).round() as usize;
+                        eprintln!(
+                            "tts[{n}]: {frames} frames in {:.2}s (gen {:.2}s){}",
+                            t0.elapsed().as_secs_f64(),
+                            gen_secs,
+                            if barge.is_some_and(|b| b.load(Ordering::Relaxed)) {
+                                " [aborted by barge-in]"
+                            } else {
+                                ""
+                            },
+                        );
+                    }
+                    Err(err) => eprintln!("tts[{n}] error: {err}; continuing"),
+                }
+            }
+        }
     }
 }
 
 pub fn run(args: &[String]) -> Result<()> {
-    let usage = "usage: tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in] [--ref <wav>] [--vad-speech-threshold <f>] [--vad-min-speech-frame <n>] [--vad-min-silence <n>] [--vad-min-speach-ratio <f>] [--vad-min-speach-frames <n>] [--vad-end-silence-ratio <f>] [--vad-look-back-frames <n>] [--min-segment-samples <n>] [--min-seg-peak <f>] [--barge-onset-frames <n>] [--min-barge-rms <f>] [--mic-gain <f>]";
-    if args.len() < 6 {
+    let usage = "usage: tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <tts-model-dir> [<codec-dir: MOSS only>] [--tts moss|qwen3 (default qwen3)] [--talker-quant q4_k|q8_0|none (default q4_k)] [--ref <wav> [--ref-text \"<text>\"]] [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in] [--vad-speech-threshold <f>] [--vad-min-speech-frame <n>] [--vad-min-silence <n>] [--vad-min-speach-ratio <f>] [--vad-min-speach-frames <n>] [--vad-end-silence-ratio <f>] [--vad-look-back-frames <n>] [--min-segment-samples <n>] [--min-seg-peak <f>] [--barge-onset-frames <n>] [--min-barge-rms <f>] [--mic-gain <f>]";
+    // Positionals end at the first `--flag`; MOSS needs 6 (its codec is a separate
+    // dir), Qwen3 needs 5 (its codec is bundled under <model-dir>/speech_tokenizer).
+    let flag_start = args
+        .iter()
+        .position(|a| a.starts_with("--"))
+        .unwrap_or(args.len());
+    let pos = &args[..flag_start];
+    if pos.len() != 5 && pos.len() != 6 {
         bail!(usage);
     }
-    let vad_dir = &args[0];
-    let asr_dir = &args[1];
-    let minicpm_path = &args[2];
-    let tok_path = &args[3];
-    let moss_dir = &args[4];
-    let codec_dir = &args[5];
+    let vad_dir = &pos[0];
+    let asr_dir = &pos[1];
+    let minicpm_path = &pos[2];
+    let tok_path = &pos[3];
+    let tts_dir = &pos[4];
+    let codec_dir = pos.get(5);
     let mut input_wav: Option<String> = None;
     let mut output_wav: Option<String> = None;
     let mut max_tokens = DEFAULT_MAX_TOKENS;
     let mut barge_in = false;
     let mut ref_wav: Option<String> = None;
+    let mut ref_text: Option<String> = None;
+    let mut tts_choice = TtsChoice::Qwen3;
+    let mut talker_quant_cli: Option<TalkerQuant> = None;
     // High-frequency VAD/tuning knobs exposed as flags (priority: flag > env >
     // default). See `vad params:` at startup for the effective values.
     let mut vad_end_silence_ratio: Option<f32> = None;
@@ -258,7 +427,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut barge_onset_cli: Option<usize> = None;
     let mut min_barge_rms_cli: Option<f32> = None;
     let mut mic_gain_cli: Option<f32> = None;
-    let mut i = 6;
+    let mut i = flag_start;
     while i < args.len() {
         match args[i].as_str() {
             "--input" => {
@@ -286,6 +455,20 @@ pub fn run(args: &[String]) -> Result<()> {
                     .map_err(|_| anyhow!("--max-tokens must be a positive integer. {usage}"))?;
             }
             "--barge-in" => barge_in = true,
+            "--tts" => {
+                i += 1;
+                tts_choice = TtsChoice::parse(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--tts requires moss|qwen3. {usage}"))?,
+                )?;
+            }
+            "--talker-quant" => {
+                i += 1;
+                talker_quant_cli =
+                    Some(TalkerQuant::parse(args.get(i).ok_or_else(|| {
+                        anyhow!("--talker-quant requires q4_k|q8_0|none. {usage}")
+                    })?)?);
+            }
             "--ref" => {
                 i += 1;
                 ref_wav = Some(
@@ -294,11 +477,21 @@ pub fn run(args: &[String]) -> Result<()> {
                         .clone(),
                 );
             }
+            "--ref-text" => {
+                i += 1;
+                ref_text = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow!("--ref-text requires a string. {usage}"))?
+                        .clone(),
+                );
+            }
             "--vad-end-silence-ratio" => {
                 i += 1;
                 vad_end_silence_ratio = Some(
                     args.get(i)
-                        .ok_or_else(|| anyhow!("--vad-end-silence-ratio requires a float. {usage}"))?
+                        .ok_or_else(|| {
+                            anyhow!("--vad-end-silence-ratio requires a float. {usage}")
+                        })?
                         .parse()
                         .map_err(|_| anyhow!("--vad-end-silence-ratio must be a float. {usage}"))?,
                 );
@@ -309,7 +502,9 @@ pub fn run(args: &[String]) -> Result<()> {
                     args.get(i)
                         .ok_or_else(|| anyhow!("--vad-min-silence requires a count. {usage}"))?
                         .parse()
-                        .map_err(|_| anyhow!("--vad-min-silence must be a positive integer. {usage}"))?,
+                        .map_err(|_| {
+                            anyhow!("--vad-min-silence must be a positive integer. {usage}")
+                        })?,
                 );
             }
             "--vad-speech-threshold" => {
@@ -327,7 +522,9 @@ pub fn run(args: &[String]) -> Result<()> {
                     args.get(i)
                         .ok_or_else(|| anyhow!("--vad-min-speech-frame requires a count. {usage}"))?
                         .parse()
-                        .map_err(|_| anyhow!("--vad-min-speech-frame must be a positive integer. {usage}"))?,
+                        .map_err(|_| {
+                            anyhow!("--vad-min-speech-frame must be a positive integer. {usage}")
+                        })?,
                 );
             }
             "--vad-min-speach-ratio" => {
@@ -343,9 +540,13 @@ pub fn run(args: &[String]) -> Result<()> {
                 i += 1;
                 vad_min_speach_frames = Some(
                     args.get(i)
-                        .ok_or_else(|| anyhow!("--vad-min-speach-frames requires a count. {usage}"))?
+                        .ok_or_else(|| {
+                            anyhow!("--vad-min-speach-frames requires a count. {usage}")
+                        })?
                         .parse()
-                        .map_err(|_| anyhow!("--vad-min-speach-frames must be a positive integer. {usage}"))?,
+                        .map_err(|_| {
+                            anyhow!("--vad-min-speach-frames must be a positive integer. {usage}")
+                        })?,
                 );
             }
             "--vad-look-back-frames" => {
@@ -354,7 +555,9 @@ pub fn run(args: &[String]) -> Result<()> {
                     args.get(i)
                         .ok_or_else(|| anyhow!("--vad-look-back-frames requires a count. {usage}"))?
                         .parse()
-                        .map_err(|_| anyhow!("--vad-look-back-frames must be a positive integer. {usage}"))?,
+                        .map_err(|_| {
+                            anyhow!("--vad-look-back-frames must be a positive integer. {usage}")
+                        })?,
                 );
             }
             "--min-segment-samples" => {
@@ -363,7 +566,9 @@ pub fn run(args: &[String]) -> Result<()> {
                     args.get(i)
                         .ok_or_else(|| anyhow!("--min-segment-samples requires a count. {usage}"))?
                         .parse()
-                        .map_err(|_| anyhow!("--min-segment-samples must be a positive integer. {usage}"))?,
+                        .map_err(|_| {
+                            anyhow!("--min-segment-samples must be a positive integer. {usage}")
+                        })?,
                 );
             }
             "--min-seg-peak" => {
@@ -381,7 +586,9 @@ pub fn run(args: &[String]) -> Result<()> {
                     args.get(i)
                         .ok_or_else(|| anyhow!("--barge-onset-frames requires a count. {usage}"))?
                         .parse()
-                        .map_err(|_| anyhow!("--barge-onset-frames must be a positive integer. {usage}"))?,
+                        .map_err(|_| {
+                            anyhow!("--barge-onset-frames must be a positive integer. {usage}")
+                        })?,
                 );
             }
             "--min-barge-rms" => {
@@ -413,6 +620,49 @@ pub fn run(args: &[String]) -> Result<()> {
     if barge_in && sim_mode {
         bail!("--barge-in is only meaningful in mic mode (not with --input)");
     }
+
+    // --- resolve + validate the TTS engine choice ---
+    let quant = match tts_choice {
+        TtsChoice::Moss => {
+            if codec_dir.is_none() {
+                bail!("--tts moss needs <codec-dir> (6th positional). {usage}");
+            }
+            if ref_text.is_some() {
+                eprintln!(
+                    "warning: --ref-text is ignored for MOSS (it clones from --ref audio alone)"
+                );
+            }
+            if talker_quant_cli.is_some() {
+                eprintln!("warning: --talker-quant is ignored for --tts moss");
+            }
+            None
+        }
+        TtsChoice::Qwen3 => {
+            if codec_dir.is_some() {
+                bail!(
+                    "<codec-dir> is MOSS-only; qwen3-tts bundles its codec in <model-dir>/speech_tokenizer. {usage}"
+                );
+            }
+            if ref_wav.is_some() && ref_text.is_none() {
+                bail!(
+                    "--tts qwen3 --ref requires --ref-text \"<full transcript of the ref wav>\" (Qwen3 babbles without it). {usage}"
+                );
+            }
+            if ref_wav.is_none() && ref_text.is_some() {
+                bail!("--ref-text only makes sense together with --ref. {usage}");
+            }
+            // Live defaults to Q4_K (sub-realtime), unlike the tts-CLI default bf16.
+            // Priority: --talker-quant flag > TINY_CPM_QWEN3_TTS_TALKER env > q4_k.
+            let q = talker_quant_cli
+                .or_else(|| {
+                    std::env::var("TINY_CPM_QWEN3_TTS_TALKER")
+                        .ok()
+                        .and_then(|s| TalkerQuant::parse(&s).ok())
+                })
+                .unwrap_or(TalkerQuant::Q4K);
+            Some(q)
+        }
+    };
 
     // --- load all five models on one Metal device ---
     let device = Device::new_metal(0)?;
@@ -449,23 +699,41 @@ pub fn run(args: &[String]) -> Result<()> {
     let tokenizer = Tokenizer::from_file(tok_path).map_err(|e| anyhow!("tokenizer: {e}"))?;
 
     let t = Instant::now();
-    let mut tts = MossEngine::load(moss_dir, codec_dir, &device)?;
-    eprintln!("loaded MOSS-TTS in {:.2}s", t.elapsed().as_secs_f64());
-    let tts_sr = tts.sample_rate();
+    let mut tts = match tts_choice {
+        TtsChoice::Moss => LiveTts::Moss(MossEngine::load(tts_dir, codec_dir.unwrap(), &device)?),
+        TtsChoice::Qwen3 => LiveTts::Qwen3(Qwen3TtsEngine::load_with_quant(
+            tts_dir,
+            &device,
+            quant.unwrap(),
+        )?),
+    };
+    eprintln!(
+        "loaded {} TTS{} in {:.2}s",
+        tts.label(),
+        match tts_choice {
+            TtsChoice::Moss => String::new(),
+            TtsChoice::Qwen3 => format!(" (talker {})", quant.unwrap().label()),
+        },
+        t.elapsed().as_secs_f64()
+    );
+    let (tts_sr, tts_ch) = (tts.sample_rate(), tts.channels());
 
-    // --- reference voice (optional): encode the ref once and reuse the codes
-    // for every reply sentence, so cloning doesn't re-encode a long ref per
-    // sentence (a 22 s ref is ~4 s of CPU codec encode each). ---
-    let ref_codes = if let Some(ref_path) = &ref_wav {
+    // --- reference voice (optional): encode the ref once and reuse it for every
+    // reply sentence, so cloning doesn't re-encode a long ref per sentence. ---
+    let live_ref = if let Some(ref_path) = &ref_wav {
         let t = Instant::now();
-        let codes = tts.encode_ref(ref_path)?;
+        let r = tts.encode_ref(ref_path, ref_text.as_deref())?;
+        let detail = match &r {
+            LiveRef::Moss(codes) => format!("{} frames", codes.dim(0)?),
+            LiveRef::Qwen3(_) => "spk emb + ref codes".to_string(),
+        };
         eprintln!(
-            "encoded voice ref {} ({} frames) in {:.2}s",
+            "encoded {} voice ref {} ({detail}) in {:.2}s",
+            tts.label(),
             ref_path,
-            codes.dim(0)?,
             t.elapsed().as_secs_f64()
         );
-        Some(codes)
+        Some(r)
     } else {
         None
     };
@@ -498,7 +766,7 @@ pub fn run(args: &[String]) -> Result<()> {
     } else {
         Some(Arc::new(Speaker::start()?))
     };
-    // Simulation mode accumulates the reply PCM (interleaved stereo) here.
+    // Simulation mode accumulates the reply PCM (interleaved, `tts_ch` channels) here.
     let mut sim_out: Vec<f32> = Vec::new();
 
     eprintln!(
@@ -559,7 +827,10 @@ pub fn run(args: &[String]) -> Result<()> {
                 // floor; boost before VAD so the neural model sees normal
                 // levels).
                 let frame: Vec<f32> = if mic_gain_val != 1.0 {
-                    frame.iter().map(|s| (s * mic_gain_val).clamp(-1.0, 1.0)).collect()
+                    frame
+                        .iter()
+                        .map(|s| (s * mic_gain_val).clamp(-1.0, 1.0))
+                        .collect()
                 } else {
                     frame
                 };
@@ -632,9 +903,7 @@ pub fn run(args: &[String]) -> Result<()> {
                     .fold(0.0f32, |a, b| a.max(b));
                 let gate = min_seg_peak(min_seg_peak_cli);
                 if peak < gate {
-                    eprintln!(
-                        "segment dropped: peak {peak:.3} < gate {gate:.3} (distant/noise)"
-                    );
+                    eprintln!("segment dropped: peak {peak:.3} < gate {gate:.3} (distant/noise)");
                     continue;
                 }
                 eprintln!("segment peak {peak:.3}");
@@ -693,15 +962,13 @@ pub fn run(args: &[String]) -> Result<()> {
                     n_sentences += 1;
                     println!("tiny: {sentence}");
                     let _ = std::io::stdout().flush();
-                    synth_and_play(
-                        &mut tts,
+                    tts.synth_and_play(
                         &speaker,
                         &mut sim_out,
-                        tts_sr,
                         n_sentences,
                         &sentence,
                         Some(&barge),
-                        ref_codes.as_ref(),
+                        live_ref.as_ref(),
                     );
                 }
             };
@@ -735,15 +1002,13 @@ pub fn run(args: &[String]) -> Result<()> {
                 n_sentences += 1;
                 println!("tiny: {rest}");
                 let _ = std::io::stdout().flush();
-                synth_and_play(
-                    &mut tts,
+                tts.synth_and_play(
                     &speaker,
                     &mut sim_out,
-                    tts_sr,
                     n_sentences,
                     &rest,
                     Some(&barge),
-                    ref_codes.as_ref(),
+                    live_ref.as_ref(),
                 );
             }
             if n_sentences == 0 {
@@ -786,7 +1051,10 @@ pub fn run(args: &[String]) -> Result<()> {
             frame
         };
         let frame: Vec<f32> = if mic_gain_val != 1.0 {
-            frame.iter().map(|s| (s * mic_gain_val).clamp(-1.0, 1.0)).collect()
+            frame
+                .iter()
+                .map(|s| (s * mic_gain_val).clamp(-1.0, 1.0))
+                .collect()
         } else {
             frame
         };
@@ -850,9 +1118,7 @@ pub fn run(args: &[String]) -> Result<()> {
             .fold(0.0f32, |a, b| a.max(b));
         let gate = min_seg_peak(min_seg_peak_cli);
         if peak < gate {
-            eprintln!(
-                "turn skipped: peak {peak:.3} < gate {gate:.3} (distant/noise)"
-            );
+            eprintln!("turn skipped: peak {peak:.3} < gate {gate:.3} (distant/noise)");
             continue;
         }
         eprintln!("segment peak {peak:.3}");
@@ -886,15 +1152,13 @@ pub fn run(args: &[String]) -> Result<()> {
                 n_sentences += 1;
                 println!("tiny: {sentence}");
                 let _ = std::io::stdout().flush();
-                synth_and_play(
-                    &mut tts,
+                tts.synth_and_play(
                     &speaker,
                     &mut sim_out,
-                    tts_sr,
                     n_sentences,
                     &sentence,
                     None,
-                    ref_codes.as_ref(),
+                    live_ref.as_ref(),
                 );
             }
         };
@@ -929,15 +1193,13 @@ pub fn run(args: &[String]) -> Result<()> {
             n_sentences += 1;
             println!("tiny: {rest}");
             let _ = std::io::stdout().flush();
-            synth_and_play(
-                &mut tts,
+            tts.synth_and_play(
                 &speaker,
                 &mut sim_out,
-                tts_sr,
                 n_sentences,
                 &rest,
                 None,
-                ref_codes.as_ref(),
+                live_ref.as_ref(),
             );
         }
         if n_sentences == 0 {
@@ -957,13 +1219,14 @@ pub fn run(args: &[String]) -> Result<()> {
         if sim_out.is_empty() {
             eprintln!("no reply audio synthesized; not writing {out_path}");
         } else {
-            let frames = sim_out.len() / 2;
+            let frames = sim_out.len() / tts_ch;
             let interleaved = Tensor::new(sim_out.as_slice(), &Device::Cpu)?;
-            let stereo = interleaved.reshape((frames, 2))?.t()?;
-            save_wav(&stereo, out_path, 2, tts_sr as u32)?;
+            let pcm = interleaved.reshape((frames, tts_ch))?.t()?;
+            save_wav(&pcm, out_path, tts_ch, tts_sr as u32)?;
             eprintln!(
-                "wrote {out_path} ({:.2}s stereo @ {} Hz)",
+                "wrote {out_path} ({:.2}s {} @ {} Hz)",
                 frames as f64 / tts_sr as f64,
+                if tts_ch == 2 { "stereo" } else { "mono" },
                 tts_sr
             );
         }

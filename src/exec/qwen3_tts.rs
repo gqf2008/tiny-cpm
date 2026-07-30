@@ -30,12 +30,12 @@ const USAGE: &str = "usage: tiny-cpm tts qwen3 <model-dir> \"<text>\" <out.wav> 
 /// Default first chunk (frames @ 12.5 Hz) before the first audio flush: 12 frames ≈
 /// 0.96 s of audio — small enough for a fast first-audio, large enough to not spend the
 /// whole budget on overlapping codec windows. Env-tunable via QWEN3_TTS_STREAM_FIRST.
-const STREAM_FIRST_FRAMES: usize = 12;
+pub const STREAM_FIRST_FRAMES: usize = 12;
 /// Steady-state chunk between flushes (25 frames = 2.0 s of audio). QWEN3_TTS_STREAM_CHUNK.
-const STREAM_CHUNK_FRAMES: usize = 25;
+pub const STREAM_CHUNK_FRAMES: usize = 25;
 /// Left context re-decoded (and dropped) per flush so chunk seams match the batch path.
 /// Matches the batch `chunked_decode(.., 25)` left context. QWEN3_TTS_STREAM_CTX.
-const STREAM_LEFT_CONTEXT: usize = 25;
+pub const STREAM_LEFT_CONTEXT: usize = 25;
 
 /// Talker backbone precision: QMatMul (Q4_K/Q8_0, runtime-quantized in memory)
 /// or the full BF16 safetensors path.
@@ -51,7 +51,7 @@ pub enum TalkerQuant {
 }
 
 impl TalkerQuant {
-    fn parse(s: &str) -> Result<Self> {
+    pub fn parse(s: &str) -> Result<Self> {
         match s.to_ascii_lowercase().replace(['-', '_'], "").as_str() {
             "q4k" | "q4km" => Ok(Self::Q4K),
             "q80" => Ok(Self::Q8_0),
@@ -70,7 +70,7 @@ impl TalkerQuant {
             Self::None => None,
         }
     }
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Q4K => "q4_k",
             Self::Q8_0 => "q8_0",
@@ -178,11 +178,8 @@ impl Qwen3TtsEngine {
             sample_rate: tts_cfg.speaker_encoder_config.sample_rate,
             ..SpeakerEncoderParams::default()
         };
-        let speaker_encoder = SpeakerEncoder::new(
-            vb_f32.pp("speaker_encoder"),
-            spk_params,
-            device,
-        )?;
+        let speaker_encoder =
+            SpeakerEncoder::new(vb_f32.pp("speaker_encoder"), spk_params, device)?;
 
         // --- 12 Hz codec (F32 safetensors in speech_tokenizer/) ---
         let codec_dir = format!("{model_dir}/speech_tokenizer");
@@ -305,6 +302,91 @@ impl Qwen3TtsEngine {
         left_context: usize,
         on_audio: &mut dyn FnMut(&[f32]),
     ) -> Result<(Tensor, f64)> {
+        self.synthesize_pcm_streaming_with_abort(
+            text,
+            language,
+            ref_voice,
+            max_frames,
+            first_chunk_frames,
+            chunk_frames,
+            left_context,
+            on_audio,
+            None,
+        )
+    }
+
+    /// Streaming GENERATION + batch DECODE: the talker emits frames one at a time
+    /// (abortable via `should_abort`, polled per frame — so `live` barge-in still
+    /// halts a sentence mid-generation), but instead of decoding each chunk on a
+    /// sliding window, we decode the whole sentence with ONE `chunked_decode` at the
+    /// end.
+    ///
+    /// Why: in a multi-model Metal process (e.g. `live`, where Qwen3-ASR + MiniCPM5
+    /// have already run on the shared `Device`), candle 0.11's Metal buffer pool
+    /// hands the streaming sliding-window `codec.decoder.decode` (small per-chunk
+    /// windows interleaved with the talker's GPU ops) recycled buffers holding stale
+    /// data, producing corrupted/babbled audio — while the single batch
+    /// `chunked_decode` of the same codes is clean. This was isolated: under full
+    /// greedy the talker's code sequence is bit-identical standalone vs live, the
+    /// per-sentence batch `chunked_decode` is clean in live, but the streaming
+    /// sliding-window audio babbles (see `tests/live_tts_corruption.rs` notes).
+    ///
+    /// Trade-off vs `synthesize_pcm_streaming_with_abort`: first audio arrives
+    /// after the sentence finishes (not chunked during generation). For the short
+    /// sentences a voice-assistant LLM emits this is fine, and correctness > a few
+    /// hundred ms of latency here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_pcm_batched_with_abort(
+        &mut self,
+        text: &str,
+        language: &str,
+        ref_voice: Option<&RefVoice>,
+        max_frames: usize,
+        on_audio: &mut dyn FnMut(&[f32]),
+        should_abort: Option<&dyn Fn() -> bool>,
+    ) -> Result<(Tensor, f64)> {
+        let text_ids = self.encode_text(text)?;
+        let newline = self.newline_token()?;
+        let t0 = Instant::now();
+        // on_frame: just drive the abort predicate; the frames are collected by
+        // generate_stream itself and returned (partial if aborted).
+        let mut on_frame = |_: &[u32]| !should_abort.is_some_and(|f| f());
+        let codes = self.talker.generate_stream(
+            &text_ids,
+            language,
+            ref_voice,
+            newline,
+            &self.gen_cfg,
+            max_frames,
+            Some(&mut on_frame),
+        )?; // (n, 16)
+        let first_secs = t0.elapsed().as_secs_f64();
+        // Single batch decode — the clean path in multi-model processes.
+        let codes = codes.t()?.unsqueeze(0)?; // (1, 16, n)
+        let wav = self.codec.decoder.chunked_decode(&codes, 300, 25)?; // (1, 1, n*1920)
+        let pcm = wav.squeeze(0)?.squeeze(0)?.to_vec1::<f32>()?;
+        on_audio(&pcm);
+        Ok((wav.squeeze(0)?, first_secs))
+    }
+
+    /// `synthesize_pcm_streaming` + an optional `should_abort` predicate polled once per
+    /// generated frame. When it returns true the talker stops generating (the partial
+    /// frames are kept) and the buffered tail is NOT flushed, so an interrupted sentence
+    /// emits no late audio — parity with MOSS's `on_chunk -> false`. Used by `live`
+    /// barge-in; the plain wrapper passes `None`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_pcm_streaming_with_abort(
+        &mut self,
+        text: &str,
+        language: &str,
+        ref_voice: Option<&RefVoice>,
+        max_frames: usize,
+        first_chunk_frames: usize,
+        chunk_frames: usize,
+        left_context: usize,
+        on_audio: &mut dyn FnMut(&[f32]),
+        should_abort: Option<&dyn Fn() -> bool>,
+    ) -> Result<(Tensor, f64)> {
         use std::cell::RefCell;
         let text_ids = self.encode_text(text)?;
         let newline = self.newline_token()?;
@@ -386,7 +468,9 @@ impl Qwen3TtsEngine {
                     flush(&mut s, codec_ref, false);
                 }
                 // Stop generating once a decode error was recorded; it surfaces after.
-                decode_err.borrow().is_none()
+                // Also stop (and drop the partial tail) when the caller's abort
+                // predicate fires (live barge-in).
+                decode_err.borrow().is_none() && !should_abort.is_some_and(|f| f())
             };
             if let Err(e) = self.talker.generate_stream(
                 &text_ids,
@@ -406,8 +490,10 @@ impl Qwen3TtsEngine {
         if let Some(e) = gen_err {
             return Err(e);
         }
-        // Final flush of the remaining partial chunk.
-        {
+        // Final flush of the remaining partial chunk. Skipped when the caller aborted:
+        // an interrupted sentence must not emit its buffered tail after the interruption
+        // (MOSS parity — its `on_chunk -> false` never emits past the abort).
+        if !should_abort.is_some_and(|f| f()) {
             let mut s = st.borrow_mut();
             flush(&mut s, codec_ref, true);
         }
