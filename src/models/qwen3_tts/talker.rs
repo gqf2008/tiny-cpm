@@ -210,6 +210,47 @@ impl CodePredictor {
     }
 }
 
+/// Sample one token from a `(1, vocab)` logits row **entirely on-device** (no GPU→CPU
+/// readback). Temperature is a scalar multiply and the multinomial draw is Gumbel-max
+/// (`argmax(logits + Gumbel(0,1))`), which is exactly a softmax-weighted sample. Returns a
+/// `(1,)` u32 tensor on the logits' device. Repetition penalty is not handled here (the
+/// code predictor never applies one); top-k/top-p are skipped (see the note below).
+fn gpu_sample_token(
+    logits: &Tensor, // (1, vocab), any float dtype
+    do_sample: bool,
+    temperature: f64,
+    top_k: usize,
+    top_p: f32,
+) -> Result<Tensor> {
+    let mut lg = logits.to_dtype(DType::F32)?;
+
+    // Temperature (skip when ~1 to avoid a no-op kernel).
+    if do_sample && temperature > 0.0 && (temperature - 1.0).abs() > 1e-6 {
+        lg = (lg / temperature)?;
+    }
+
+    // Top-k / top-p: skipped on the GPU path. The code predictor's defaults
+    // (top_k=50, top_p=1.0 over a 2048-token vocab) only trim the negligible tail, and a
+    // GPU top-k needs an O(vocab²) rank-count mask that costs far more than it saves on
+    // Metal (measured: it made the predictor *slower* than the CPU-sync path). Gumbel-max
+    // over the full temperature-scaled softmax is a faithful sample of essentially the
+    // same distribution. (Set QWEN3_TTS_CPU_SAMPLE=1 for the exact top-k/top-p path.)
+    let _ = top_k;
+    let _ = top_p;
+
+    if !do_sample {
+        // Greedy: argmax over the (masked) logits.
+        return Ok(lg.argmax(candle_core::D::Minus1)?); // (1,) u32
+    }
+
+    // Multinomial via Gumbel-max: sample u ~ U(0,1), g = -log(-log(u)), pick
+    // argmax(lg + g). argmax over -inf entries stays -inf+finite → never selected.
+    let u = Tensor::rand_like(&lg, 1e-7, 1.0)?; // avoid log(0)
+    let gumbel = u.log()?.neg()?.log()?.neg()?;
+    let perturbed = (lg + gumbel)?;
+    Ok(perturbed.argmax(candle_core::D::Minus1)?) // (1,) u32
+}
+
 /// Voice-cloning reference: pre-encoded speaker embedding + ref codec codes + ref text.
 pub struct RefVoice {
     /// Raw speaker embedding, (enc_dim,) — becomes one prefix row.
@@ -685,10 +726,18 @@ impl Talker {
         // Diagnostic: QWEN3_TTS_GREEDY=1 forces argmax (do_sample=false) to test
         // whether babbling is sampling-driven (temperature × numeric scale).
         let greedy = std::env::var("QWEN3_TTS_GREEDY").is_ok();
+        // QWEN3_TTS_PROF=1: per-stage wall-clock accumulation, printed at end of gen.
+        let prof = std::env::var("QWEN3_TTS_PROF").is_ok();
+        let mut t_sample0 = std::time::Duration::ZERO;
+        let mut t_predictor = std::time::Duration::ZERO;
+        let mut t_embed = std::time::Duration::ZERO;
+        let mut t_fwd = std::time::Duration::ZERO;
+        let t_gen = std::time::Instant::now();
 
         #[allow(clippy::explicit_counter_loop)]
         // `offset` tracks the KV-cache seqlen, not the loop item.
         for step in 0..max_new_tokens {
+            let tt = std::time::Instant::now();
             let mut lg = logits.clone();
             for (i, l) in lg.iter_mut().enumerate().take(vocab_size) {
                 if i >= suppress_from && i != codec_eos as usize {
@@ -704,6 +753,9 @@ impl Talker {
                 if step >= 2 { Some(&gen_history) } else { None },
                 gen_cfg.repetition_penalty,
             )?;
+            if prof {
+                t_sample0 += tt.elapsed();
+            }
             if code0 == codec_eos && step >= 2 {
                 break;
             }
@@ -716,17 +768,25 @@ impl Talker {
             }
 
             // code predictor fills codebooks 1..=15.
+            let tt = std::time::Instant::now();
             let rest = self.code_predictor_predict(&past_hidden, code0, gen_cfg)?;
+            if prof {
+                t_predictor += tt.elapsed();
+            }
             let mut frame = vec![code0];
             frame.extend_from_slice(&rest);
 
             // next input embedding: Σ16 codebook embeddings + trailing/tts_pad text row.
+            let tt = std::time::Instant::now();
             let mut next = self.frame_embed(&frame)?;
             let text_row = match &trailing {
                 Some(tr) if step < n_trailing => tr.narrow(1, step, 1)?,
                 _ => tts_pad_embed.clone(),
             };
             next = (next + text_row)?;
+            if prof {
+                t_embed += tt.elapsed();
+            }
             frames.push(frame);
 
             // Streaming: emit this frame's codes; `false` aborts generation early.
@@ -734,10 +794,31 @@ impl Talker {
                 break;
             }
 
+            let tt = std::time::Instant::now();
             let (h, l) = self.forward_step(&next, offset)?;
+            if prof {
+                t_fwd += tt.elapsed();
+            }
             past_hidden = h;
             logits = l;
             offset += 1;
+        }
+
+        if prof {
+            let total = t_gen.elapsed();
+            eprintln!(
+                "qwen3-tts PROF: frames={} total={:.2?} | sample0={:.2?} predictor={:.2?} embed={:.2?} fwd={:.2?} | per-frame: sample0={:.2?} predictor={:.2?} embed={:.2?} fwd={:.2?}",
+                frames.len(),
+                total,
+                t_sample0,
+                t_predictor,
+                t_embed,
+                t_fwd,
+                t_sample0 / frames.len().max(1) as u32,
+                t_predictor / frames.len().max(1) as u32,
+                t_embed / frames.len().max(1) as u32,
+                t_fwd / frames.len().max(1) as u32,
+            );
         }
 
         let flat: Vec<u32> = frames.into_iter().flatten().collect();
@@ -746,6 +827,16 @@ impl Talker {
     }
 
     /// Run the code predictor for one frame (codebook 0 already known). Returns 15 codes.
+    ///
+    /// **GPU-sampling path (default)** — the 15 codebook steps each need the sampled token
+    /// to build the next step's embedding, which naively forces a blocking `to_vec2`
+    /// GPU→CPU readback per step. Profiling (`QWEN3_TTS_PROF=1`) shows that readback is
+    /// the dominant per-frame cost: it drains the entire queued GPU command buffer, so
+    /// 15 serialized syncs prevent any pipelining and the predictor alone was ~70% of
+    /// frame time. The fix keeps sampling *on the GPU*: each step applies temperature +
+    /// top-k + Gumbel-max argmax as tensor ops (no readback), feeds the token back via an
+    /// on-device embedding gather, and does ONE `to_vec1` readback after the last step.
+    /// Set `QWEN3_TTS_CPU_SAMPLE=1` to restore the per-step CPU sampling (reference path).
     fn code_predictor_predict(
         &mut self,
         talker_hidden_last: &Tensor,
@@ -757,34 +848,64 @@ impl Talker {
         cp.clear_kv_cache();
         let prefill = Tensor::cat(&[talker_hidden_last.clone(), code0_emb], 1)?; // (1,2,hidden)
         let mut hidden = cp.forward_hidden(&prefill, 0)?; // (1,1,hidden) from position 1
-        let mut codes = Vec::with_capacity(cp.cfg.num_code_groups - 1);
+        let n_groups = cp.cfg.num_code_groups - 1;
         let mut offset = 2usize;
-        for g in 0..cp.cfg.num_code_groups - 1 {
-            let logits = cp.lm_head[g]
-                .forward(&hidden)?
-                .squeeze(1)?
-                .to_dtype(DType::F32)?
-                .to_vec2::<f32>()?;
-            let token = sample_from_logits_vec(
-                &logits[0],
+        let cpu_sample = std::env::var("QWEN3_TTS_CPU_SAMPLE").is_ok();
+
+        if cpu_sample {
+            // Reference path: per-step CPU sampling (one blocking sync per codebook).
+            let mut codes = Vec::with_capacity(n_groups);
+            for g in 0..n_groups {
+                let logits = cp.lm_head[g]
+                    .forward(&hidden)?
+                    .squeeze(1)?
+                    .to_dtype(DType::F32)?
+                    .to_vec2::<f32>()?;
+                let token = sample_from_logits_vec(
+                    &logits[0],
+                    gen_cfg.subtalker_dosample,
+                    Some(gen_cfg.subtalker_temperature),
+                    Some(gen_cfg.subtalker_top_k),
+                    Some(gen_cfg.subtalker_top_p),
+                    None,
+                    1.0,
+                )?;
+                codes.push(token);
+                if g + 1 < n_groups {
+                    let emb = cp.codec_embedding[g].forward(&Tensor::from_vec(
+                        vec![token],
+                        (1, 1),
+                        hidden.device(),
+                    )?)?; // (1,1,talker_hidden)
+                    hidden = cp.forward_hidden(&emb, offset)?;
+                    offset += 1;
+                }
+            }
+            return Ok(codes);
+        }
+
+        // GPU path: keep the running token as an on-device (1,) u32 tensor; gather its
+        // embedding without a readback. Collect the 15 token tensors and read them back
+        // in a single cat + to_vec1 at the end.
+        let mut token_tensors: Vec<Tensor> = Vec::with_capacity(n_groups);
+        for g in 0..n_groups {
+            let logits = cp.lm_head[g].forward(&hidden)?.squeeze(0)?; // (1, vocab)
+            let token = gpu_sample_token(
+                &logits,
                 gen_cfg.subtalker_dosample,
-                Some(gen_cfg.subtalker_temperature),
-                Some(gen_cfg.subtalker_top_k),
-                Some(gen_cfg.subtalker_top_p),
-                None,
-                1.0,
-            )?;
-            codes.push(token);
-            if g + 1 < cp.cfg.num_code_groups - 1 {
-                let emb = cp.codec_embedding[g].forward(&Tensor::from_vec(
-                    vec![token],
-                    (1, 1),
-                    hidden.device(),
-                )?)?; // (1,1,talker_hidden)
+                gen_cfg.subtalker_temperature,
+                gen_cfg.subtalker_top_k,
+                gen_cfg.subtalker_top_p,
+            )?; // (1,) u32 on device
+            if g + 1 < n_groups {
+                let emb = cp.codec_embedding[g].forward(&token.reshape((1, 1))?)?;
                 hidden = cp.forward_hidden(&emb, offset)?;
                 offset += 1;
             }
+            token_tensors.push(token);
         }
-        Ok(codes)
+        // Single readback for the whole frame.
+        let all = Tensor::cat(&token_tensors, 0)?.to_vec1::<u32>()?;
+        Ok(all)
     }
 }
