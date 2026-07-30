@@ -171,9 +171,16 @@ impl Qwen3TtsEngine {
         // dtype in `encode_ref`.
         let vb_f32 =
             unsafe { VarBuilder::from_mmaped_safetensors(&model_list, DType::F32, device)? };
+        // enc_dim comes from config.json's speaker_encoder_config (1024 on 0.6B, 2048 on
+        // 1.7B); the rest of the ECAPA-TDNN hyper-params are the upstream defaults.
+        let spk_params = SpeakerEncoderParams {
+            enc_dim: tts_cfg.speaker_encoder_config.enc_dim,
+            sample_rate: tts_cfg.speaker_encoder_config.sample_rate,
+            ..SpeakerEncoderParams::default()
+        };
         let speaker_encoder = SpeakerEncoder::new(
             vb_f32.pp("speaker_encoder"),
-            SpeakerEncoderParams::default(),
+            spk_params,
             device,
         )?;
 

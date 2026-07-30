@@ -105,7 +105,10 @@ struct CodePredictor {
     norm: RmsNorm,
     rotary: RoPE,
     lm_head: Vec<Linear>, // 15 × [hidden → vocab]
-    small_to_mtp: Linear, // talker_hidden → predictor hidden
+    /// talker_hidden → predictor_hidden projection. `None` when the two hidden sizes
+    /// are equal (e.g. 0.6B, whose code predictor runs at the talker's 1024 and so has
+    /// no `small_to_mtp_projection` tensor in the checkpoint); 1.7B projects 2048→1024.
+    small_to_mtp: Option<Linear>,
 }
 
 impl CodePredictor {
@@ -150,11 +153,17 @@ impl CodePredictor {
                 vb.pp("lm_head").pp(g),
             )?);
         }
-        let small_to_mtp = linear(
-            talker_hidden,
-            cfg.hidden_size,
-            vb.pp("small_to_mtp_projection"),
-        )?;
+        // 1.7B (talker 2048 → predictor 1024) carries a small_to_mtp_projection tensor;
+        // 0.6B (both 1024) does not — skip the projection when dims already match.
+        let small_to_mtp = if talker_hidden == cfg.hidden_size {
+            None
+        } else {
+            Some(linear(
+                talker_hidden,
+                cfg.hidden_size,
+                vb.pp("small_to_mtp_projection"),
+            )?)
+        };
         Ok(Self {
             cfg: cfg.clone(),
             codec_embedding,
@@ -175,7 +184,11 @@ impl CodePredictor {
     /// One decoder forward over `embeds` (1, T, talker_hidden), projecting to predictor
     /// hidden size first. Returns the last-position hidden (1, predictor_hidden).
     fn forward_hidden(&mut self, embeds: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
-        let xs = self.small_to_mtp.forward(embeds)?; // (1, T, hidden)
+        // Project to predictor hidden only when the dims differ (0.6B runs them equal).
+        let xs = match &self.small_to_mtp {
+            Some(proj) => proj.forward(embeds)?,
+            None => embeds.clone(),
+        }; // (1, T, hidden)
         let (bs, seq_len, _) = xs.dims3()?;
         let mask = if seq_len <= 1 {
             None
