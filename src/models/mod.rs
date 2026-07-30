@@ -8,4 +8,5 @@ pub mod moss_tts_nano;
 pub mod qwen2;
 pub mod qwen3;
 pub mod qwen3_asr;
+pub mod qwen3_tts;
 pub mod voxcpm;

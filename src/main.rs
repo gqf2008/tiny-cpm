@@ -17,7 +17,9 @@
 //!     tiny-cpm dialogue <funasr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
 //!     tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N]
 
-use tiny_cpm::{common, exec, models, position_embed, quantized_minicpm5, token_output_stream, tokenizer, utils};
+use tiny_cpm::{
+    common, exec, models, position_embed, quantized_minicpm5, token_output_stream, tokenizer, utils,
+};
 
 use anyhow::{Result, bail};
 
@@ -40,8 +42,9 @@ fn main() -> Result<()> {
             Some("voxcpm") => exec::voxcpm::run(&rest[1..]),
             Some("moss") => exec::moss_tts::run(&rest[1..]),
             Some("cosyvoice3") => exec::cosyvoice3::run(&rest[1..]),
+            Some("qwen3") => exec::qwen3_tts::run(&rest[1..]),
             _ => bail!(
-                "usage: tiny-cpm tts <voxcpm|moss> <model-dir> \"<text>\" <out.wav> [--codec <codec-dir>] [--ref <ref.wav>] [--max-len N]\n       tiny-cpm tts cosyvoice3 <model-dir> \"<text>\" <out.wav> [--voice <name>] [--ref <ref.wav> --ref-text \"<text>\"] [--steps N] [--max-tokens N]"
+                "usage: tiny-cpm tts <voxcpm|moss> <model-dir> \"<text>\" <out.wav> [--codec <codec-dir>] [--ref <ref.wav>] [--max-len N]\n       tiny-cpm tts cosyvoice3 <model-dir> \"<text>\" <out.wav> [--voice <name>] [--ref <ref.wav> --ref-text \"<text>\"] [--steps N] [--max-tokens N]\n       tiny-cpm tts qwen3 <model-dir> \"<text>\" <out.wav> [--ref <ref.wav> --ref-text \"<text>\"] [--language <lang>] [--max-frames N]"
             ),
         },
         "vad" => exec::vad::run(rest),
