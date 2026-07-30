@@ -702,6 +702,12 @@ impl CodecDecoder {
         Ok(wav.clamp(-1.0, 1.0)?)
     }
 
+    /// Output PCM samples per codec frame (`total_upsample`; 1920 at 24 kHz).
+    /// Used by the streaming path to slice a re-decoded window down to its new tail.
+    pub fn frame_samples(&self) -> usize {
+        self.total_upsample
+    }
+
     /// `chunked_decode`: 300-frame chunks with 25-frame left context (context output trimmed).
     /// codes: (B, 16, T) → (B, 1, T*1920).
     pub fn chunked_decode(

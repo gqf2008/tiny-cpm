@@ -477,8 +477,41 @@ impl Talker {
         gen_cfg: &Qwen3TTSGenerationConfig,
         max_new_tokens: usize,
     ) -> Result<Tensor> {
+        self.generate_stream(
+            text_ids,
+            language,
+            ref_voice,
+            newline_token,
+            gen_cfg,
+            max_new_tokens,
+            None,
+        )
+    }
+
+    /// `generate` + an optional per-frame callback. After each frame's 16 codes are
+    /// finalized, `on_frame(&frame)` runs; returning `false` aborts generation early
+    /// (the frames so far are still returned, so the caller can flush the tail). The
+    /// exec streaming path uses this to incrementally codec-decode as frames arrive.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_stream(
+        &mut self,
+        text_ids: &[u32],
+        language: &str,
+        ref_voice: Option<&RefVoice>,
+        newline_token: u32,
+        gen_cfg: &Qwen3TTSGenerationConfig,
+        max_new_tokens: usize,
+        mut on_frame: Option<&mut dyn FnMut(&[u32]) -> bool>,
+    ) -> Result<Tensor> {
         anyhow::ensure!(!text_ids.is_empty(), "talker.generate: empty text");
         self.clear_kv_cache();
+        // Normalize to a single &mut dyn callback (no-op when streaming is off) so the
+        // ICL / non-ICL branches below can pass one uniform reference to generate_inner.
+        let mut noop = |_: &[u32]| true;
+        let cb: &mut dyn FnMut(&[u32]) -> bool = match on_frame.as_mut() {
+            Some(c) => &mut **c,
+            None => &mut noop,
+        };
         let cfg = &self.cfg;
         let hidden = cfg.hidden_size;
 
@@ -565,13 +598,27 @@ impl Talker {
                 let head_part = (text_track.narrow(1, 0, c1)? + codec_track)?;
                 let prompt = Tensor::cat(&[prompt0, head_part], 1)?;
                 let rest = text_track.narrow(1, c1, t1 - c1)?; // trailing
-                self.generate_inner(prompt, Some(rest), tts_pad_embed, gen_cfg, max_new_tokens)
+                self.generate_inner(
+                    prompt,
+                    Some(rest),
+                    tts_pad_embed,
+                    gen_cfg,
+                    max_new_tokens,
+                    cb,
+                )
             } else {
                 let pad_rows = Tensor::cat(&vec![tts_pad_embed.clone(); c1 - t1], 1)?;
                 let text_track = Tensor::cat(&[text_track, pad_rows], 1)?;
                 let head_part = (text_track + codec_track)?;
                 let prompt = Tensor::cat(&[prompt0, head_part], 1)?;
-                self.generate_inner(prompt, None, tts_pad_embed, gen_cfg, max_new_tokens)
+                self.generate_inner(
+                    prompt,
+                    None,
+                    tts_pad_embed,
+                    gen_cfg,
+                    max_new_tokens,
+                    cb,
+                )
             }
         } else {
             // Non-ICL: first text token ⊕ last codec prefix row (bos); rest → trailing.
@@ -584,12 +631,21 @@ impl Talker {
             } else {
                 tts_eos_embed
             };
-            self.generate_inner(prompt, Some(rest), tts_pad_embed, gen_cfg, max_new_tokens)
+            self.generate_inner(
+                prompt,
+                Some(rest),
+                tts_pad_embed,
+                gen_cfg,
+                max_new_tokens,
+                cb,
+            )
         }
     }
 
     /// The AR decode loop shared by ICL and non-ICL. `trailing` rows (1, N, hidden) are
     /// added to the text track one per generated frame; once exhausted, `tts_pad_embed`.
+    /// `on_frame` (streaming) runs after each frame's 16 codes are finalized; `false`
+    /// aborts the loop early (frames generated so far are kept and returned).
     fn generate_inner(
         &mut self,
         prompt: Tensor,
@@ -597,6 +653,7 @@ impl Talker {
         tts_pad_embed: Tensor,
         gen_cfg: &Qwen3TTSGenerationConfig,
         max_new_tokens: usize,
+        on_frame: &mut dyn FnMut(&[u32]) -> bool,
     ) -> Result<Tensor> {
         // Copy config values out up front; `&mut self` methods are called in the loop.
         let vocab_size = self.cfg.vocab_size;
@@ -658,6 +715,11 @@ impl Talker {
             };
             next = (next + text_row)?;
             frames.push(frame);
+
+            // Streaming: emit this frame's codes; `false` aborts generation early.
+            if !on_frame(&frames[frames.len() - 1]) {
+                break;
+            }
 
             let (h, l) = self.forward_step(&next, offset)?;
             past_hidden = h;
