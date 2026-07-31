@@ -14,4 +14,5 @@ pub mod config;
 pub mod quantized_talker;
 pub mod rope_fused;
 pub mod speaker_encoder;
+pub mod swiglu_fused;
 pub mod talker;

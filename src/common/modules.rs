@@ -81,6 +81,20 @@ impl GateUpDownMLP {
 
 impl Module for GateUpDownMLP {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
+        // SwiGLU fast path: fuse `silu(gate) * up` into one Metal kernel (the
+        // candle equivalent of mlx-audio's `@mx.compile def swiglu`). Only when the
+        // activation is SiLU; any other activation uses the composite ops below.
+        if matches!(self.act_fn, Activation::Silu) {
+            let gate = xs.apply(&self.gate_proj)?;
+            let up = xs.apply(&self.up_proj)?;
+            if let Some(fused) = crate::models::qwen3_tts::swiglu_fused::swiglu_fused(&gate, &up)
+            {
+                let gated = fused.map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                return gated.apply(&self.down_proj);
+            }
+            // Non-Metal / mismatched inputs: composite silu(gate) * up.
+            return (gate.silu()? * up)?.apply(&self.down_proj);
+        }
         let lhs = xs.apply(&self.gate_proj)?.apply(&self.act_fn)?;
         let rhs = xs.apply(&self.up_proj)?;
         (lhs * rhs)?.apply(&self.down_proj)
