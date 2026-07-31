@@ -473,6 +473,12 @@ impl Talker {
         self.codec_embedding.forward(&t).map_err(Into::into)
     }
 
+    /// codec_embedding for one **on-device** token (1,1) u32 → (1, 1, hidden).
+    /// Gather without a GPU→CPU readback (mlx-style lazy feedback).
+    fn codec_embed1_gpu(&self, id_t: &Tensor) -> Result<Tensor> {
+        self.codec_embedding.forward(id_t).map_err(Into::into)
+    }
+
     /// Sum of all 16 codebook embeddings for one frame's codes → (1, 1, hidden).
     /// codes[0] uses the talker codec_embedding; codes[1..16] use the predictor's.
     fn frame_embed(&self, codes: &[u32]) -> Result<Tensor> {
@@ -483,6 +489,20 @@ impl Talker {
                 (1, 1),
                 &self.device,
             )?)?;
+            acc = (acc + e)?;
+        }
+        Ok(acc)
+    }
+
+    /// On-device variant of `frame_embed`: takes codebook-0 and the 15 predictor
+    /// tokens as **on-device** (1,1) u32 tensors (no readback), sums their
+    /// embeddings → (1, 1, hidden). Keeps the whole frame's token→embedding
+    /// feedback on the GPU so the only per-frame sync is the single end-of-frame
+    /// readback in `generate_stream`.
+    fn frame_embed_gpu(&self, code0_t: &Tensor, rest_t: &[Tensor]) -> Result<Tensor> {
+        let mut acc = self.codec_embed1_gpu(code0_t)?;
+        for (g, tok) in rest_t.iter().enumerate() {
+            let e = self.code_predictor.codec_embedding[g].forward(&tok.reshape((1, 1))?)?;
             acc = (acc + e)?;
         }
         Ok(acc)
@@ -671,14 +691,7 @@ impl Talker {
                 let text_track = Tensor::cat(&[text_track, pad_rows], 1)?;
                 let head_part = (text_track + codec_track)?;
                 let prompt = Tensor::cat(&[prompt0, head_part], 1)?;
-                self.generate_inner(
-                    prompt,
-                    None,
-                    tts_pad_embed,
-                    gen_cfg,
-                    max_new_tokens,
-                    cb,
-                )
+                self.generate_inner(prompt, None, tts_pad_embed, gen_cfg, max_new_tokens, cb)
             }
         } else {
             // Non-ICL: first text token ⊕ last codec prefix row (bos); rest → trailing.
@@ -747,8 +760,7 @@ impl Talker {
         // distinct token; re-scattering the same value is idempotent).
         let rep_penalty = gen_cfg.repetition_penalty;
         let apply_rep = (rep_penalty - 1.0).abs() > 1e-6;
-        let mut rep_mult =
-            Tensor::ones((1, vocab_size), DType::F32, &self.device)?;
+        let mut rep_mult = Tensor::ones((1, vocab_size), DType::F32, &self.device)?;
         // Diagnostic: QWEN3_TTS_GREEDY=1 forces argmax (do_sample=false) to test
         // whether babbling is sampling-driven (temperature × numeric scale).
         let greedy = std::env::var("QWEN3_TTS_GREEDY").is_ok();
@@ -764,10 +776,11 @@ impl Talker {
         // `offset` tracks the KV-cache seqlen, not the loop item.
         for step in 0..max_new_tokens {
             let tt = std::time::Instant::now();
-            // Sample codebook 0 on the GPU: add the suppression bias (cast to the logits
-            // dtype first — BF16 talker vs F32 bias), apply the repetition-penalty
-            // multiplier (from step>=2, matching the CPU reference), then temperature +
-            // Gumbel-max. Read back ONE u32 for EOS / predictor input.
+            // Sample codebook 0 on the GPU (suppression bias + repetition-penalty
+            // multiplier + temperature + Gumbel-max), then keep the token ON-DEVICE.
+            // mlx-audio alignment: defer the GPU→CPU sync — code0 feeds the predictor
+            // and next-frame embedding as a lazy tensor, and the EOS flag is computed
+            // on the GPU; the ONLY per-frame readback is the single cat at frame end.
             let lg = logits_gpu.broadcast_add(&suppress_bias.to_dtype(logits_gpu.dtype())?)?;
             let rep = if apply_rep && step >= 2 {
                 Some(&rep_mult)
@@ -782,39 +795,26 @@ impl Talker {
                 gen_cfg.top_p,
                 rep,
             )?; // (1,) u32 on device
-            let code0 = code0_t.to_vec1::<u32>()?[0];
             if prof {
                 t_sample0 += tt.elapsed();
             }
-            if code0 == codec_eos && step >= 2 {
-                break;
-            }
-            gen_history.push(code0);
             // Scatter the penalty into this token's multiplier column (idempotent per
             // distinct token — HF applies the penalty once per distinct token).
             if apply_rep {
                 let pen = Tensor::from_vec(vec![rep_penalty], (1, 1), &self.device)?;
                 rep_mult = rep_mult.scatter(&code0_t.reshape((1, 1))?, &pen, 1)?;
             }
-            if std::env::var("QWEN3_TTS_DEBUG").is_ok() && step % 25 == 0 {
-                eprintln!("qwen3-tts: frame {step} code0={code0} (offset={offset})");
-            }
-            if std::env::var("QWEN3_TTS_TRACE").is_ok() {
-                eprintln!("trace frame {step} code0={code0}");
-            }
 
-            // code predictor fills codebooks 1..=15.
+            // code predictor fills codebooks 1..=15 (on-device tokens, no readback).
             let tt = std::time::Instant::now();
-            let rest = self.code_predictor_predict(&past_hidden, code0, gen_cfg)?;
+            let rest_t = self.code_predictor_predict(&past_hidden, &code0_t, gen_cfg)?;
             if prof {
                 t_predictor += tt.elapsed();
             }
-            let mut frame = vec![code0];
-            frame.extend_from_slice(&rest);
 
-            // next input embedding: Σ16 codebook embeddings + trailing/tts_pad text row.
+            // next input embedding: Σ16 codebook embeddings (on-device) + trailing/tts_pad.
             let tt = std::time::Instant::now();
-            let mut next = self.frame_embed(&frame)?;
+            let mut next = self.frame_embed_gpu(&code0_t.reshape((1, 1))?, &rest_t)?;
             let text_row = match &trailing {
                 Some(tr) if step < n_trailing => tr.narrow(1, step, 1)?,
                 _ => tts_pad_embed.clone(),
@@ -823,7 +823,30 @@ impl Talker {
             if prof {
                 t_embed += tt.elapsed();
             }
-            frames.push(frame);
+
+            // SINGLE per-frame readback: cat [code0, rest..] into one (16,) tensor and
+            // read it back once — for EOS check, gen_history, the streaming callback and
+            // the returned codes tensor. (mlx-audio does the same: one mx.eval per frame.)
+            let mut all_t = vec![code0_t.reshape((1,))?];
+            all_t.extend(rest_t.iter().map(|t| t.reshape((1,)).unwrap()));
+            let flat_frame = Tensor::cat(&all_t, 0)?.to_vec1::<u32>()?;
+            let code0 = flat_frame[0];
+            let mut frame = flat_frame;
+
+            if std::env::var("QWEN3_TTS_DEBUG").is_ok() && step % 25 == 0 {
+                eprintln!("qwen3-tts: frame {step} code0={code0} (offset={offset})");
+            }
+            if std::env::var("QWEN3_TTS_TRACE").is_ok() {
+                eprintln!("trace frame {step} code0={code0}");
+            }
+
+            // EOS check AFTER the predictor (matches mlx: is_eos.item() after the code
+            // loop). The EOS frame's predictor codes are computed then dropped.
+            if code0 == codec_eos && step >= 2 {
+                break;
+            }
+            gen_history.push(code0);
+            frames.push(frame.clone());
 
             // Streaming: emit this frame's codes; `false` aborts generation early.
             if !on_frame(&frames[frames.len() - 1]) {
@@ -863,6 +886,10 @@ impl Talker {
     }
 
     /// Run the code predictor for one frame (codebook 0 already known). Returns 15 codes.
+    /// Run the code predictor for one frame (codebook 0 already known). Returns the
+    /// 15 codebook-1..=15 tokens as **on-device** (1,) u32 tensors (default GPU path)
+    /// so the caller can feed them back into `frame_embed_gpu` without a readback;
+    /// the single per-frame readback happens in `generate_stream`.
     ///
     /// **GPU-sampling path (default)** — the 15 codebook steps each need the sampled token
     /// to build the next step's embedding, which naively forces a blocking `to_vec2`
@@ -870,16 +897,16 @@ impl Talker {
     /// the dominant per-frame cost: it drains the entire queued GPU command buffer, so
     /// 15 serialized syncs prevent any pipelining and the predictor alone was ~70% of
     /// frame time. The fix keeps sampling *on the GPU*: each step applies temperature +
-    /// top-k + Gumbel-max argmax as tensor ops (no readback), feeds the token back via an
-    /// on-device embedding gather, and does ONE `to_vec1` readback after the last step.
-    /// Set `QWEN3_TTS_CPU_SAMPLE=1` to restore the per-step CPU sampling (reference path).
+    /// top-k + Gumbel-max argmax as tensor ops (no readback) and feeds the token back via
+    /// an on-device embedding gather. Set `QWEN3_TTS_CPU_SAMPLE=1` to restore the
+    /// per-step CPU sampling (reference path, returns read-back values).
     fn code_predictor_predict(
         &mut self,
         talker_hidden_last: &Tensor,
-        code0: u32,
+        code0_t: &Tensor,
         gen_cfg: &Qwen3TTSGenerationConfig,
-    ) -> Result<Vec<u32>> {
-        let code0_emb = self.codec_embed1(code0)?; // talker codec_embedding for book 0
+    ) -> Result<Vec<Tensor>> {
+        let code0_emb = self.codec_embed1_gpu(&code0_t.reshape((1, 1))?)?; // talker codec_embedding for book 0
         let cp = &mut self.code_predictor;
         cp.clear_kv_cache();
         let prefill = Tensor::cat(&[talker_hidden_last.clone(), code0_emb], 1)?; // (1,2,hidden)
@@ -890,6 +917,7 @@ impl Talker {
 
         if cpu_sample {
             // Reference path: per-step CPU sampling (one blocking sync per codebook).
+            // Returns the tokens re-uploaded as (1,) u32 tensors to match the signature.
             let mut codes = Vec::with_capacity(n_groups);
             for g in 0..n_groups {
                 let logits = cp.lm_head[g]
@@ -906,7 +934,6 @@ impl Talker {
                     None,
                     1.0,
                 )?;
-                codes.push(token);
                 if g + 1 < n_groups {
                     let emb = cp.codec_embedding[g].forward(&Tensor::from_vec(
                         vec![token],
@@ -916,13 +943,14 @@ impl Talker {
                     hidden = cp.forward_hidden(&emb, offset)?;
                     offset += 1;
                 }
+                codes.push(Tensor::from_vec(vec![token], (1,), &self.device)?);
             }
             return Ok(codes);
         }
 
         // GPU path: keep the running token as an on-device (1,) u32 tensor; gather its
-        // embedding without a readback. Collect the 15 token tensors and read them back
-        // in a single cat + to_vec1 at the end.
+        // embedding without a readback. Collect the 15 token tensors; the caller does
+        // the single end-of-frame readback (code0 + these + EOS) in generate_stream.
         let spec_probe = std::env::var("QWEN3_TTS_SPEC_PROBE").is_ok();
         let mut token_tensors: Vec<Tensor> = Vec::with_capacity(n_groups);
         for g in 0..n_groups {
@@ -961,8 +989,6 @@ impl Talker {
             }
             token_tensors.push(token);
         }
-        // Single readback for the whole frame.
-        let all = Tensor::cat(&token_tensors, 0)?.to_vec1::<u32>()?;
-        Ok(all)
+        Ok(token_tensors)
     }
 }
