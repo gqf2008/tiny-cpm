@@ -458,12 +458,15 @@ impl Talker {
         // vb_cpu is rooted at the repo root and mmaped on CPU; quantized_talker
         // prefixes `talker.model.` itself and quantizes onto `device`.
         let backbone = TalkerBackbone::Quant(quantized_talker::load(&vb_cpu, cfg, quant, device)?);
-        // Quantize the code predictor too (it dominates per-frame time: 15 sequential
-        // 5-layer steps, weight-bandwidth-bound). Q4_K cuts its bandwidth floor ~3×.
-        // Opt out with QWEN3_TTS_PREDICTOR_QUANT=0 (keeps BF16 predictor).
+        // Code-predictor quantization is OFF by default: unlike the 1.7B talker,
+        // the predictor is small (1024-hidden, 5 layers), and at m=1 its Q4_K GEMV
+        // dequant overhead EXCEEDS the bandwidth saving — measured on a clean
+        // machine, Q4_K predictor ~50ms/frame vs BF16 ~33ms/frame (the same
+        // small-model-Q4_K-doesn't-pay effect as "0.6B ≈ 1.7B in RTF"). Opt IN
+        // with QWEN3_TTS_PREDICTOR_QUANT=1; default keeps the BF16 predictor.
         let predictor_quant = match std::env::var("QWEN3_TTS_PREDICTOR_QUANT").as_deref() {
-            Ok("0") | Ok("off") | Ok("none") => None,
-            _ => Some(quant),
+            Ok("1") | Ok("on") => Some(quant),
+            _ => None,
         };
         Self::assemble(vb, tts, backbone, device, Some(&vb_cpu), predictor_quant)
     }
