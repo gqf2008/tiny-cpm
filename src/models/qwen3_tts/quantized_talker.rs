@@ -30,6 +30,7 @@ use candle_nn::{Module, RmsNorm, VarBuilder, ops};
 use crate::common::modules::eager_attention_forward;
 use crate::models::qwen3_tts::config::TalkerConfig;
 use crate::models::qwen3_tts::rope_fused::apply_rope_fused;
+use crate::models::qwen3_tts::swiglu_fused::swiglu_fused;
 
 /// One decoder layer, semantically identical to `Qwen3DecoderLayer` (RMSNorm →
 /// per-head-QK-norm GQA attention with KV cache → residual → RMSNorm → SwiGLU
@@ -107,10 +108,15 @@ impl QuantizedTalkerLayer {
 
         let residual = &xs;
         let xs = self.post_attention_layernorm.forward(&xs)?;
-        let gate = ops::silu(&self.gate_proj.forward(&xs)?)?;
-        let xs = self
-            .down_proj
-            .forward(&(gate * self.up_proj.forward(&xs)?)?)?;
+        // SwiGLU: fuse silu(gate)*up into one Metal kernel when possible (the
+        // QMatMul projections output F32 on Metal, which swiglu_fused handles).
+        let gate = self.gate_proj.forward(&xs)?;
+        let up = self.up_proj.forward(&xs)?;
+        let gated = match swiglu_fused(&gate, &up) {
+            Some(f) => f?,
+            None => (ops::silu(&gate)? * up)?,
+        };
+        let xs = self.down_proj.forward(&gated)?;
         Ok((residual + xs)?)
     }
 }
@@ -207,19 +213,28 @@ fn norm(vb: &VarBuilder, name: &str, eps: f64, device: &Device) -> Result<RmsNor
     Ok(RmsNorm::new(w, eps))
 }
 
-/// Build the quantized talker backbone from a **CPU-mmaped** safetensors
-/// VarBuilder rooted at the repo root (tensor names are prefixed with
-/// `talker.model.` here). `quant` is typically `GgmlDType::Q4K`.
-pub fn load(
+/// Build a quantized Qwen3 layer-stack backbone from a **CPU-mmaped**
+/// safetensors VarBuilder. `prefix` is the tensor-name root holding
+/// `layers.{i}.self_attn.{q,k,v,o}_proj.weight`, `layers.{i}.mlp.{gate,up,down}_proj.weight`,
+/// the per-head `q_norm`/`k_norm`, and the layer norms — `"talker.model"` for the
+/// talker, `"code_predictor.model"` for the code predictor. `quant` is typically
+/// `GgmlDType::Q4K`. The final norm is NOT loaded here (the caller owns it).
+#[allow(clippy::too_many_arguments)]
+pub fn load_stack(
     vb: &VarBuilder,
-    cfg: &TalkerConfig,
+    prefix: &str,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    rms_norm_eps: f64,
     quant: GgmlDType,
     device: &Device,
 ) -> Result<QuantizedTalkerBackbone> {
-    let eps = cfg.rms_norm_eps;
-    let m = vb.pp("talker.model");
-    let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-    for i in 0..cfg.num_hidden_layers {
+    let eps = rms_norm_eps;
+    let m = vb.pp(prefix);
+    let mut layers = Vec::with_capacity(num_hidden_layers);
+    for i in 0..num_hidden_layers {
         let l = m.pp(format!("layers.{i}"));
         let a = l.pp("self_attn");
         let f = l.pp("mlp");
@@ -235,14 +250,36 @@ pub fn load(
             k_norm: norm(&a, "k_norm.weight", eps, device)?,
             input_layernorm: norm(&l, "input_layernorm.weight", eps, device)?,
             post_attention_layernorm: norm(&l, "post_attention_layernorm.weight", eps, device)?,
-            num_heads: cfg.num_attention_heads,
-            num_kv_heads: cfg.num_key_value_heads,
-            num_kv_groups: cfg.num_attention_heads / cfg.num_key_value_heads,
-            head_dim: cfg.head_dim,
+            num_heads: num_attention_heads,
+            num_kv_heads: num_key_value_heads,
+            num_kv_groups: num_attention_heads / num_key_value_heads,
+            head_dim,
             kv_cache: None,
         });
     }
+    Ok(QuantizedTalkerBackbone { layers })
+}
+
+/// Build the quantized talker backbone from a **CPU-mmaped** safetensors
+/// VarBuilder rooted at the repo root (tensor names are prefixed with
+/// `talker.model.` here). `quant` is typically `GgmlDType::Q4K`.
+pub fn load(
+    vb: &VarBuilder,
+    cfg: &TalkerConfig,
+    quant: GgmlDType,
+    device: &Device,
+) -> Result<QuantizedTalkerBackbone> {
     // The final norm (`talker.model.norm.weight`) is deliberately NOT loaded
     // here: `Talker` already owns and applies it once in `forward_step`.
-    Ok(QuantizedTalkerBackbone { layers })
+    load_stack(
+        vb,
+        "talker.model",
+        cfg.num_hidden_layers,
+        cfg.num_attention_heads,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+        cfg.rms_norm_eps,
+        quant,
+        device,
+    )
 }

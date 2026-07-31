@@ -101,7 +101,7 @@ impl ResizeMlp {
 struct CodePredictor {
     cfg: CodePredictorConfig,
     codec_embedding: Vec<Embedding>, // 15 × [vocab × talker_hidden]
-    layers: Vec<Qwen3DecoderLayer>,
+    layers: CodePredictorBackbone,
     norm: RmsNorm,
     rotary: RoPE,
     lm_head: Vec<Linear>, // 15 × [hidden → vocab]
@@ -111,12 +111,62 @@ struct CodePredictor {
     small_to_mtp: Option<Linear>,
 }
 
+/// The predictor's 5-layer Qwen3 stack: either the BF16 `Qwen3DecoderLayer`s or a
+/// QMatMul-quantized mirror (same mechanism as the talker's `QuantizedTalkerBackbone`).
+/// Quantizing the predictor cuts its per-frame weight-bandwidth floor ~3× (BF16
+/// ~17ms → Q4_K ~5ms over the 15 sequential steps), the biggest RTF lever left.
+enum CodePredictorBackbone {
+    Full(Vec<Qwen3DecoderLayer>),
+    Quant(quantized_talker::QuantizedTalkerBackbone),
+}
+
+impl CodePredictorBackbone {
+    fn forward(
+        &mut self,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        match self {
+            CodePredictorBackbone::Full(layers) => {
+                let mut h = xs.clone();
+                for l in layers {
+                    h = l.forward(&h, cos, sin, mask)?;
+                }
+                Ok(h)
+            }
+            CodePredictorBackbone::Quant(backbone) => backbone.forward(xs, cos, sin, mask),
+        }
+    }
+
+    fn clear_kv_cache(&mut self) {
+        match self {
+            CodePredictorBackbone::Full(layers) => {
+                for l in layers {
+                    l.clear_kv_cache();
+                }
+            }
+            CodePredictorBackbone::Quant(backbone) => backbone.clear_kv_cache(),
+        }
+    }
+
+    /// The Quant path emits F32 (QMatMul constraint); the Full path stays in the
+    /// checkpoint's BF16. Used to cast the backbone output back before the BF16
+    /// final norm / lm_head.
+    fn is_quant(&self) -> bool {
+        matches!(self, CodePredictorBackbone::Quant(_))
+    }
+}
+
 impl CodePredictor {
     fn new(
         vb: VarBuilder,
         cfg: &CodePredictorConfig,
         talker_hidden: usize,
         device: &Device,
+        vb_cpu: Option<&VarBuilder>,
+        quant: Option<GgmlDType>,
     ) -> Result<Self> {
         let m = vb.pp("model");
         let mut codec_embedding = Vec::with_capacity(cfg.num_code_groups - 1);
@@ -127,22 +177,40 @@ impl CodePredictor {
                 m.pp("codec_embedding").pp(g),
             )?);
         }
-        let qcfg = qwen3_cfg(
-            cfg.hidden_size,
-            cfg.intermediate_size,
-            cfg.num_hidden_layers,
-            cfg.num_attention_heads,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-            cfg.rms_norm_eps,
-            cfg.rope_theta,
-            &cfg.hidden_act,
-            cfg.vocab_size,
-        );
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        for i in 0..cfg.num_hidden_layers {
-            layers.push(Qwen3DecoderLayer::new(&qcfg, m.pp("layers").pp(i))?);
-        }
+        // Backbone: quantized QMatMul mirror when a CPU source + quant are given
+        // (the live/perf path), else the BF16 Qwen3DecoderLayer stack.
+        let layers = match (vb_cpu, quant) {
+            (Some(cpu), Some(q)) => CodePredictorBackbone::Quant(quantized_talker::load_stack(
+                cpu,
+                "talker.code_predictor.model",
+                cfg.num_hidden_layers,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                cfg.rms_norm_eps,
+                q,
+                device,
+            )?),
+            _ => {
+                let qcfg = qwen3_cfg(
+                    cfg.hidden_size,
+                    cfg.intermediate_size,
+                    cfg.num_hidden_layers,
+                    cfg.num_attention_heads,
+                    cfg.num_key_value_heads,
+                    cfg.head_dim,
+                    cfg.rms_norm_eps,
+                    cfg.rope_theta,
+                    &cfg.hidden_act,
+                    cfg.vocab_size,
+                );
+                let mut ls = Vec::with_capacity(cfg.num_hidden_layers);
+                for i in 0..cfg.num_hidden_layers {
+                    ls.push(Qwen3DecoderLayer::new(&qcfg, m.pp("layers").pp(i))?);
+                }
+                CodePredictorBackbone::Full(ls)
+            }
+        };
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, m.pp("norm"))?;
         let rotary = RoPE::new(cfg.head_dim, cfg.rope_theta as f32, device)?;
         let mut lm_head = Vec::with_capacity(cfg.num_code_groups - 1);
@@ -176,9 +244,7 @@ impl CodePredictor {
     }
 
     fn clear_kv_cache(&mut self) {
-        for l in &mut self.layers {
-            l.clear_kv_cache();
-        }
+        self.layers.clear_kv_cache();
     }
 
     /// One decoder forward over `embeds` (1, T, talker_hidden), projecting to predictor
@@ -201,11 +267,15 @@ impl CodePredictor {
             )?)
         };
         let (cos, sin) = self.rotary.forward(seqlen_offset, seq_len, xs.device())?;
-        let mut h = xs;
-        for l in &mut self.layers {
-            h = l.forward(&h, &cos, &sin, mask.as_ref())?;
-        }
-        h = self.norm.forward(&h)?;
+        let h = self.layers.forward(&xs, &cos, &sin, mask.as_ref())?;
+        // The Quant backbone returns F32; the final norm + lm_head are BF16, so cast
+        // back (mirrors how Talker::forward_step casts the quant talker output).
+        let h = if self.layers.is_quant() {
+            h.to_dtype(DType::BF16)?
+        } else {
+            h
+        };
+        let h = self.norm.forward(&h)?;
         Ok(h.narrow(1, seq_len - 1, 1)?) // (1, 1, hidden)
     }
 }
@@ -370,7 +440,7 @@ impl Talker {
             )?);
         }
         let backbone = TalkerBackbone::Full(layers);
-        Self::assemble(vb, tts, backbone, device)
+        Self::assemble(vb, tts, backbone, device, None, None)
     }
 
     /// Quantized backbone (QMatMul, e.g. Q4_K). The 7 big matmuls per layer are
@@ -388,7 +458,14 @@ impl Talker {
         // vb_cpu is rooted at the repo root and mmaped on CPU; quantized_talker
         // prefixes `talker.model.` itself and quantizes onto `device`.
         let backbone = TalkerBackbone::Quant(quantized_talker::load(&vb_cpu, cfg, quant, device)?);
-        Self::assemble(vb, tts, backbone, device)
+        // Quantize the code predictor too (it dominates per-frame time: 15 sequential
+        // 5-layer steps, weight-bandwidth-bound). Q4_K cuts its bandwidth floor ~3×.
+        // Opt out with QWEN3_TTS_PREDICTOR_QUANT=0 (keeps BF16 predictor).
+        let predictor_quant = match std::env::var("QWEN3_TTS_PREDICTOR_QUANT").as_deref() {
+            Ok("0") | Ok("off") | Ok("none") => None,
+            _ => Some(quant),
+        };
+        Self::assemble(vb, tts, backbone, device, Some(&vb_cpu), predictor_quant)
     }
 
     /// The `Qwen3Config` passed to the reused `Qwen3DecoderLayer` (Full path).
@@ -408,11 +485,15 @@ impl Talker {
     }
 
     /// Shared constructor: load every non-backbone weight and assemble the talker.
+    /// `vb_cpu`+`predictor_quant`, when given, also quantize the code predictor's
+    /// 5-layer stack (the live/perf path); `None` keeps it BF16.
     fn assemble(
         vb: VarBuilder,
         tts: &Qwen3TTSConfig,
         backbone: TalkerBackbone,
         device: &Device,
+        vb_cpu: Option<&VarBuilder>,
+        predictor_quant: Option<GgmlDType>,
     ) -> Result<Self> {
         let cfg = &tts.talker_config;
         let vb_t = vb.pp("talker");
@@ -437,6 +518,8 @@ impl Talker {
             &cfg.code_predictor_config,
             cfg.hidden_size,
             device,
+            vb_cpu,
+            predictor_quant,
         )?;
         Ok(Self {
             cfg: cfg.clone(),
@@ -831,7 +914,7 @@ impl Talker {
             all_t.extend(rest_t.iter().map(|t| t.reshape((1,)).unwrap()));
             let flat_frame = Tensor::cat(&all_t, 0)?.to_vec1::<u32>()?;
             let code0 = flat_frame[0];
-            let mut frame = flat_frame;
+            let frame = flat_frame;
 
             if std::env::var("QWEN3_TTS_DEBUG").is_ok() && step % 25 == 0 {
                 eprintln!("qwen3-tts: frame {step} code0={code0} (offset={offset})");
