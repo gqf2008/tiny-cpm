@@ -29,7 +29,7 @@ use candle_nn::{Module, RmsNorm, VarBuilder, ops};
 
 use crate::common::modules::eager_attention_forward;
 use crate::models::qwen3_tts::config::TalkerConfig;
-use crate::position_embed::rope::apply_rotary_pos_emb;
+use crate::models::qwen3_tts::rope_fused::apply_rope_fused;
 
 /// One decoder layer, semantically identical to `Qwen3DecoderLayer` (RMSNorm →
 /// per-head-QK-norm GQA attention with KV cache → residual → RMSNorm → SwiGLU
@@ -83,7 +83,9 @@ impl QuantizedTalkerLayer {
             .forward(&xs)?
             .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let (q, k) = apply_rotary_pos_emb(&q, &k, cos, sin, false)?;
+        // Fused RoPE: one Metal kernel instead of the ~12-op composite (falls back
+        // to `apply_rotary_pos_emb` internally on non-Metal / unexpected shapes).
+        let (q, k) = apply_rope_fused(&q, &k, cos, sin)?;
         let (k, v) = match &self.kv_cache {
             None => (k, v),
             Some((prev_k, prev_v)) => (

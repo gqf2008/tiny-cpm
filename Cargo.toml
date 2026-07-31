@@ -8,6 +8,13 @@ anyhow = "1"
 candle-core = { version = "0.11", features = ["metal"] }
 candle-nn = { version = "0.11", features = ["metal"] }
 candle-transformers = "0.11"
+# Same version as candle-core 0.11.0's own dep, so the metal Device/Buffer/
+# ComputePipeline types unify. Used to runtime-compile the fused RoPE kernel
+# (src/models/qwen3_tts/rope_fused.metal) without forking candle.
+candle-metal-kernels = "0.11"
+# MTLSize for the fused-kernel dispatch grid (candle-metal-kernels doesn't
+# re-export it); same 0.3.2 candle-metal-kernels already pins.
+objc2-metal = "0.3.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
