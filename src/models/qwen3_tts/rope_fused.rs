@@ -58,35 +58,41 @@ fn pipeline_for(device: &candle_core::MetalDevice, dtype: DType) -> Result<&'sta
 /// (we only need the `(seq, head_dim)` values). Returns (q_rot, k_rot) with the
 /// same shapes/dtypes as the inputs. Falls back to the composite op sequence on
 /// any non-Metal device or shape we don't handle.
+///
+/// The q/k inputs may be non-contiguous (they're the transpose(1,2) of the
+/// (b, seq, heads, head_dim) projections). We `.contiguous()` them into the
+/// canonical (b, heads, seq, head_dim) layout — at m=1 that copy is 1–2 kernels,
+/// far cheaper than the ~12 the composite path issues, and it lets the kernel use
+/// a simple contiguous row*head_dim offset (no stride plumbing).
 pub fn apply_rope_fused(q: &Tensor, k: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<(Tensor, Tensor)> {
-    // Only handle the Metal + contiguous + 4D case; anything else uses the
+    // Only handle the Metal + 4D + F32/BF16 case; anything else uses the
     // well-tested composite path.
     let device = match q.device() {
         Device::Metal(_) => q.device(),
         _ => return apply_rotary_pos_emb(q, k, cos, sin, false).map_err(Into::into),
     };
-    if q.rank() != 4 || k.rank() != 4 || q.dtype() != k.dtype() {
-        return apply_rotary_pos_emb(q, k, cos, sin, false).map_err(Into::into);
-    }
     let dtype = q.dtype();
-    if dtype != DType::F32 && dtype != DType::BF16 {
+    if dtype != k.dtype() || (dtype != DType::F32 && dtype != DType::BF16) {
         return apply_rotary_pos_emb(q, k, cos, sin, false).map_err(Into::into);
     }
 
-    let q_dims = q.dims4()?;
+    // Normalize q/k to 4D (b, heads, seq, head_dim). A 3D (b, seq, hidden) input
+    // can't be split into heads without knowing head_dim, so only 4D is fused.
+    if q.rank() != 4 || k.rank() != 4 {
+        return apply_rotary_pos_emb(q, k, cos, sin, false).map_err(Into::into);
+    }
+    let (b, q_heads, seq_len, head_dim) = q.dims4()?;
     let k_dims = k.dims4()?;
-    let (b, q_heads, seq_len, head_dim) = q_dims;
     let kv_heads = k_dims.1;
-    if k_dims.0 != b || k_dims.2 != seq_len || k_dims.3 != head_dim {
+    if k_dims.0 != b || k_dims.2 != seq_len || k_dims.3 != head_dim || b != 1 {
+        // b>1 shares one stride set in the kernel — only b==1 is exact there.
         return apply_rotary_pos_emb(q, k, cos, sin, false).map_err(Into::into);
     }
-    // We pass a single (sb, sh, ss, sd) stride set to the kernel; q and k differ
-    // in head count, so their BATCH stride differs (sb = heads*seq*hd). At b==1
-    // the batch term is always 0 and the shared set is exact — that's the only
-    // case the talker ever runs. For b>1, fall back to the composite path.
-    if b != 1 {
-        return apply_rotary_pos_emb(q, k, cos, sin, false).map_err(Into::into);
-    }
+
+    // Canonicalize to contiguous (b, heads, seq, head_dim). This collapses the
+    // transpose(1,2) non-contiguity into a clean layout the kernel indexes simply.
+    let q = q.contiguous()?;
+    let k = k.contiguous()?;
 
     let metal_dev = device.as_metal_device()?.clone();
     let pipeline = pipeline_for(&metal_dev, dtype)?;
@@ -101,11 +107,8 @@ pub fn apply_rope_fused(q: &Tensor, k: &Tensor, cos: &Tensor, sin: &Tensor) -> R
     let head_dim_i = head_dim as i64;
     let seq_len_i = seq_len as i64;
 
-    // Input strides: q/k arrive as transpose(1,2) of the (b, seq, heads, head_dim)
-    // projections — NON-contiguous when seq_len > 1. Both share the same layout
-    // pattern (only head counts differ), so read the real strides from q's layout
-    // and pass them to the kernel; it reconstructs each row's offset from
-    // (batch, head, seq). k uses identical strides (batch/head/seq/head_dim order).
+    // Inputs are now contiguous (b, heads, seq, head_dim) → strides are the plain
+    // row-major ones. Pass them anyway so the kernel stays general.
     let q_el = q.elem_count();
     let k_el = k.elem_count();
 
@@ -114,15 +117,9 @@ pub fn apply_rope_fused(q: &Tensor, k: &Tensor, cos: &Tensor, sin: &Tensor) -> R
     let (cos_storage, cos_layout) = cos.storage_and_layout();
     let (sin_storage, sin_layout) = sin.storage_and_layout();
 
-    // candle Layout::stride is in element units, dims ordered (b, heads, seq, hd).
     let st = q_layout.stride();
-    if st.len() != 4 {
-        return apply_rotary_pos_emb(q, k, &cos, &sin, false).map_err(Into::into);
-    }
-    // k must share q's stride pattern (it does: same reshape+transpose recipe),
-    // else the single-stride-set assumption breaks — fall back rather than corrupt.
-    if k_layout.stride() != st {
-        return apply_rotary_pos_emb(q, k, &cos, &sin, false).map_err(Into::into);
+    if st.len() != 4 || k_layout.stride() != st {
+        return apply_rotary_pos_emb(&q, &k, &cos, &sin, false).map_err(Into::into);
     }
     let (sb, sh, ss, sd) = (st[0] as i64, st[1] as i64, st[2] as i64, st[3] as i64);
 

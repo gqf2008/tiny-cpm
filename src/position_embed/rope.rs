@@ -101,6 +101,36 @@ pub fn apply_rotary_pos_emb(
     sin: &Tensor,
     tof32: bool,
 ) -> Result<(Tensor, Tensor)> {
+    // On Metal, prefer the single fused kernel (it handles the transpose(1,2)
+    // non-contiguity via .contiguous() and falls back here internally for any
+    // shape/dtype it doesn't cover). `tof32` callers that aren't already F32
+    // skip fusion — the fused path has no F16 pipeline, and BF16 is already fused.
+    #[cfg(feature = "metal")]
+    {
+        let dt = q.dtype();
+        let fusible = q.rank() == 4
+            && k.rank() == 4
+            && dt == k.dtype()
+            && (dt == DType::F32 || dt == DType::BF16)
+            && matches!(q.device(), Device::Metal(_));
+        if fusible && (!tof32 || dt == DType::F32) {
+            // The fused path .contiguous()s non-contiguous inputs itself.
+            return crate::models::qwen3_tts::rope_fused::apply_rope_fused(q, k, cos, sin)
+                .map_err(Into::into);
+        }
+    }
+    apply_rotary_pos_emb_composite(q, k, cos, sin, tof32)
+}
+
+/// The original ~12-op composite RoPE (broadcast_mul / rotate_half / add). Kept
+/// as the fallback for non-Metal devices and any shape the fused kernel skips.
+fn apply_rotary_pos_emb_composite(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    tof32: bool,
+) -> Result<(Tensor, Tensor)> {
     // sin/cos: to (bs, 1, seq_len, head_dim)
     // q/k: (bs, n_head, seq_len, head_dim)
     let mut cos = cos.clone();

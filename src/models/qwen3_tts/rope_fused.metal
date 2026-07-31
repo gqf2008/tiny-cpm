@@ -16,14 +16,12 @@
 // read k. Each row is `head_dim` elements; cos/sin are indexed by the row's
 // sequence position (row % seq_len for prefill; at m=1 every row is position 0).
 //
-// The q/k inputs are the `transpose(1,2)` of the (b, seq, heads, head_dim)
-// projections, i.e. NON-contiguous when seq_len > 1 (their storage order is
-// seq-major, head-minor). The composite candle path handles this via strided
-// views; a raw-elementcount kernel that assumed `base = row*head_dim` read the
-// WRONG elements on the prefill pass and poisoned the whole KV cache. So we take
-// the real input strides and compute each row's offset from (b, head, seq); the
-// OUTPUT is written contiguous (row*head_dim) so downstream consumers see a
-// standard (b, heads, seq, head_dim) tensor.
+// The Rust driver `.contiguous()`s q/k into canonical (b, heads, seq, head_dim)
+// before dispatch (the projections arrive as a transpose(1,2) view), then passes
+// the resulting row-major strides (sb, sh, ss, sd). The kernel still reconstructs
+// each row's offset from (batch, head, seq) via those strides, so it stays correct
+// for any strided input; with the contiguous canonical form the offsets reduce to
+// row*head_dim + i. The OUTPUT is written contiguous.
 #include <metal_stdlib>
 using namespace metal;
 
