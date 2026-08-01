@@ -13,6 +13,8 @@ mod audio;
 mod codec;
 mod config;
 mod model;
+mod qmat;
+mod quant_talker;
 mod speaker_encoder;
 mod talker;
 
@@ -82,6 +84,8 @@ fn main() -> Result<()> {
     let mut codes_file: Option<String> = None;
     let mut encode_wav: Option<String> = None;
     let mut spk_embed_wav: Option<String> = None;
+    let mut qmat_test = false;
+    let mut talker_quant = false;
     let mut ref_wav: Option<String> = None;
     let mut ref_text: Option<String> = None;
     let mut i = 4;
@@ -106,6 +110,14 @@ fn main() -> Result<()> {
             "--spk-embed" => {
                 spk_embed_wav = args.get(i + 1).cloned();
                 i += 2;
+            }
+            "--qmat-test" => {
+                qmat_test = true;
+                i += 1;
+            }
+            "--talker-quant" => {
+                talker_quant = true;
+                i += 1;
             }
             "--ref" => {
                 ref_wav = args.get(i + 1).cloned();
@@ -210,6 +222,164 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // --qmat-test: Q4K GEMV vs f32 linear on real talker weights (numerics + latency).
+    if qmat_test {
+        use burn::tensor::{Float as _F, Tensor as _T};
+        let wq: _T<2, _F> = w.get(
+            "talker.model.layers.0.self_attn.q_proj.weight",
+            burn::tensor::DType::F32,
+        )?;
+        let (n, k) = (wq.dims()[0], wq.dims()[1]);
+        let wq_vec: Vec<f32> = wq.clone().into_data().to_vec::<f32>()?;
+        let anchor_t = _T::<1, _F>::zeros([1], &device);
+        let anchor = anchor_t
+            .try_into_primitive::<burn_wgpu::Metal>()
+            .map_err(|e| anyhow::anyhow!("anchor: {e:?}"))?;
+        let mut seed = 7u64;
+        let mut rnd = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        };
+        let x: Vec<f32> = (0..k).map(|_| rnd() * 0.5).collect();
+        let x_t: _T<3, _F> = _T::<1, _F>::from_floats(x.as_slice(), &device).reshape([1, 1, k]);
+        // Random-weight control (isolates burn-client vs real-weight issues)
+        let mut rseed = 99u64;
+        let mut rrnd = move || {
+            rseed = rseed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((rseed >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        };
+        let rw: Vec<f32> = (0..k * n).map(|_| rrnd() * 0.02).collect();
+        let qm_r = qmat::Q4KMatmul::new(&rw, k, n, &anchor)?;
+        let y_r = qm_r.raw_forward(&x)?;
+        let y_rc: Vec<f64> = (0..n)
+            .map(|row| {
+                (0..k)
+                    .map(|i| rw[row * k + i] as f64 * x[i] as f64)
+                    .sum::<f64>()
+            })
+            .collect();
+        let r_rel: Vec<f64> = y_r
+            .iter()
+            .zip(y_rc.iter())
+            .map(|(a, b)| (*a as f64 - *b).abs() / b.abs().max(1e-9))
+            .collect();
+        println!(
+            "random-weights control: y_q vs CPU max rel {:.3e}",
+            r_rel.iter().copied().fold(0.0f64, f64::max)
+        );
+        // Real-weight quantize diagnostics
+        let blocks = k / 32;
+        println!("wq_vec len {} expect {}", wq_vec.len(), k * n);
+        let (qvals, qscales, qmins) = qmat::quantize_q4k(&wq_vec, k, n);
+        let mut deq_max = 0.0f64;
+        let mut deq_at = (0usize, 0usize, 0usize);
+        let mut min_scale = f32::MAX;
+        for row in 0..n {
+            for b in 0..blocks {
+                let scl = qscales[row * blocks + b];
+                min_scale = min_scale.min(scl);
+                for i in 0..32 {
+                    let q = (qvals[row * blocks * 4 + b * 4 + i / 8] >> ((i % 8) * 4)) & 0xF;
+                    let v = qmins[row * blocks + b] + q as f32 * scl;
+                    let d = (v as f64 - wq_vec[row * k + b * 32 + i] as f64).abs();
+                    if d > deq_max {
+                        deq_max = d;
+                        deq_at = (row, b, i);
+                    }
+                }
+            }
+        }
+        let (dr, db, di) = deq_at;
+        println!(
+            "deq_max at row {dr} blk {db} i {di}: orig {:.6} deq {:.6} (min {:.6} scale {:.6})",
+            wq_vec[dr * k + db * 32 + di],
+            qmins[dr * blocks + db]
+                + ((qvals[dr * blocks * 4 + db * 4 + di / 8] >> ((di % 8) * 4)) & 0xF) as f32
+                    * qscales[dr * blocks + db],
+            qmins[dr * blocks + db],
+            qscales[dr * blocks + db]
+        );
+        let blk_vals: Vec<f32> = (0..32).map(|i| wq_vec[dr * k + db * 32 + i]).collect();
+        println!("block values: {:?}", &blk_vals[..16]);
+        let nan_cnt = wq_vec.iter().filter(|v| v.is_nan()).count();
+        let inf_cnt = wq_vec.iter().filter(|v| v.is_infinite()).count();
+        let (wmin, wmax) = (
+            wq_vec.iter().copied().fold(f32::INFINITY, f32::min),
+            wq_vec.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+        );
+        println!("real weights: nan {nan_cnt} inf {inf_cnt} range [{wmin:.4}, {wmax:.4}]");
+        println!("real weights: dequant max|d| {deq_max:.6}, min block scale {min_scale:.3e}");
+        println!(
+            "row0 blk0: min {:.6} max {:.6}",
+            qmins[0],
+            qmins[0] + qscales[0] * 15.0
+        );
+        let qm = qmat::Q4KMatmul::new(&wq_vec, k, n, &anchor)?;
+        let y_ref = model::linear(x_t.clone(), wq.clone(), None);
+        let y_ref_v: Vec<f32> = y_ref.into_data().to_vec::<f32>()?;
+        let y_q_v = qm.raw_forward(&x)?;
+        // CPU f64 reference
+        let y_cpu: Vec<f64> = (0..n)
+            .map(|row| {
+                (0..k)
+                    .map(|i| wq_vec[row * k + i] as f64 * x[i] as f64)
+                    .sum::<f64>()
+            })
+            .collect();
+        let q_cpu: Vec<f64> = y_q_v
+            .iter()
+            .zip(y_cpu.iter())
+            .map(|(a, b)| (*a as f64 - *b).abs() / b.abs().max(1e-9))
+            .collect();
+        let b_cpu: Vec<f64> = y_ref_v
+            .iter()
+            .zip(y_cpu.iter())
+            .map(|(a, b)| (*a as f64 - *b).abs() / b.abs().max(1e-9))
+            .collect();
+        println!(
+            "y_q vs CPU: max rel {:.3e},  y_ref(burn linear) vs CPU: max rel {:.3e}",
+            q_cpu.iter().copied().fold(0.0f64, f64::max),
+            b_cpu.iter().copied().fold(0.0f64, f64::max)
+        );
+        println!("y_cpu[0..6] {:?}", &y_cpu[..6]);
+        let mut max_rel = 0.0f64;
+        let mut mean_rel = 0.0f64;
+        for (a, b) in y_q_v.iter().zip(y_ref_v.iter()) {
+            let r = (*a as f64 - *b as f64).abs() / (*b as f64).abs().max(1e-9);
+            max_rel = max_rel.max(r);
+            mean_rel += r;
+        }
+        mean_rel /= n as f64;
+        println!("y_q[0..6]   {:?}", &y_q_v[..6]);
+        println!("y_ref[0..6] {:?}", &y_ref_v[..6]);
+        println!("wq[0][0..6] {:?}", &wq_vec[..6]);
+        println!("x[0..6]     {:?}", &x[..6]);
+        println!("Q4K vs f32 linear: max rel err {max_rel:.4e}, mean {mean_rel:.4e}");
+        let t0 = Instant::now();
+        for _ in 0..100 {
+            let _ = qm.forward(x_t.clone())?;
+        }
+        device.sync().map_err(|e| anyhow::anyhow!("sync: {e}"))?;
+        let tq = t0.elapsed();
+        let t0 = Instant::now();
+        for _ in 0..100 {
+            let _ = model::linear(x_t.clone(), wq.clone(), None);
+        }
+        device.sync().map_err(|e| anyhow::anyhow!("sync: {e}"))?;
+        let tf = t0.elapsed();
+        println!(
+            "latency {k}x{n}: Q4K {:.1} us/call, f32 linear {:.1} us/call, speedup {:.1}x",
+            tq.as_secs_f64() * 1e6 / 100.0,
+            tf.as_secs_f64() * 1e6 / 100.0,
+            tf.as_secs_f64() / tq.as_secs_f64()
+        );
+        return Ok(());
+    }
+
     // --spk-embed: speaker-encoder-only verification — dump the raw embedding.
     if let Some(sw) = spk_embed_wav {
         let (samples, sr) = audio::decode_audio(&sw)?;
@@ -295,7 +465,17 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let mut talker = talker::Talker::new(&w, &tts_cfg)?;
+    let mut talker = if talker_quant {
+        let anchor_t = Tensor::<1, burn::tensor::Float>::zeros([1], &device);
+        let anchor_c = anchor_t
+            .try_into_primitive::<burn_wgpu::Metal>()
+            .map_err(|e| anyhow::anyhow!("anchor: {e:?}"))?;
+        let anchor = qmat::RTAnchor(anchor_c);
+        eprintln!("talker backbone = Q4_K (custom cubecl GEMV)");
+        talker::Talker::new_quant(&w, &tts_cfg, &anchor)?
+    } else {
+        talker::Talker::new(&w, &tts_cfg)?
+    };
 
     // --- ref voice (ICL cloning): speaker embed + ref codes + ref text ids ---
     let ref_voice: Option<talker::RefVoice> = match (&ref_wav, &ref_text) {

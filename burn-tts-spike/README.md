@@ -18,6 +18,10 @@ cargo run --release -- <model-dir> "<text>" <out.wav> [--language zh|en] [--max-
     --ref ref.wav --ref-text "full ref transcript"
 ```
 
+`--talker-quant`：Q4_K 量化 talker + predictor backbone（自定义 cubecl GEMV kernel，
+省内存 ~2.7×，速度无收益 —— 见 Phase 5）。`--qmat-test`：Q4K GEMV vs f32 linear 的
+数值 + 延迟对照（验证工具）。
+
 - 音频时长 / gen、codec 分段耗时、RTF → stderr。
 - 先完整跑 1 轮 warmup（MSL 着色器编译 + matmul autotune），再计正式轮。
 - `--codes-file <file>`：跳过 talker，把外部 (n,16) codes 直接喂给 codec
@@ -150,6 +154,41 @@ codec 小 conv 的 fused kernel；预测器 15 步的并行/投机解码提高 m
     90 帧 ref → ~100 token prompt → 每帧 ~3× 慢（candle 同条件 1.8×）。优化方向：
     mask 复用 / 滑动 attention。
 
+### Phase 5 — Q4_K 量化（自定义 cubecl GEMV kernel）
+
+**实现**：`src/qmat.rs`（量化 + kernel）+ `src/quant_talker.rs`（QuantDecoderLayer）。
+权重按 32 元素块量化（f32 min + f32 scale=(max-min)/15 + 4 u32 打包 32 个 4-bit 值，
+0.75 B/elem vs f16 2 B），每层 7 个 GEMV（q/k/v/o/gate/up/down）替换 f16 matmul，
+norms/attention 保持原 dtype。kernel 是 `#[cube(launch_unchecked)]` 自定义 GEMV：
+每输出行一个线程，块内解包累加，激活 F32（与 candle QMatMul 相同约束）。
+通过 `Tensor::try_into_primitive::<burn_wgpu::Metal>()` 与 burn 的 GPU 上下文共享 buffer。
+
+**验证**：
+- kernel 数值：随机权重 GEMV vs CPU rel err **3.3e-3**（Q4 精度内）；延迟 **8µs/launch**
+  （独立 bin；集成路径含 burn 包装 ~200µs）
+- 真实权重：单块 dequant 误差可达 0.015 —— 值域大的块（±0.22）scale 大，是 **Q4 的固有
+  精度**，非实现 bug
+- greedy codes：**burn Q4K vs f16 2.08% 一致；candle Q4K vs BF16 1.83% 一致** —— 行为
+  一致（连第一个分歧点都相同：frame0 cb2 933→412）。Q4 权重噪声使 greedy argmax 大面积
+  翻转，是量化固有现象（candle 同）；**采样式**（实际使用）音频正常（RMS 4033，无 babble）
+- 端到端采样 RTF ~2.8（与 f16 同级）
+
+**性能结论（重要）**：量化**没有速度收益**（gen 128ms/帧 vs f16 113ms）。原因：burn 的
+m=1 每步成本是 **op/launch 数瓶颈**（每层 ~20 个 op × 5 层 × 16 步/帧 × ~40µs），
+带宽不是瓶颈 —— Q4K 只省 matmul 的带宽，动不了 op 数。candle 的 Q4_K 收益（0.53）来自
+其 kernel 效率（带宽是真实瓶颈，且 predictor 量化也只省 4% —— candle 自己的注释）。
+**burn Q4K 的价值 = 内存**（talker 1.7B 权重 ~2.7× 缩小）。
+
+**新坑**：
+17. **CubeDim 不能超过 wgpu 的 max units/cube（1024）**：2560 线程的 `CubeDim::new_1d(2560)`
+    静默失败（kernel 完全不执行，输出全 0，无报错）。必须 `CubeCount × CubeDim(≤1024)`。
+18. **burn metal feature 的 backend 类型是 `Metal`（MslCompiler），不是 `Wgpu`（AutoCompiler）**：
+    `try_into_primitive::<Wgpu>()` 报 BackendMismatch("Expected Wgpu tensor, got variant: Metal")。
+19. `try_into_primitive`/`from_primitive` 需要 burn-tensor 的 **`extension` feature**
+    （`BackendPrimitive` trait，路径 `burn_tensor::BackendPrimitive`）。
+20. **Q4KMatmul 只支持 s=1**（kernel 是单 token GEMV）；prefill（s>1）按 token 循环
+    （一次性成本，可接受；batched kernel 是后续优化）。
+
 ## 文件结构（镜像 candle 侧）
 
 - `src/config.rs` — serde config（只留用到的字段）+ `Qwen3TTSGenerationConfig` Default。
@@ -163,6 +202,10 @@ codec 小 conv 的 fused kernel；预测器 15 步的并行/投机解码提高 m
   SnakeBeta、EuclideanCodebookDecode、SplitRvqDecode、DecoderPreTransformer（8 层、
   sliding-window 72、LayerScale、RoPE θ1e4）、ConvNeXtBlock、DecoderResidualUnit、
   `CodecDecoder::decode` + `chunked_decode(300,25)`。
+- `src/qmat.rs` — Q4_K 量化（CPU）+ 自定义 cubecl GEMV kernel（`#[cube(launch_unchecked)]`，
+  Metal backend 集成 via `try_into_primitive`）。
+- `src/quant_talker.rs` — `QuantDecoderLayer`（7 Q4K GEMV + norms + KV cache）+
+  QuantTalkerBackbone（28 层）+ QuantPredictorBackbone（5 层）。
 - `src/speaker_encoder.rs` — ECAPA-TDNN（ReflectConv、Res2Net scale8、SE、ASP、fc）+ F32。
 - `src/audio.rs` — 解码（symphonia）、sinc 重采样、speaker mel 前端（reflect pad +
   periodic Hann + realfft STFT + slaney mel）—— CPU 侧 f32，与 candle 参考一致。

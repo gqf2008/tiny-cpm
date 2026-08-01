@@ -14,6 +14,7 @@ use crate::model::{
     DecoderLayer, Weights, causal_mask, compute_default_rope_parameters, dt, linear, rms_norm,
     rotary,
 };
+use crate::quant_talker::{QuantPredictorBackbone, QuantTalkerBackbone};
 
 use burn::tensor::DType;
 
@@ -77,6 +78,7 @@ pub struct CodePredictor {
     cfg: CodePredictorConfig,
     codec_embedding: Vec<Tensor<2>>, // 15 × (vocab, talker_hidden)
     layers: Vec<DecoderLayer>,       // 5 × Qwen3 (predictor hidden)
+    layers_quant: Option<QuantPredictorBackbone>,
     norm_w: Tensor<1>,
     inv_freq: Vec<f32>,
     lm_head: Vec<Tensor<2>>, // 15 × (vocab, hidden)
@@ -124,6 +126,7 @@ impl CodePredictor {
             cfg: cfg.clone(),
             codec_embedding,
             layers,
+            layers_quant: None,
             norm_w,
             inv_freq,
             lm_head,
@@ -135,6 +138,9 @@ impl CodePredictor {
     pub fn clear_kv_cache(&mut self) {
         for l in self.layers.iter_mut() {
             l.clear_cache();
+        }
+        if let Some(q) = self.layers_quant.as_mut() {
+            q.clear_kv_cache();
         }
     }
 
@@ -153,8 +159,16 @@ impl CodePredictor {
         };
         let (cos, sin) = rotary(&self.device, &self.inv_freq, seqlen_offset, seq_len, dt());
         let mut h = xs;
-        for l in self.layers.iter_mut() {
-            h = l.forward(h, &cos, &sin, mask.as_ref());
+        if let Some(q) = self.layers_quant.as_mut() {
+            for l in q.layers.iter_mut() {
+                h = l
+                    .forward(h, &cos, &sin, mask.as_ref())
+                    .expect("quant predictor layer");
+            }
+        } else {
+            for l in self.layers.iter_mut() {
+                h = l.forward(h, &cos, &sin, mask.as_ref());
+            }
         }
         let h = rms_norm(h, self.norm_w.clone(), self.cfg.rms_norm_eps);
         h.narrow(1, seq_len - 1, 1)
@@ -192,6 +206,8 @@ pub struct Talker {
     inv_freq: Vec<f32>,
     codec_head: Tensor<2>, // (vocab, hidden)
     code_predictor: CodePredictor,
+    /// Q4_K quantized backbone (optional; `--talker-quant`). None = f16 layers.
+    layers_quant: Option<QuantTalkerBackbone>,
 }
 
 impl Talker {
@@ -226,12 +242,38 @@ impl Talker {
             inv_freq: compute_default_rope_parameters(cfg.head_dim, cfg.rope_theta as f32),
             codec_head: w.get("talker.codec_head.weight", dt())?,
             code_predictor,
+            layers_quant: None,
         })
+    }
+
+    /// Load with a Q4_K quantized backbone (7 GEMVs per layer instead of f16
+    /// matmuls). `anchor` supplies the cubecl client for weight upload.
+    pub fn new_quant(
+        w: &Weights,
+        tts: &Qwen3TTSConfig,
+        anchor: &crate::qmat::RTAnchor,
+    ) -> Result<Self> {
+        let mut t = Self::new(w, tts)?;
+        t.layers_quant = Some(QuantTalkerBackbone::new(w, &tts.talker_config, anchor)?);
+        let pc = &tts.talker_config.code_predictor_config;
+        t.code_predictor.layers_quant = Some(QuantPredictorBackbone::new(
+            w,
+            pc.num_hidden_layers,
+            pc.num_attention_heads,
+            pc.num_key_value_heads,
+            pc.head_dim,
+            pc.rms_norm_eps,
+            anchor,
+        )?);
+        Ok(t)
     }
 
     fn clear_kv_cache(&mut self) {
         for l in self.layers.iter_mut() {
             l.clear_cache();
+        }
+        if let Some(q) = self.layers_quant.as_mut() {
+            q.clear_kv_cache();
         }
     }
 
@@ -296,8 +338,16 @@ impl Talker {
         };
         let (cos, sin) = rotary(&self.device, &self.inv_freq, seqlen_offset, seq_len, dt());
         let mut h = embeds;
-        for l in self.layers.iter_mut() {
-            h = l.forward(h, &cos, &sin, mask.as_ref());
+        if let Some(q) = self.layers_quant.as_mut() {
+            for l in q.layers.iter_mut() {
+                h = l
+                    .forward(h, &cos, &sin, mask.as_ref())
+                    .expect("quant layer forward");
+            }
+        } else {
+            for l in self.layers.iter_mut() {
+                h = l.forward(h, &cos, &sin, mask.as_ref());
+            }
         }
         let h = rms_norm(h, self.norm_w.clone(), self.cfg.rms_norm_eps);
         let last = h.narrow(1, seq_len - 1, 1); // (1,1,hidden)

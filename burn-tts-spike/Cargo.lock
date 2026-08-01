@@ -678,6 +678,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "burn",
+ "burn-backend",
+ "burn-tensor",
+ "burn-wgpu",
+ "cubecl",
+ "cubecl-common",
  "hound",
  "realfft",
  "safetensors 0.7.0",
