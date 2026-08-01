@@ -336,6 +336,47 @@ CARGO_TARGET_DIR=../target-shared cargo build --release --features fusion
 - `--qmat-test` — Q4K GEMV 数值/延迟对照
 - Phase 1–7 完整验证记录（逐位对比、基准表、踩坑）
 
+### Phase 9 — codec 卷积优化（burn-perf 分支，2026-08-01）
+
+**症状**：codec（chunked_decode）占全流程 RTF 的近一半（~1.0–1.1），其中
+`blocks` 循环（4 个 DecoderBlock）独占 ~1.6s（20 帧）：`conv_transpose1d`
+（stride 8/5/4/3）每个 130–190ms，residual 的 k7 dilated causal conv 在
+T=12800/38400 时每个 77–97ms。
+
+**根因**：burn 的 conv 走 im2col 物化（大 T 时 ~百 MB 中间矩阵，带宽爆炸）；
+`conv_transpose1d` 内部同样物化零插值输入。且 burn matmul 在 m<1000 时
+occupancy 极低（m=128: ~2 GFLOP/s，m=12800: ~56 GFLOP/s）。
+
+**修复**（`src/codec.rs`，`BURN_TTS_OLD_CONV=1` 可回退旧路径）：
+- `causal_conv_shifted`：stride-1 causal conv = k 次"移位 + 通道 matmul"
+  （dense,groups=1）或逐元素乘（depthwise）——**无 im2col 物化**。
+  普通 causal conv kernel 需**翻转**（cross-correlation 语义）；
+  转置卷积等价（零插值 + conv）kernel **不翻转**（convolution 语义）。
+- `CausalTransConv`：stride S 转置卷积 = 零插值（(T-1)*S+1）+ 右补 k-1 +
+  shifted causal conv，仅当插值后长度 ≥2048（matmul occupancy 足够）；
+  小长度保留 `conv_transpose1d`（m-bound matmul 反而更慢）。
+- `CausalConv`：仅当 T ≥2048 用 shifted（小 T 的 tap matmul 是 m-bound 病态）。
+
+**验证**：新旧路径 PCM 逐点 max|d| = **1.3e-6**（fp32 舍入级，长度逐位相等）；
+`src/bin/tconv_bench2.rs` / `conv_shifted_bench.rs` 为等价性回归基准
+（max|d| ~1e-6，转置卷积 4–5×、大 T 残差 conv 2–4×）。
+
+**实测（块级内部 prof，20 帧，同次运行内对比，避开负载噪声）**：
+
+| 块 | 旧路径 | 新路径 |
+|---|---|---|
+| trans T=640（s8→3200） | 184ms | **39ms** |
+| trans T=3200（s4→12800） | ~180ms | 73ms |
+| trans T=12800（s3→38400） | ~180ms | 66ms |
+| residual T=3200（k7 dil） | ~95ms | **17ms** |
+| residual T=12800/38400 | 77–97ms | 62–68ms |
+| blocks 合计 | ~1600ms | **~1070ms**（-33%） |
+
+codec-only RTF 约 2.3 → 2.0；全流程 codec 部分 RTF ~1.07 → ~0.85（负载
+波动大，内部块级对比为准）。**残余**：T=80 trans（192ms，m-bound 无法移位）、
+T=640 residual（92ms，im2col 但 T 太小）、shifted matmul 在 codec 内比隔离
+bench 慢 ~4–5×（非连续输入 + fusion 组合），是 burn kernel 效率上限。
+
 ## 文件结构（镜像 candle 侧）
 
 - `src/config.rs` — serde config（只留用到的字段）+ `Qwen3TTSGenerationConfig` Default。

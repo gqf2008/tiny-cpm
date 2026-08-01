@@ -448,15 +448,41 @@ fn main() -> Result<()> {
         .unsqueeze(); // (1, 16, n)
         let t1 = Instant::now();
         let wav = decoder.chunked_decode(&codes_t, 300, 25)?;
+        let tc1 = Instant::now();
         let pcm: Vec<f32> = wav
             .squeeze_dim::<2>(0)
             .squeeze_dim::<1>(0)
             .to_data()
             .to_vec::<f32>()
             .map_err(|e| anyhow::anyhow!("pcm read: {e}"))?;
+        let tc2 = Instant::now();
         device
             .sync()
             .map_err(|e| anyhow::anyhow!("device sync: {e}"))?;
+        if std::env::var("BURN_TTS_CODEC_PROF").is_ok() {
+            eprintln!(
+                "[codec-wall] codes-file: decode {:.1}ms readback {:.1}ms sync {:.1}ms",
+                (tc1 - t1).as_secs_f64() * 1e3,
+                (tc2 - tc1).as_secs_f64() * 1e3,
+                (Instant::now() - tc2).as_secs_f64() * 1e3
+            );
+            // second decode: isolates one-time compile vs steady-state enqueue
+            let t2a = Instant::now();
+            let wav2 = decoder.chunked_decode(&codes_t, 300, 25)?;
+            let t2b = Instant::now();
+            let _: Vec<f32> = wav2
+                .squeeze_dim::<2>(0)
+                .squeeze_dim::<1>(0)
+                .to_data()
+                .to_vec::<f32>()?;
+            let t2c = Instant::now();
+            let _ = device.sync();
+            eprintln!(
+                "[codec-wall] codes-file 2nd: decode {:.1}ms readback {:.1}ms",
+                (t2b - t2a).as_secs_f64() * 1e3,
+                (t2c - t2b).as_secs_f64() * 1e3
+            );
+        }
         if std::env::var("BURN_TTS_DUMP_PCM").is_ok() {
             eprintln!("BURN_PCM {:?}", pcm);
         }
@@ -585,7 +611,18 @@ fn main() -> Result<()> {
             &gen_cfg,
             max_frames,
         )?; // (n, 16)
+        let t_gen_done = Instant::now();
         let n_frames = codes.dims()[0];
+        if std::env::var("BURN_TTS_CODEC_PROF").is_ok() {
+            // Talker GPU time: drain the async queue right after generate.
+            let tg0 = Instant::now();
+            let _ = device.sync();
+            eprintln!(
+                "[gen-gpu] {tag}: gen-wall {:.0}ms, post-gen drain {:.0}ms",
+                (t_gen_done - t1).as_secs_f64() * 1e3,
+                tg0.elapsed().as_secs_f64() * 1e3
+            );
+        }
         if std::env::var("BURN_TTS_DUMP_CODES").is_ok() {
             let v: Vec<i32> = codes
                 .clone()
@@ -596,16 +633,34 @@ fn main() -> Result<()> {
         }
         let t2 = Instant::now();
         let codes_t: Tensor<3, Int> = codes.clone().swap_dims(0, 1).unsqueeze(); // (1, 16, n)
+        if std::env::var("BURN_TTS_CODEC_PROF").is_ok() {
+            // Drain talker GPU backlog so codec wall time is measured cleanly.
+            let _ = device.sync();
+        }
+        let tc0 = Instant::now();
         let wav = decoder.chunked_decode(&codes_t, 300, 25)?; // (1, 1, n*1920)
+        let tc1 = Instant::now();
         let pcm: Vec<f32> = wav
             .squeeze_dim::<2>(0)
             .squeeze_dim::<1>(0)
             .to_data()
             .to_vec::<f32>()
             .map_err(|e| anyhow::anyhow!("pcm read: {e}"))?;
+        let tc2 = Instant::now();
         device
             .sync()
             .map_err(|e| anyhow::anyhow!("device sync: {e}"))?;
+        if std::env::var("BURN_TTS_DUMP_PCM").is_ok() {
+            eprintln!("BURN_PCM {:?}", pcm);
+        }
+        if std::env::var("BURN_TTS_CODEC_PROF").is_ok() {
+            eprintln!(
+                "[codec-wall] {tag}: decode {:.1}ms readback {:.1}ms sync {:.1}ms",
+                (tc1 - tc0).as_secs_f64() * 1e3,
+                (tc2 - tc1).as_secs_f64() * 1e3,
+                (Instant::now() - tc2).as_secs_f64() * 1e3
+            );
+        }
         if std::env::var("BURN_TTS_DUMP_PCM").is_ok() {
             eprintln!("BURN_PCM {:?}", pcm);
         }

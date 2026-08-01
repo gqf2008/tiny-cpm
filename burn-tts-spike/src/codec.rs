@@ -59,6 +59,56 @@ fn pad_zeros_last_dim(
     Tensor::cat(parts, 2)
 }
 
+/// Causal conv (stride 1) via shifted-window composition: `out[t] = Σ_q w[q]·x[t-q·d]`
+/// (zeros for t<q·d). `w` is (out, in, k), `groups` 1 (dense matmul per tap) or
+/// `in==out==groups` (depthwise, elementwise per tap). Avoids burn's im2col
+/// materialization, which dominates on long sequences (codec T up to 38400).
+fn causal_conv_shifted(
+    x: Tensor<3>,
+    w: Tensor<3>,
+    b: Option<Tensor<1>>,
+    dilation: usize,
+    groups: usize,
+    reverse_kernel: bool,
+) -> Tensor<3> {
+    let [b0, cin, t] = x.dims();
+    let [out_c, _, k] = w.dims();
+    let device = x.device();
+    let depthwise = groups == cin && groups == out_c;
+    let mut acc: Option<Tensor<3>> = None;
+    for q in 0..k {
+        let shift = q * dilation;
+        let xq = if shift == 0 {
+            x.clone()
+        } else {
+            let zeros = Tensor::<3, burn::tensor::Float>::zeros([b0, cin, shift], &device);
+            Tensor::cat(vec![zeros, x.clone().narrow(2, 0, t - shift)], 2)
+        };
+        let tap = if reverse_kernel { k - 1 - q } else { q };
+        if depthwise {
+            let wq = w.clone().narrow(2, tap, 1).reshape([cin, 1, 1]);
+            let m = xq * wq; // (B, C, T)
+            acc = Some(match acc {
+                None => m,
+                Some(a) => a + m,
+            });
+        } else {
+            let wq = w.clone().narrow(2, tap, 1).reshape([out_c, cin]).swap_dims(0, 1);
+            let m = xq.swap_dims(1, 2).reshape([b0 * t, cin]).matmul(wq).reshape([b0, t, out_c]);
+            let m = m.swap_dims(1, 2); // (B, out, T)
+            acc = Some(match acc {
+                None => m,
+                Some(a) => a + m,
+            });
+        }
+    }
+    let mut y = acc.expect("k >= 1");
+    if let Some(bias) = b {
+        y = y + bias.clone().reshape([1, out_c, 1]);
+    }
+    y
+}
+
 /// `Qwen3TTSTokenizerV2CausalConvNet`: left-pad + right extra-pad, then a plain
 /// conv1d (no built-in padding). Weight name nested under `.conv`.
 struct CausalConv {
@@ -101,11 +151,20 @@ impl CausalConv {
         })
     }
     fn forward(&self, x: Tensor<3>, device: &burn::tensor::Device) -> Tensor<3> {
-        let len = x.dims()[2];
-        let extra = conv1d_extra_padding(len, self.kernel_eff, self.padding, self.stride);
-        let x = pad_zeros_last_dim(x, self.padding, extra, device);
-        let opts = ConvOptions::new([self.stride], [0], [self.dilation], self.groups);
-        module::conv1d(x, self.w.clone(), self.b.clone(), opts)
+        // Shifted-window matmul wins only when T is large enough for burn's
+        // matmul to hit reasonable occupancy; for small T the per-tap matmuls
+        // are catastrophically slow (m~100: ~2 GFLOP/s), so keep im2col there.
+        if std::env::var("BURN_TTS_OLD_CONV").is_ok()
+            || self.stride != 1
+            || x.dims()[2] < 2048
+        {
+            let len = x.dims()[2];
+            let extra = conv1d_extra_padding(len, self.kernel_eff, self.padding, self.stride);
+            let x = pad_zeros_last_dim(x, self.padding, extra, device);
+            let opts = ConvOptions::new([self.stride], [0], [self.dilation], self.groups);
+            return module::conv1d(x, self.w.clone(), self.b.clone(), opts);
+        }
+        causal_conv_shifted(x, self.w.clone(), self.b.clone(), self.dilation, self.groups, true)
     }
 }
 
@@ -142,11 +201,44 @@ impl CausalTransConv {
         })
     }
     fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        let opts = ConvTransposeOptions::new([self.stride], [0], [0], [1], 1);
-        let y = module::conv_transpose1d(x, self.w.clone(), self.b.clone(), opts);
+        if std::env::var("BURN_TTS_OLD_CONV").is_ok() {
+            let opts = ConvTransposeOptions::new([self.stride], [0], [0], [1], 1);
+            let y = module::conv_transpose1d(x, self.w.clone(), self.b.clone(), opts);
+            if self.right_pad > 0 {
+                let t = y.dims()[2];
+                return y.narrow(2, 0, t - self.right_pad);
+            }
+            return y;
+        }
+        // transposed conv (stride s, kernel k) = zero-insert (s-1 zeros between
+        // elements) + causal conv (k-1 left pad). conv_transpose weight layout
+        // is (in, out, k); the conv needs (out, in, k). Only for large T —
+        // small T's per-tap matmuls are m-bound and slower than conv_transpose.
+        let [b, c, t] = x.dims();
+        // shifted path needs the zero-inserted length ((t-1)*s+1) large enough
+        // for burn's matmul to reach decent occupancy
+        if (t - 1) * self.stride + 1 < 2048 {
+            let opts = ConvTransposeOptions::new([self.stride], [0], [0], [1], 1);
+            let y = module::conv_transpose1d(x, self.w.clone(), self.b.clone(), opts);
+            if self.right_pad > 0 {
+                let t2 = y.dims()[2];
+                return y.narrow(2, 0, t2 - self.right_pad);
+            }
+            return y;
+        }
+        let k = self.w.dims()[2];
+        let dev = x.device();
+        let x4 = x.unsqueeze_dim::<4>(3); // (B, C, T, 1)
+        let zeros = Tensor::<4, burn::tensor::Float>::zeros([b, c, t, self.stride - 1], &x4.device());
+        let inter = Tensor::cat(vec![x4, zeros], 3); // (B, C, T, S)
+        let x_up = inter.reshape([b, c, t * self.stride]).narrow(2, 0, (t - 1) * self.stride + 1);
+        // right-pad (k-1): the transposed conv's output extends k-1 past the last
+        // input's tap start ((T-1)*s .. (T-1)*s+k-1)
+        let x_up = pad_zeros_last_dim(x_up, 0, k - 1, &dev);
+        let y = causal_conv_shifted(x_up, self.w.clone().swap_dims(0, 1), self.b.clone(), 1, 1, false);
         if self.right_pad > 0 {
-            let t = y.dims()[2];
-            y.narrow(2, 0, t - self.right_pad)
+            let t2 = y.dims()[2];
+            y.narrow(2, 0, t2 - self.right_pad)
         } else {
             y
         }
@@ -247,13 +339,19 @@ impl RvqDecode {
         })
     }
     /// codes: slice of per-layer (B, T) → (B, 512, T)
-    fn decode(&self, codes: &[Tensor<2, Int>]) -> Result<Tensor<3>> {
+    fn decode(&self, codes: &[Tensor<2, Int>], device: &burn::tensor::Device) -> Result<Tensor<3>> {
         if codes.len() != self.layers.len() {
             return Err(anyhow!("rvq layer count mismatch"));
         }
         let mut acc: Option<Tensor<3>> = None;
-        for (layer, codes_i) in self.layers.iter().zip(codes.iter()) {
+        let prof = std::env::var("BURN_TTS_CODEC_PROF").is_ok();
+        for (i, (layer, codes_i)) in self.layers.iter().zip(codes.iter()).enumerate() {
+            let t0 = std::time::Instant::now();
             let q = layer.decode(codes_i.clone()); // (B, dim, T)
+            if prof {
+                let _ = device.sync();
+                eprintln!("[codec-q] layer {i}: {:.2}ms", t0.elapsed().as_secs_f64() * 1e3);
+            }
             acc = Some(match acc {
                 None => q,
                 Some(a) => a + q,
@@ -262,7 +360,16 @@ impl RvqDecode {
         let q = acc.ok_or_else(|| anyhow!("rvq: no layers"))?;
         // 1×1 conv: (B, 256, T) → (B, 512, T)
         let opts = ConvOptions::new([1], [0], [1], 1);
-        Ok(module::conv1d(q, self.output_proj_w.clone(), None, opts))
+        if prof {
+            let _ = device.sync();
+            eprintln!("[codec-q] pre-conv1d sync ok");
+        }
+        let out = module::conv1d(q, self.output_proj_w.clone(), None, opts);
+        if prof {
+            let _ = device.sync();
+            eprintln!("[codec-q] conv1d done");
+        }
+        Ok(out)
     }
 }
 
@@ -281,17 +388,39 @@ impl SplitRvqDecode {
         })
     }
     /// codes (B, 16, T) Int → (B, 512, T)
-    fn decode(&self, codes: &Tensor<3, Int>) -> Result<Tensor<3>> {
+    fn decode(&self, codes: &Tensor<3, Int>, device: &burn::tensor::Device) -> Result<Tensor<3>> {
+        let prof = std::env::var("BURN_TTS_CODEC_QPROF").is_ok();
         let b = codes.dims()[0];
         let t = codes.dims()[2];
+        let t0 = std::time::Instant::now();
         let first = vec![codes.clone().narrow(1, 0, 1).reshape([b, t])];
         let mut rest = Vec::with_capacity(15);
         for i in 1..16 {
             rest.push(codes.clone().narrow(1, i, 1).reshape([b, t]));
         }
-        let q = self.rvq_first.decode(&first)?;
-        let q2 = self.rvq_rest.decode(&rest)?;
-        Ok(q + q2)
+        if prof {
+            let _ = device.sync();
+            eprintln!("[codec-q] narrow/reshape: {:.1}ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
+        let t1 = std::time::Instant::now();
+        let q = self.rvq_first.decode(&first, device)?;
+        if prof {
+            let _ = device.sync();
+            eprintln!("[codec-q] rvq_first: {:.1}ms", t1.elapsed().as_secs_f64() * 1e3);
+        }
+        let t2 = std::time::Instant::now();
+        let q2 = self.rvq_rest.decode(&rest, device)?;
+        if prof {
+            let _ = device.sync();
+            eprintln!("[codec-q] rvq_rest: {:.1}ms", t2.elapsed().as_secs_f64() * 1e3);
+        }
+        let t3 = std::time::Instant::now();
+        let out = q + q2;
+        if prof {
+            let _ = device.sync();
+            eprintln!("[codec-q] q+q2 add: {:.1}ms", t3.elapsed().as_secs_f64() * 1e3);
+        }
+        Ok(out)
     }
 }
 
@@ -661,10 +790,30 @@ impl DecoderBlock {
         })
     }
     fn forward(&self, x: Tensor<3>, device: &burn::tensor::Device) -> Tensor<3> {
+        let prof = std::env::var("BURN_TTS_CODEC_PROF").is_ok();
+        let tin = x.dims()[2];
+        let t0 = std::time::Instant::now();
         let mut h = self.snake.forward(x);
+        if prof {
+            let _ = device.sync();
+            let now = std::time::Instant::now();
+            eprintln!("[codec-block] T={tin} snake {:.1}ms", (now - t0).as_secs_f64() * 1e3);
+        }
+        let t1 = std::time::Instant::now();
         h = self.trans_conv.forward(h);
-        for r in &self.residuals {
+        if prof {
+            let _ = device.sync();
+            let now = std::time::Instant::now();
+            eprintln!("[codec-block] T={tin} trans_conv {:.1}ms (out T={})", (now - t1).as_secs_f64() * 1e3, h.dims()[2]);
+        }
+        for (ri, r) in self.residuals.iter().enumerate() {
+            let t2 = std::time::Instant::now();
             h = r.forward(h, device);
+            if prof {
+                let _ = device.sync();
+                let now = std::time::Instant::now();
+                eprintln!("[codec-block] T={} residual{ri} {:.1}ms", h.dims()[2], (now - t2).as_secs_f64() * 1e3);
+            }
         }
         h
     }
@@ -762,20 +911,60 @@ impl CodecDecoder {
 
     /// codes: (B, 16, T) Int → waveform (B, 1, T*1920) CODEC_DT in [-1, 1].
     pub fn decode(&self, codes: &Tensor<3, Int>) -> Result<Tensor<3>> {
-        let hidden = self.quantizer.decode(codes)?; // (B, 512, T)
+        let prof = std::env::var("BURN_TTS_CODEC_PROF").is_ok();
+        let mut marks: Vec<String> = Vec::new();
+        let mut last = std::time::Instant::now();
+        let hidden = self.quantizer.decode(codes, &self.device)?; // (B, 512, T)
+        if prof {
+            let _ = self.device.sync();
+            let now = std::time::Instant::now();
+            marks.push(format!("quantizer {:.1}ms", (now - last).as_secs_f64() * 1e3));
+            last = now;
+        }
         let hidden = self.pre_conv.forward(hidden, &self.device).swap_dims(1, 2); // (B, T, latent)
+        if prof {
+            let _ = self.device.sync();
+            let now = std::time::Instant::now();
+            marks.push(format!("preconv {:.1}ms", (now - last).as_secs_f64() * 1e3));
+            last = now;
+        }
         let hidden = self.pre_transformer.forward(hidden); // (B, T, latent)
+        if prof {
+            let _ = self.device.sync();
+            let now = std::time::Instant::now();
+            marks.push(format!("pretrans {:.1}ms", (now - last).as_secs_f64() * 1e3));
+            last = now;
+        }
         let mut hidden = hidden.swap_dims(1, 2); // (B, latent, T)
         for (tc, cn) in &self.upsample {
             hidden = tc.forward(hidden);
             hidden = cn.forward(hidden, &self.device);
         }
+        if prof {
+            let _ = self.device.sync();
+            let now = std::time::Instant::now();
+            marks.push(format!("upsample {:.1}ms", (now - last).as_secs_f64() * 1e3));
+            last = now;
+        }
         let mut wav = self.decoder0.forward(hidden, &self.device);
         for block in &self.blocks {
             wav = block.forward(wav, &self.device);
         }
+        if prof {
+            let _ = self.device.sync();
+            let now = std::time::Instant::now();
+            marks.push(format!("blocks {:.1}ms", (now - last).as_secs_f64() * 1e3));
+            last = now;
+        }
         wav = self.final_snake.forward(wav);
         wav = self.final_conv.forward(wav, &self.device);
+        if prof {
+            let _ = self.device.sync();
+            let now = std::time::Instant::now();
+            marks.push(format!("final {:.1}ms", (now - last).as_secs_f64() * 1e3));
+            last = now;
+            eprintln!("[codec-gpu] {}", marks.join(" "));
+        }
         Ok(wav.clamp(-1.0, 1.0))
     }
 
@@ -792,6 +981,7 @@ impl CodecDecoder {
         left_context: usize,
     ) -> Result<Tensor<3>> {
         let t_total = codes.dims()[2];
+        let prof = std::env::var("BURN_TTS_CODEC_PROF").is_ok();
         let mut wavs = Vec::new();
         let mut start = 0usize;
         while start < t_total {
@@ -801,17 +991,32 @@ impl CodecDecoder {
             } else {
                 start
             };
+            let t_n0 = std::time::Instant::now();
             let chunk = codes
                 .clone()
                 .narrow(2, start - context, (end - start) + context);
             let wav = self.decode(&chunk)?;
+            let t_n1 = std::time::Instant::now();
             let drop = context * self.total_upsample;
             let t = wav.dims()[2];
             let wav = wav.narrow(2, drop, t - drop);
             wavs.push(wav);
             start = end;
+            if prof {
+                eprintln!(
+                    "[codec-chunk] chunk {start}-{end}: decode {:.1}ms",
+                    (t_n1 - t_n0).as_secs_f64() * 1e3
+                );
+            }
         }
-        Ok(Tensor::cat(wavs, 2))
+        if prof {
+            let t_c0 = std::time::Instant::now();
+            let out = Tensor::cat(wavs, 2);
+            eprintln!("[codec-chunk] cat: {:.1}ms", t_c0.elapsed().as_secs_f64() * 1e3);
+            Ok(out)
+        } else {
+            Ok(Tensor::cat(wavs, 2))
+        }
     }
 }
 
