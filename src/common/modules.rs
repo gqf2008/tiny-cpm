@@ -792,21 +792,64 @@ pub fn eager_attention_forward(
     let value_states = value_states.contiguous()?;
     let attn_output = {
         // flash-attn path from aha dropped: tiny-cpm has no `candle_flash_attn`
-        // dependency, only the pure eager path is kept.
-        let attn_weights =
-            query_states.matmul(&key_states.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
-        let attn_weights = (attn_weights * scaling)?;
-        let attn_weights = match attention_mask {
-            None => attn_weights,
-            Some(mask) => attn_weights.broadcast_add(&mask.to_dtype(attn_weights.dtype())?)?,
-        };
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?.contiguous()?;
-        attn_weights.matmul(&value_states)?
+        // dependency. On Metal at decode (single query position, no mask), route
+        // through candle-metal-kernels' fused SDPA vector kernel — ONE kernel
+        // instead of matmul+scale+softmax+matmul (+ the repeat_kv/contiguous
+        // setup above). Fall back to the pure eager path otherwise.
+        if attention_mask.is_none()
+            && query_states.rank() == 4
+            && matches!(query_states.dim(2), Ok(1))
+        {
+            match crate::models::qwen3_tts::sdpa_fused::sdpa_vector_attention(
+                &query_states,
+                &key_states,
+                &value_states,
+                scaling as f32,
+            ) {
+                Ok(Some(out)) => out,
+                _ => eager_attention_math(
+                    &query_states,
+                    &key_states,
+                    &value_states,
+                    attention_mask,
+                    scaling,
+                )?,
+            }
+        } else {
+            eager_attention_math(
+                &query_states,
+                &key_states,
+                &value_states,
+                attention_mask,
+                scaling,
+            )?
+        }
     };
     //(b, n_head, seq_len, dim) -> (b, seq_len, n_head, dim)
     let attn_output = attn_output.transpose(1, 2)?.contiguous()?;
 
     Ok(attn_output)
+}
+
+/// The pure eager attention math: softmax(q·k^T·scale [+mask])·v. Split out so
+/// `eager_attention_forward` can route the decode step through the fused SDPA
+/// vector kernel and fall back here for prefill / masked / non-Metal inputs.
+fn eager_attention_math(
+    query_states: &Tensor,
+    key_states: &Tensor,
+    value_states: &Tensor,
+    attention_mask: Option<&Tensor>,
+    scaling: f64,
+) -> Result<Tensor> {
+    let attn_weights =
+        query_states.matmul(&key_states.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
+    let attn_weights = (attn_weights * scaling)?;
+    let attn_weights = match attention_mask {
+        None => attn_weights,
+        Some(mask) => attn_weights.broadcast_add(&mask.to_dtype(attn_weights.dtype())?)?,
+    };
+    let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?.contiguous()?;
+    Ok(attn_weights.matmul(&value_states)?)
 }
 
 pub fn get_conv2d(
