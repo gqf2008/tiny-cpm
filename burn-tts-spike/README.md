@@ -297,6 +297,13 @@ CARGO_TARGET_DIR=../target-shared cargo build --release --features fusion
 22. `fallback(i)` 的 `i` 是 plan 内 op 序号（0..len），不是 segment 位置；
     传 `self.len` 当单个调用会越界（ordering `[0,1,2]` 下标 3 → OOB）。
 
+**补丁归档**：`burn-fusion-fix.patch`（本目录）是 burn fork 上 5 文件的完整 diff
+（`ElemwiseOptimization` stale-shape fallback + stale-plan 作废 + policy 校验 +
+`BURN_FUSION_NO_CACHE` 门控 + `ExecutionPlanStore::clear`），可直接
+`git apply` 到 tracel-ai/burn 的 `610991889` 附近版本。优化后 fallback 频率
+从 ~1.4 次/帧降到 **~0.1 次/帧**（10+10 帧仅 1 次：首次 stale 触发后缓存作废，
+下一个同样式按当前编号重新探索并正常 fused）。
+
 ## 文件结构（镜像 candle 侧）
 
 - `src/config.rs` — serde config（只留用到的字段）+ `Qwen3TTSGenerationConfig` Default。

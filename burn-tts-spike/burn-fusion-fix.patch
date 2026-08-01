@@ -1,0 +1,213 @@
+diff --git a/crates/burn-cubecl-fusion/src/optim/elemwise/optimization.rs b/crates/burn-cubecl-fusion/src/optim/elemwise/optimization.rs
+index 7df5c928b..26b1ed160 100644
+--- a/crates/burn-cubecl-fusion/src/optim/elemwise/optimization.rs
++++ b/crates/burn-cubecl-fusion/src/optim/elemwise/optimization.rs
+@@ -155,8 +155,44 @@ impl<R: Runtime> FusedOperation<R> for ElemwiseOptimization<R> {
+     fn run(
+         &mut self,
+         context: &mut Context<CubeFusionHandle<R>>,
+-        _fallback: &dyn Fn(usize) -> Box<dyn FallbackOperation<R>>,
++        fallback: &dyn Fn(usize) -> Box<dyn FallbackOperation<R>>,
+     ) {
++        // A cached plan's trace embeds relative shape ids from the converter
++        // state it was built under. After a queue drain + renumber, a replanned
++        // (but content-matching) segment may resolve those ids against a
++        // converter that no longer has them — the fused launch would panic
++        // (output.rs shape-map miss). Validate up front: if any block's
++        // reference shape dim is unresolvable, execute the ops unfused instead
++        // of panicking. This keeps replay correct even when a plan re-fires on
++        // a stale position.
++        for block in self.trace.blocks.iter() {
++            for dim in block.shape_ref.iter() {
++                if !context.shapes_relative2global.contains_key(dim) {
++                    if std::env::var("BURN_FUSION_TRACE_FB").is_ok() {
++                        static FB: std::sync::atomic::AtomicU64 =
++                            std::sync::atomic::AtomicU64::new(0);
++                        let n = FB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                        eprintln!(
++                            "[fb-trace] elemwise fallback #{n} (len={}, dims={:?}, map={:?})",
++                            self.len,
++                            block.shape_ref.iter().collect::<Vec<_>>(),
++                            context.shapes_relative2global.keys().collect::<Vec<_>>()
++                        );
++                    }
++                    // The plan's embedded ids no longer resolve — it will keep
++                    // re-firing on every content-match. Tell the processor to
++                    // drop cached plans so the next occurrence re-explores
++                    // against the current numbering (and fuses correctly).
++                    burn_fusion::mark_stale_plan();
++                    // Execute each of the plan's ops unfused (fallback(i) runs
++                    // the i-th op via the plan's ordering).
++                    for i in 0..self.len {
++                        fallback(i).run(context);
++                    }
++                    return;
++                }
++            }
++        }
+         Self::execute(self, context)
+     }
+ 
+diff --git a/crates/burn-fusion/src/lib.rs b/crates/burn-fusion/src/lib.rs
+index 404c9cbff..bb8ef993c 100644
+--- a/crates/burn-fusion/src/lib.rs
++++ b/crates/burn-fusion/src/lib.rs
+@@ -28,6 +28,24 @@ mod tensor;
+ #[cfg(feature = "test-util")]
+ pub mod inspect;
+ 
++use std::sync::atomic::{AtomicBool, Ordering};
++
++static STALE_PLAN: AtomicBool = AtomicBool::new(false);
++
++/// Set when a fused optimization detects that its cached trace is stale under
++/// the current relative numbering (see `burn-cubecl-fusion`'s
++/// `ElemwiseOptimization::run` fallback path). The stream processor checks this
++/// after each plan execution and drops all cached plans so the next occurrence
++/// re-explores against the current numbering instead of replaying the stale one.
++pub fn mark_stale_plan() {
++    STALE_PLAN.store(true, Ordering::Relaxed);
++}
++
++/// Returns and clears the stale-plan flag.
++pub fn take_stale_plan() -> bool {
++    STALE_PLAN.swap(false, Ordering::Relaxed)
++}
++
+ pub use op::UnfusedOp;
+ pub(crate) use server::*;
+ 
+diff --git a/crates/burn-fusion/src/stream/execution/policy.rs b/crates/burn-fusion/src/stream/execution/policy.rs
+index 14c21b877..d95d7d5a4 100644
+--- a/crates/burn-fusion/src/stream/execution/policy.rs
++++ b/crates/burn-fusion/src/stream/execution/policy.rs
+@@ -82,7 +82,31 @@ impl<O: core::fmt::Debug> Policy<O> {
+         }
+ 
+         if let Some((id, _length)) = self.found {
+-            return Action::Execute(id);
++            // A stored plan's optimization is POSITIONAL: its ordering and fused
++            // blocks were built for a specific segment span. Triggers re-fire on
++            // every matching prefix, so a plan can be re-executed against a queue
++            // that has since drained/renumbered or grown — replaying consumed ops
++            // with stale relative dims (fused launch crash, output.rs shape-map
++            // miss). Only replay when the current segment EXACTLY matches the
++            // plan's span: its own ops plus the longest OnOperations trigger.
++            let plan = store.get_unchecked(id);
++            let span = plan.operations.len()
++                + plan
++                    .triggers
++                    .iter()
++                    .filter_map(|t| match t {
++                        ExecutionTrigger::OnOperations(ops) => Some(ops.len()),
++                        _ => None,
++                    })
++                    .max()
++                    .unwrap_or(0);
++            let replayable = span == operations.len()
++                && plan.operations == operations[..plan.operations.len()];
++            if replayable {
++                return Action::Execute(id);
++            }
++            // Stale or oversized segment: fall through to re-exploration against
++            // the current ops.
+         }
+ 
+         match mode {
+@@ -245,14 +269,19 @@ impl<O: core::fmt::Debug> Policy<O> {
+     fn action_sync(&self, operations: &[OperationIr], store: &ExecutionPlanStore<O>) -> Action {
+         for available in self.availables.iter() {
+             if available.size == operations.len() {
+-                return Action::Execute(available.id);
++                let item = store.get_unchecked(available.id);
++                if item.operations == operations[..item.operations.len()] {
++                    return Action::Execute(available.id);
++                }
+             }
+         }
+ 
+         for candidate in self.candidates.iter() {
+             let item = store.get_unchecked(candidate.id);
+ 
+-            if item.operations.len() == operations.len() {
++            if item.operations.len() == operations.len()
++                && item.operations == operations[..item.operations.len()]
++            {
+                 return Action::Execute(candidate.id);
+             }
+         }
+diff --git a/crates/burn-fusion/src/stream/execution/processor.rs b/crates/burn-fusion/src/stream/execution/processor.rs
+index ef36f3fb7..8ef5a7ed4 100644
+--- a/crates/burn-fusion/src/stream/execution/processor.rs
++++ b/crates/burn-fusion/src/stream/execution/processor.rs
+@@ -144,9 +144,26 @@ impl<O: NumOperations> Processor<O> {
+     }
+ 
+     fn reset(&mut self, store: &mut ExecutionPlanStore<O>, operations: &[OperationIr]) {
++        // A fused optimization detected a stale (unnumberable) plan during the
++        // execution that just finished. Drop the whole cache so the next
++        // occurrence re-explores against the current numbering — otherwise the
++        // stale plan keeps re-firing and falling back on every frame.
++        if crate::take_stale_plan() {
++            store.clear();
++        }
+         self.explorer.reset(operations);
+         self.policy.reset();
+ 
++        // EXPERIMENT (Q4K-REVIEW): the queue renumbers its relative ids after every
++        // drain, and cached plans embed ids from the pre-drain numbering. Replaying
++        // a stale plan crashes the fused launch (output.rs shape map miss). Until the
++        // cache is keyed by numbering epoch, drop all plans here so each execution
++        // re-explores against the current numbering. Kept behind an env so the
++        // upstream behavior stays reachable for comparison.
++        if std::env::var("BURN_FUSION_NO_CACHE").is_ok() {
++            store.clear();
++        }
++
+         // Reset the policy state with the remaining operations
+         for operation in operations.iter() {
+             self.policy.update(store, operation);
+@@ -193,6 +210,14 @@ impl<O: NumOperations> Processor<O> {
+                 match policy.action(store, relative, ExecutionMode::Sync) {
+                     Action::Execute(id) => {
+                         store.add_trigger(id, trigger);
++                        // The matching plan's OPTIMIZATION embeds relative ids from
++                        // the converter state it was built under. After a queue
++                        // drain + renumber the stored blocks can reference dims
++                        // that no longer resolve (output.rs shape-map miss), even
++                        // though the plan's relative op list still compares equal.
++                        // Always keep the freshly-explored optimization — its
++                        // blocks were built against the CURRENT numbering.
++                        store.get_mut_unchecked(id).optimization = optimization;
+                         id
+                     }
+                     _ => {
+@@ -208,6 +233,7 @@ impl<O: NumOperations> Processor<O> {
+             ExecutionMode::Sync => match policy.action(store, relative, ExecutionMode::Sync) {
+                 Action::Execute(id) => {
+                     store.add_trigger(id, ExecutionTrigger::OnSync);
++                    store.get_mut_unchecked(id).optimization = optimization;
+                     id
+                 }
+                 _ => {
+diff --git a/crates/burn-fusion/src/stream/store/base.rs b/crates/burn-fusion/src/stream/store/base.rs
+index 7de03083a..1512c2567 100644
+--- a/crates/burn-fusion/src/stream/store/base.rs
++++ b/crates/burn-fusion/src/stream/store/base.rs
+@@ -62,6 +62,16 @@ impl<O: core::fmt::Debug> ExecutionPlanStore<O> {
+         self.index.find(query)
+     }
+ 
++    /// Drop every cached plan. Must be called when the queue's relative numbering
++    /// is rebuilt (`reset_relative`): cached plans embed relative shape/tensor ids
++    /// that are only valid for the numbering they were built under, and replaying
++    /// them against a renumbered queue crashes the fused-kernel launch
++    /// (stale dim id missing from `shapes_relative2global`).
++    pub fn clear(&mut self) {
++        self.plans.clear();
++        self.index = ExecutionPlanIndex::default();
++    }
++
+     pub fn add(&mut self, exploration: ExecutionPlan<O>) -> ExecutionPlanId {
+         if exploration.operations.is_empty() {
+             panic!("Can't add an empty optimization.");
