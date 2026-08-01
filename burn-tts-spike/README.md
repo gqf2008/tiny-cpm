@@ -258,6 +258,45 @@ CARGO_TARGET_DIR=../target-shared cargo build --release --features fusion
 真实生成）；"性能逆天"的对外说法应撤回，改为"方向已验证 + 潜力可复现测量
 （`--bench-gen`）+ 引擎 bug 阻塞交付"。
 
+### Phase 7 — fusion 缓存重放崩溃的修复（2026-08-01,评审期实测）
+
+**症状回顾**（Phase 6）：`--features fusion` 下真实生成必崩
+（`output.rs:207` 相对 shape id 缺失 → panic → `mem::swap` 队列损坏 →
+`ordering.rs:49` 连锁 → OOM SIGKILL）。根因：plan store 全局共享，但每个 plan
+内嵌的 relative id 是构建时 converter 的编号；每次块执行后队列
+`reset_relative()` 重编号，旧 plan 重放时编号失效。
+
+**修复（burn fork 本地 patch，5 文件）**：
+- **核心**：`ElemwiseOptimization::run` 在 fused launch 前校验所有 block 的
+  `shape_ref` dims 能否在当前 context 的 `shapes_relative2global` 解析；
+  **不可解析 → 走引擎预留的 unfused fallback 逐个执行，而不是 panic**。
+- 配套：`Policy::action` found 路径精确跨度校验（plan ops + trigger ops == 当前
+  segment）、`action_sync` 全 op 校验（原来只查长度）、探索复用时用新 optimization
+  覆盖旧 plan、`ExecutionPlanStore::clear()`（供 `BURN_FUSION_NO_CACHE` 门控）。
+
+**实测（同机夹逼，M4，`--max-frames 20` greedy，真实生成含每帧 readback）**：
+
+| 构建 | gen ms/帧 | RTF |
+|---|---|---|
+| 非融合 f16（负载 6.2 / 3.6 两轮） | 100.5 / 97.5 | 2.27 / 2.23 |
+| **融合 + 修复（负载 4.4）** | **94.0** | **2.15** |
+
+- 零崩溃、零 shader 失败；codes 首 8 帧与非融合 greedy 逐位一致；跨运行确定。
+- fallback 频率 ~1.4 次/帧，**始终是同一个过期 plan**（apply_rope，shape_ref
+  `[0,1,6,2]` 缺 dim 6），其余块全部正常 fused。
+- 6 帧内 **49562 次 plan 缓存命中 / 249 次探索** —— 融合覆盖巨大，净收益 ~5%
+  （省掉的 launch 开销被融合自身的 per-op 簿记部分对冲）。
+- **校准：8.7×（12.6ms/帧）依然不可复现**。融合收益真实但有限（~5%），远达不到
+  作者原声称的量级；该数字依赖未保存的本地 burn patch。
+
+**新坑（续 Phase 6）**：
+21. **融合 kernel 的 shape 引用必须做执行期校验**：plan 的 relative shape id 在
+    重放时可能失效（队列重编号）。校验失败要**回退 unfused 执行**（用引擎的
+    `fallback` 钩子，`fallback(i)` 逐个执行第 i 个 op），而不是 panic——fallback
+    钩子就是为这个设计的，elemwise 原实现没用它。
+22. `fallback(i)` 的 `i` 是 plan 内 op 序号（0..len），不是 segment 位置；
+    传 `self.len` 当单个调用会越界（ordering `[0,1,2]` 下标 3 → OOB）。
+
 ## 文件结构（镜像 candle 侧）
 
 - `src/config.rs` — serde config（只留用到的字段）+ `Qwen3TTSGenerationConfig` Default。
