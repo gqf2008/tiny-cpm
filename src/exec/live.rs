@@ -10,7 +10,7 @@
 //!   (`--ref-text` ignored). Needs the `<codec-dir>` positional.
 //!
 //! Usage:
-//!     tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> \
+//!     tiny-cpm live <vad-dir> <qwen3asr-dir> <bf16-dir> \
 //!         <tokenizer.json> <tts-model-dir> [<codec-dir: MOSS only>] \
 //!         [--tts moss|qwen3] [--ref <wav> [--ref-text "<text>"]] \
 //!         [--input <wav>] [--output <wav>] [--max-tokens N]
@@ -388,7 +388,7 @@ impl LiveTts {
 }
 
 pub fn run(args: &[String]) -> Result<()> {
-    let usage = "usage: tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <tts-model-dir> [<codec-dir: MOSS only>] [--tts moss|qwen3 (default qwen3)] [--talker-quant q4_k|q8_0|none (default q4_k)] [--ref <wav> [--ref-text \"<text>\"]] [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in] [--vad-speech-threshold <f>] [--vad-min-speech-frame <n>] [--vad-min-silence <n>] [--vad-min-speach-ratio <f>] [--vad-min-speach-frames <n>] [--vad-end-silence-ratio <f>] [--vad-look-back-frames <n>] [--min-segment-samples <n>] [--min-seg-peak <f>] [--barge-onset-frames <n>] [--min-barge-rms <f>] [--mic-gain <f>]";
+    let usage = "usage: tiny-cpm live <vad-dir> <qwen3asr-dir> <bf16-dir> <tokenizer.json> <tts-model-dir> [<codec-dir: MOSS only>] [--tts moss|qwen3 (default qwen3)] [--talker-quant q4_k|q8_0|none (default q4_k)] [--ref <wav> [--ref-text \"<text>\"]] [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in] [--vad-speech-threshold <f>] [--vad-min-speech-frame <n>] [--vad-min-silence <n>] [--vad-min-speach-ratio <f>] [--vad-min-speach-frames <n>] [--vad-end-silence-ratio <f>] [--vad-look-back-frames <n>] [--min-segment-samples <n>] [--min-seg-peak <f>] [--barge-onset-frames <n>] [--min-barge-rms <f>] [--mic-gain <f>]";
     // Positionals end at the first `--flag`; MOSS needs 6 (its codec is a separate
     // dir), Qwen3 needs 5 (its codec is bundled under <model-dir>/speech_tokenizer).
     let flag_start = args

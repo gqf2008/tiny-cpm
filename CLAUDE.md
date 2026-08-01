@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `tiny-cpm` is a single-binary Rust CLI for **on-device inference on Apple Metal** (macOS / Apple Silicon only), built on the **official `candle` 0.11** crate. One binary, six models, six subcommands:
 
-- `chat` — MiniCPM5-1B reasoning LLM, quantized GGUF Q8_0 (~57 tok/s on Metal) via a vendored `quantized_minicpm5` module.
+- `chat` — MiniCPM5-1B reasoning LLM, bf16 safetensors dir quantized in memory (default Q8_0, ~57 tok/s on Metal) via a vendored `quantized_minicpm5` module (GGUF not supported).
 - `asr funasr` / `asr qwen3` — Fun-ASR-Nano-2512 and Qwen3-ASR speech recognition.
 - `tts voxcpm` / `tts moss` — VoxCPM2 and MOSS-TTS-Nano (+ MOSS-Audio-Tokenizer-Nano codec) speech synthesis, with `--ref` voice cloning.
 - `tts cosyvoice3` — Fun-CosyVoice3-0.5B (Qwen2-0.5B LM + DiT-CFM + HiFT, 24kHz; ported from CrispASR C++/ggml). 8 baked voices (`--voice`), zero-shot cloning (`--ref` + `--ref-text`, required). Prefers `cosyvoice3-llm-q4_k.gguf` (QMatMul) / `cosyvoice3-flow-q8_0.gguf` (F16) over `llm.pt`/`flow.pt` when present. `--stream` = chunked streaming (first audio ~1.1 s warm (default first-chunk: hop 12, 3 steps, no CFG; upstream schedule after; env knobs CV3_FIRST_HOP/CV3_FIRST_STEPS/CV3_FIRST_CFG)).
@@ -22,13 +22,13 @@ The four speech models are **ported from [`aha`](https://github.com/jhqxxx/aha)*
 ## Commands
 
 ```bash
-cargo run --release -- chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens] [--quant <name>]
+cargo run --release -- chat <bf16-dir> <tokenizer.json> "<prompt>" [max_tokens] [--quant <name>]
 cargo run --release -- asr funasr <model-dir> <audio-file> [max_tokens]
 cargo run --release -- asr qwen3  <model-dir> <audio-file> [max_tokens]
 cargo run --release -- tts voxcpm <model-dir> "<text>" <out.wav> [--ref ref.wav] [--max-len N]
 cargo run --release -- tts moss   <model-dir> "<text>" <out.wav> [--codec dir] [--ref ref.wav] [--max-len N]
 cargo run --release -- tts qwen3  <model-dir> "<text>" <out.wav> [--ref ref.wav --ref-text "<text>"] [--language <lang>] [--max-frames N] [--talker-quant q4_k|q8_0|none] [--stream]
-cargo run --release -- dialogue <funasr-dir> <minicpm5.gguf|bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
+cargo run --release -- dialogue <funasr-dir> <bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
 
 cargo build --release
 cargo check
@@ -52,8 +52,8 @@ Model weights are not in the repo — download into `./models/` (gitignored). MO
 
 ## Non-obvious things that bite
 
-- **`from_gguf` vs `from_safetensors_dir`** (chat): `.gguf` → pre-quantized fast load; a directory → bf16 safetensors quantized in memory at load (default Q8_0; `--quant <name>` or `TINY_CPM_QUANT` to override: q8_0/q4_0/q4_1/q5_0/q5_1/q4_k/q5_k/q6_k/q3_k/q2_k/f16/f32). **`quantize_onto` needs a CPU source** — mmap on CPU, then quantize onto Metal.
-- **Why vendored `quantized_minicpm5`**: upstream `quantized_llama` hardcodes `head_dim = hidden/heads` (96 for MiniCPM5); MiniCPM5 has `head_dim=128`, `16*128=2048 ≠ 1536`. Patches: read `head_dim` from GGUF metadata / config.json; reshape attention output to `n_head*head_dim` before o_proj; always use NEOX (non-interleaved / half-split) RoPE — real MiniCPM5-1B GGUFs report arch `"llama"`, which would select the wrong (NORM) convention; the loader prints the arch at load for diagnostics.
+- **`from_safetensors_dir`** (chat): bf16 safetensors quantized in memory at load (default Q8_0; `--quant <name>` or `TINY_CPM_QUANT` to override: q8_0/q4_0/q4_1/q5_0/q5_1/q4_k/q5_k/q6_k/q3_k/q2_k/f16/f32). GGUF files are not supported. **`quantize_onto` needs a CPU source** — mmap on CPU, then quantize onto Metal.
+- **Why vendored `quantized_minicpm5`**: upstream `quantized_llama` hardcodes `head_dim = hidden/heads` (96 for MiniCPM5); MiniCPM5 has `head_dim=128`, `16*128=2048 ≠ 1536`. Patches: read `head_dim` from `config.json`; reshape attention output to `n_head*head_dim` before o_proj; always use NEOX (non-interleaved / half-split) RoPE, matching the HF `LlamaForCausalLM` reference (`rotate_half`). GGUF files are not supported.
 - **Greedy (`ArgMax`) loops forever** on MiniCPM5 — `chat` uses `TopP { p: 0.9, temperature: 0.7 }`, seed `299792458`, EOS `[1, 130073]`.
 - **Weight formats differ per model**: Fun-ASR = `.pt` pickles + bundled `Qwen3-0.6B/` subdir; Qwen3-ASR = mmaped safetensors (bf16); VoxCPM2 = safetensors LM + `.pth` AudioVAE (F32); MOSS = `.bin` pickles (loaded at **F32** — F16 visibly degraded quality vs the official F32 Python reference) + safetensors codec + sentencepiece `tokenizer.model`.
 - **MOSS**: `--codec` defaults to `<model-dir>/../MOSS-Audio-Tokenizer-Nano`; `--max-len` default 100 frames (~8 s at 12.5 fps — the codec's true rate); output WAV is stereo.

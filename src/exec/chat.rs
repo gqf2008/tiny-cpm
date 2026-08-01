@@ -1,19 +1,18 @@
-//! MiniCPM5-1B chat: accepts a pre-quantized `.gguf` (Q8_0) or a bf16
-//! safetensors directory (auto-quantized in-memory, default Q8_0; override
-//! with `TINY_CPM_QUANT` or `--quant <name>`). Streams tokens to stdout as
-//! they generate.
+//! MiniCPM5-1B chat: loads a bf16 safetensors directory, auto-quantized
+//! in-memory (default Q8_0; override with `TINY_CPM_QUANT` or
+//! `--quant <name>`). GGUF files are not supported. Streams tokens to stdout
+//! as they generate.
 //!
 //! Uses a vendored, patched `quantized_minicpm5` module — `quantized_llama`
 //! with fixes for MiniCPM5's non-standard head_dim (128 != hidden/heads = 96)
 //! and its NEOX (non-interleaved) RoPE convention.
 //!
 //! Usage:
-//!     tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens] [--quant <name>]
+//!     tiny-cpm chat <bf16-dir> <tokenizer.json> "<prompt>" [max_tokens] [--quant <name>]
 
 use crate::quantized_minicpm5::ModelWeights;
 use crate::token_output_stream::TokenOutputStream;
 use anyhow::Result;
-use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use std::io::Write;
@@ -32,41 +31,43 @@ pub struct ChatGenStats {
     pub decode: std::time::Duration,
 }
 
-/// Load MiniCPM5 from a `.gguf` file or a bf16 safetensors directory
-/// (auto-quantized in-memory) onto `device`. Quant level comes from
-/// `TINY_CPM_QUANT` (default Q8_0). See [`load_model_with_quant`].
+/// Load MiniCPM5 from a bf16 safetensors directory (auto-quantized
+/// in-memory) onto `device`. Quant level comes from `TINY_CPM_QUANT` (default
+/// Q8_0). See [`load_model_with_quant`].
 pub fn load_model(model_path: &str, device: &Device) -> Result<ModelWeights> {
     load_model_with_quant(model_path, None, device)
 }
 
 /// `load_model` with an explicit quant level (`quant_name`: e.g. "q4_k_m",
-/// "q8_0"). Priority: `quant_name` > `TINY_CPM_QUANT` env > Q8_0. A `.gguf`
-/// path ignores the quant level (the file is already quantized).
+/// "q8_0"). Priority: `quant_name` > `TINY_CPM_QUANT` env > Q8_0.
+///
+/// GGUF files are not supported: pass the bf16 safetensors directory and let
+/// the loader quantize in memory (candle's `QTensor::quantize_onto` requires a
+/// CPU source, so the safetensors are mmapped on CPU first).
 pub fn load_model_with_quant(
     model_path: &str,
     quant_name: Option<&str>,
     device: &Device,
 ) -> Result<ModelWeights> {
-    let model = if model_path.ends_with(".gguf") {
-        let mut file = std::fs::File::open(model_path)?;
-        let content =
-            gguf_file::Content::read(&mut file).map_err(|e| anyhow::anyhow!("gguf: {e:?}"))?;
-        ModelWeights::from_gguf(content, &mut file, device)?
-    } else {
-        // Runtime quantization of the bf16 safetensors. Default Q8_0; override
-        // via `quant_name` or TINY_CPM_QUANT (q8_0, q4_k_m, q5_k_m, q6_k, ...).
-        // K-quants map to candle's `GgmlDType::QnK` block formats.
-        let dtype = match quant_name {
-            Some(q) => parse_quant_source(Some(q), "--quant"),
-            None => parse_quant_source(
-                std::env::var("TINY_CPM_QUANT").ok().as_deref(),
-                "TINY_CPM_QUANT",
-            ),
-        };
-        eprintln!("quantizing bf16 safetensors in {model_path} to {dtype:?} in-memory...");
-        ModelWeights::from_safetensors_dir(model_path, dtype, device)?
+    if model_path.ends_with(".gguf") {
+        anyhow::bail!(
+            "GGUF files are no longer supported: {model_path} — pass the bf16 safetensors directory (auto-quantized in memory, see --quant)"
+        );
+    }
+    // Runtime quantization of the bf16 safetensors. Default Q8_0; override
+    // via `quant_name` or TINY_CPM_QUANT (q8_0, q4_k_m, q5_k_m, q6_k, ...).
+    // K-quants map to candle's `GgmlDType::QnK` block formats.
+    let dtype = match quant_name {
+        Some(q) => parse_quant_source(Some(q), "--quant"),
+        None => parse_quant_source(
+            std::env::var("TINY_CPM_QUANT").ok().as_deref(),
+            "TINY_CPM_QUANT",
+        ),
     };
-    Ok(model)
+    eprintln!("quantizing bf16 safetensors in {model_path} to {dtype:?} in-memory...");
+    Ok(ModelWeights::from_safetensors_dir(
+        model_path, dtype, device,
+    )?)
 }
 
 /// Map a quant name to a `GgmlDType` (default Q8_0), reporting the value as
@@ -363,7 +364,7 @@ fn is_repeating(text: &str) -> bool {
 
 pub fn run(args: &[String]) -> Result<()> {
     // `--quant <name>` / `--quant=<name>` may appear anywhere in args;
-    // everything else is a positional: <model.gguf | bf16-dir> <tokenizer.json>
+    // everything else is a positional: <bf16-dir> <tokenizer.json>
     // <prompt> [max_tokens].
     let mut quant: Option<String> = None;
     let mut positional: Vec<&str> = Vec::new();
@@ -384,7 +385,7 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     if positional.len() < 3 {
         eprintln!(
-            "usage: tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> <prompt> [max_tokens] [--quant <name>]"
+            "usage: tiny-cpm chat <bf16-dir> <tokenizer.json> <prompt> [max_tokens] [--quant <name>]"
         );
         std::process::exit(1);
     }
@@ -404,10 +405,6 @@ pub fn run(args: &[String]) -> Result<()> {
         })?,
         None => 512,
     };
-    if quant.is_some() && model_path.ends_with(".gguf") {
-        eprintln!("warning: --quant is ignored for .gguf files (the file is already quantized)");
-    }
-
     let t_load = std::time::Instant::now();
     let device = Device::new_metal(0)?;
     let mut model = load_model_with_quant(model_path, quant.as_deref(), &device)?;

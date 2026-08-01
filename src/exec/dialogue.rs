@@ -3,7 +3,7 @@
 //! single Metal device and stay resident for the whole run.
 //!
 //! Usage:
-//!     tiny-cpm dialogue <funasr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> \
+//!     tiny-cpm dialogue <funasr-dir> <bf16-dir> <tokenizer.json> \
 //!         <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
 //!
 //! `max_tokens` caps the LLM reply (default 256). stdout carries only the
@@ -33,7 +33,7 @@ const DEFAULT_MAX_TOKENS: usize = 256;
 const MOSS_MAX_FRAMES: usize = 300;
 
 pub fn run(args: &[String]) -> Result<()> {
-    let usage = "usage: tiny-cpm dialogue <funasr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]";
+    let usage = "usage: tiny-cpm dialogue <funasr-dir> <bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]";
     if args.len() < 7 {
         bail!(usage);
     }

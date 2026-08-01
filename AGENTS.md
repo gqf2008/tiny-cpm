@@ -6,7 +6,7 @@ Guidance for AI coding agents working on this repository. Assumes no prior knowl
 
 `tiny-cpm` is a single-binary Rust CLI for **on-device inference on Apple Metal** (macOS / Apple Silicon only), built on the official [`candle`](https://github.com/huggingface/candle) crate (0.11, from crates.io). One binary, six models, six subcommands:
 
-- `chat` — [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B) reasoning LLM, **quantized (GGUF Q8_0)** via a vendored, minimally patched `quantized_minicpm5` module. ~57–59 tok/s decode on Metal.
+- `chat` — [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B) reasoning LLM, **quantized in memory from a bf16 safetensors dir (default Q8_0)** via a vendored, minimally patched `quantized_minicpm5` module (GGUF files are not supported). ~57–59 tok/s decode on Metal.
 - `asr funasr` — Fun-ASR-Nano-2512 (SANM encoder + adaptor + Qwen3-0.6B decoder; `.pt` pickle weights).
 - `asr qwen3` — Qwen3-ASR-0.6B/1.7B (Whisper-style audio encoder + Qwen3 decoder; safetensors bf16).
 - `tts voxcpm` — VoxCPM2 (MiniCPM4 LM + residual LM + locDiT flow matching + AudioVAE; safetensors + `.pth` VAE). Voice cloning via `--ref`.
@@ -39,15 +39,15 @@ xcodebuild -downloadComponent MetalToolchain   # one-time
 ## Build, run, and test commands
 
 ```bash
-cargo run --release -- chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens] [--quant <name>]
+cargo run --release -- chat <bf16-dir> <tokenizer.json> "<prompt>" [max_tokens] [--quant <name>]
 cargo run --release -- asr funasr <model-dir> <audio-file> [max_tokens]
 cargo run --release -- asr qwen3  <model-dir> <audio-file> [max_tokens]
 cargo run --release -- tts voxcpm <model-dir> "<text>" <out.wav> [--ref ref.wav] [--max-len N]
 cargo run --release -- tts moss   <model-dir> "<text>" <out.wav> [--codec dir] [--ref ref.wav] [--max-len N]
 cargo run --release -- tts cosyvoice3 <model-dir> "<text>" <out.wav> [--voice name] [--ref ref.wav --ref-text "<text>"] [--steps 6] [--stream]
 cargo run --release -- tts qwen3 <model-dir> "<text>" <out.wav> [--ref ref.wav --ref-text "<text>"] [--language <lang>] [--max-frames N] [--talker-quant q4_k|q8_0|none] [--stream]
-cargo run --release -- dialogue <funasr-dir> <minicpm5.gguf|bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
-cargo run --release -- live <vad-dir> <qwen3asr-dir> <minicpm5.gguf|bf16-dir> <tokenizer.json> <tts-model-dir> [<codec-dir: MOSS only>] [--tts moss|qwen3] [--ref <wav> [--ref-text "<text>"]] [--input <wav>] [--output <wav>] [--max-tokens N]
+cargo run --release -- dialogue <funasr-dir> <bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
+cargo run --release -- live <vad-dir> <qwen3asr-dir> <bf16-dir> <tokenizer.json> <tts-model-dir> [<codec-dir: MOSS only>] [--tts moss|qwen3] [--ref <wav> [--ref-text "<text>"]] [--input <wav>] [--output <wav>] [--max-tokens N]
 cargo run --release -- vad <model-dir> <audio-file>
 
 cargo build --release
@@ -69,7 +69,7 @@ cargo test    # CPU-only unit tests
 
 ### The three MiniCPM5 patches (why `quantized_minicpm5` is vendored)
 
-Upstream `quantized_llama` assumes `head_dim == hidden_size / num_heads` and `num_heads * head_dim == hidden_size`. MiniCPM5: `head_dim = 128`, `hidden = 1536`, `heads = 16` → `16*128 = 2048 ≠ 1536`. The vendored module (1) reads `head_dim` from GGUF `llama.rope.dimension_count` / `config.json`, (2) reshapes attention output to `num_heads * head_dim` before the output projection (2048 → 1536), (3) always uses NEOX (non-interleaved / half-split) RoPE — real MiniCPM5-1B GGUFs declare `general.architecture = "llama"`, but the HF `LlamaForCausalLM` reference uses `rotate_half` (NEOX), so the arch string would select the wrong convention; the loader hardcodes NEOX and prints the arch at load for diagnostics. The bf16 loader (`from_safetensors_dir` → `from_vb`) shares the same RoPE; its quant level defaults to Q8_0 (`--quant <name>` / `TINY_CPM_QUANT`).
+Upstream `quantized_llama` assumes `head_dim == hidden_size / num_heads` and `num_heads * head_dim == hidden_size`. MiniCPM5: `head_dim = 128`, `hidden = 1536`, `heads = 16` → `16*128 = 2048 ≠ 1536`. The vendored module (1) reads `head_dim` from `config.json`, (2) reshapes attention output to `num_heads * head_dim` before the output projection (2048 → 1536), (3) always uses NEOX (non-interleaved / half-split) RoPE, matching the HF `LlamaForCausalLM` reference (`rotate_half`). GGUF files are not supported: the bf16 loader (`from_safetensors_dir` → `from_vb`) shares the same RoPE and quantizes in memory (default Q8_0; `--quant <name>` / `TINY_CPM_QUANT`).
 
 ## Testing strategy
 

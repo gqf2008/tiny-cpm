@@ -9,13 +9,13 @@
 //!   live   realtime voice dialogue: mic -> VAD -> Qwen3-ASR -> MiniCPM5 -> TTS (moss|qwen3) -> speaker
 //!
 //! Usage:
-//!     tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens] [--quant <name>]
+//!     tiny-cpm chat <bf16-dir> <tokenizer.json> "<prompt>" [max_tokens] [--quant <name>]
 //!     tiny-cpm asr <funasr|qwen3> <model-dir> <audio-file> [max_tokens]
 //!     tiny-cpm tts <voxcpm|moss> <model-dir> "<text>" <out.wav> [--codec <codec-dir>] [--ref <ref.wav>] [--max-len N]
 //!     tiny-cpm tts cosyvoice3 <model-dir> "<text>" <out.wav> [--voice <name>] [--ref <ref.wav> --ref-text "<text>"] [--steps N] [--max-tokens N]
 //!     tiny-cpm vad <model-dir> <audio-file>
-//!     tiny-cpm dialogue <funasr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
-//!     tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <tts-model-dir> [<codec-dir: MOSS only>] [--tts moss|qwen3] [--ref <wav> [--ref-text "<text>"]] [--input <wav>] [--output <wav>] [--max-tokens N]
+//!     tiny-cpm dialogue <funasr-dir> <bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
+//!     tiny-cpm live <vad-dir> <qwen3asr-dir> <bf16-dir> <tokenizer.json> <tts-model-dir> [<codec-dir: MOSS only>] [--tts moss|qwen3] [--ref <wav> [--ref-text "<text>"]] [--input <wav>] [--output <wav>] [--max-tokens N]
 
 use tiny_cpm::{
     common, exec, models, position_embed, quantized_minicpm5, token_output_stream, tokenizer, utils,
@@ -59,7 +59,7 @@ fn main() -> Result<()> {
 
 fn usage() {
     eprintln!("usage:");
-    eprintln!("  tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> \"<prompt>\" [max_tokens]");
+    eprintln!("  tiny-cpm chat <bf16-dir> <tokenizer.json> \"<prompt>\" [max_tokens]");
     eprintln!("  tiny-cpm asr <funasr|qwen3> <model-dir> <audio-file> [max_tokens]");
     eprintln!(
         "  tiny-cpm tts <voxcpm|moss> <model-dir> \"<text>\" <out.wav> [--codec <codec-dir>] [--ref <ref.wav>] [--max-len N]"
@@ -69,9 +69,9 @@ fn usage() {
     );
     eprintln!("  tiny-cpm vad <model-dir> <audio-file>");
     eprintln!(
-        "  tiny-cpm dialogue <funasr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]"
+        "  tiny-cpm dialogue <funasr-dir> <bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]"
     );
     eprintln!(
-        "  tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <tts-model-dir> [<codec-dir: MOSS only>] [--tts moss|qwen3] [--ref <wav> [--ref-text \"<text>\"]] [--input <wav>] [--output <wav>] [--max-tokens N]"
+        "  tiny-cpm live <vad-dir> <qwen3asr-dir> <bf16-dir> <tokenizer.json> <tts-model-dir> [<codec-dir: MOSS only>] [--tts moss|qwen3] [--ref <wav> [--ref-text \"<text>\"]] [--input <wav>] [--output <wav>] [--max-tokens N]"
     );
 }

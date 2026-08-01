@@ -6,7 +6,7 @@ A single-binary Rust CLI built on the official [`candle`](https://github.com/hug
 
 | subcommand | model | task | weights |
 |------------|-------|------|---------|
-| `chat` | [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B) | reasoning LLM | GGUF (Q8_0 quantized) or bf16 safetensors dir |
+| `chat` | [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B) | reasoning LLM | bf16 safetensors dir (in-memory quant, default Q8_0) |
 | `asr funasr` | [Fun-ASR-Nano-2512](https://modelscope.cn/models/FunAudioLLM/Fun-ASR-Nano-2512) | speech recognition | `.pt` pickles + bundled Qwen3-0.6B |
 | `asr qwen3` | [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) / 1.7B | speech recognition | safetensors (bf16) |
 | `tts voxcpm` | [VoxCPM2](https://huggingface.co/OpenBMB/VoxCPM2) | TTS + voice cloning | safetensors (bf16) + `.pth` AudioVAE |
@@ -42,9 +42,11 @@ hf download OpenBMB/VoxCPM2 --local-dir models/VoxCPM2
 ## Build and run
 
 ```bash
-# MiniCPM5-1B chat — GGUF (fast load) or bf16 safetensors dir (quantized in memory: default Q8_0; override with `TINY_CPM_QUANT` or `--quant <name>` — q8_0, q4_0, q4_1, q5_0, q5_1, q4_k, q5_k, q6_k, q3_k, q2_k, f16, f32)
-cargo run --release -- chat ./models/MiniCPM5-1B-Q8_0.gguf ./models/tokenizer.json "What is AI?" 512
-# bf16 dir, custom in-memory quant level (default Q8_0):
+# MiniCPM5-1B chat — bf16 safetensors dir, quantized in memory (default Q8_0;
+# override with `TINY_CPM_QUANT` or `--quant <name>` — q8_0, q4_0, q4_1, q5_0,
+# q5_1, q4_k, q5_k, q6_k, q3_k, q2_k, f16, f32). GGUF files are not supported.
+cargo run --release -- chat ./models/MiniCPM5-1B ./models/tokenizer.json "What is AI?" 512
+# custom in-memory quant level:
 cargo run --release -- chat ./models/MiniCPM5-1B ./models/tokenizer.json "What is AI?" 512 --quant q4_k
 
 # ASR — transcript goes to stdout
@@ -60,12 +62,12 @@ cargo run --release -- tts cosyvoice3 ./models/Fun-CosyVoice3-0.5B-2512 "你好�
 Full CLI contract (parsed in `src/main.rs`):
 
 ```
-tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens] [--quant <name>]
+tiny-cpm chat <bf16-dir> <tokenizer.json> "<prompt>" [max_tokens] [--quant <name>]
 tiny-cpm asr <funasr|qwen3> <model-dir> <audio-file> [max_tokens]
 tiny-cpm tts <voxcpm|moss> <model-dir> "<text>" <out.wav> [--codec <codec-dir>] [--ref <ref.wav>] [--max-len N]
 tiny-cpm tts cosyvoice3 <model-dir> "<text>" <out.wav> [--voice <name>] [--ref <ref.wav> --ref-text "<text>"] [--steps N] [--max-tokens N] [--stream]
-tiny-cpm dialogue <funasr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
-tiny-cpm live <vad-dir> <qwen3asr-dir> <minicpm5.gguf | bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in] [--ref <wav>] [--vad-speech-threshold <f>] [--vad-min-speech-frame <n>] [--vad-min-silence <n>] [--vad-min-speach-ratio <f>] [--vad-min-speach-frames <n>] [--vad-end-silence-ratio <f>] [--vad-look-back-frames <n>] [--min-segment-samples <n>] [--min-seg-peak <f>] [--barge-onset-frames <n>] [--min-barge-rms <f>] [--mic-gain <f>]
+tiny-cpm dialogue <funasr-dir> <bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
+tiny-cpm live <vad-dir> <qwen3asr-dir> <bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> [--input <wav>] [--output <wav>] [--max-tokens N] [--barge-in] [--ref <wav>] [--vad-speech-threshold <f>] [--vad-min-speech-frame <n>] [--vad-min-silence <n>] [--vad-min-speach-ratio <f>] [--vad-min-speach-frames <n>] [--vad-end-silence-ratio <f>] [--vad-look-back-frames <n>] [--min-segment-samples <n>] [--min-seg-peak <f>] [--barge-onset-frames <n>] [--min-barge-rms <f>] [--mic-gain <f>]
 tiny-cpm vad <model-dir> <audio-file>
 tiny-cpm codec-rt <model-dir> <in.wav> <out.wav> [--codec <codec-dir>]   # MOSS codec encode→decode round-trip (diagnostic)
 ```
@@ -112,7 +114,7 @@ cargo test    # CPU-only unit tests (masks, feature-length math, config parsing,
 
 ### The three MiniCPM5 patches (why `quantized_minicpm5` is vendored)
 
-Upstream `quantized_llama` assumes `head_dim == hidden_size / num_heads` and `num_heads * head_dim == hidden_size`. MiniCPM5 has `head_dim = 128`, `hidden_size = 1536`, `num_heads = 16`, so `num_heads * head_dim = 2048 ≠ 1536`. The vendored module reads `head_dim` from GGUF metadata (`llama.rope.dimension_count`) / `config.json`, and reshapes the attention output to `num_heads * head_dim` (2048) before the output projection maps 2048 → 1536. RoPE is always NEOX (non-interleaved / half-split): real MiniCPM5-1B GGUFs declare `general.architecture = "llama"`, but the HF `LlamaForCausalLM` reference uses `rotate_half` (NEOX), so the arch string would select the wrong convention — the loader hardcodes NEOX and prints the arch at load for diagnostics. The bf16 safetensors loader (`from_safetensors_dir`) quantizes HF-layout weights in memory (default Q8_0; `--quant <name>` or `TINY_CPM_QUANT` to override).
+Upstream `quantized_llama` assumes `head_dim == hidden_size / num_heads` and `num_heads * head_dim == hidden_size`. MiniCPM5 has `head_dim = 128`, `hidden_size = 1536`, `num_heads = 16`, so `num_heads * head_dim = 2048 ≠ 1536`. The vendored module reads `head_dim` from `config.json`, and reshapes the attention output to `num_heads * head_dim` (2048) before the output projection maps 2048 → 1536. RoPE is always NEOX (non-interleaved / half-split), matching the HF `LlamaForCausalLM` reference (`rotate_half`). GGUF files are not supported: the bf16 safetensors loader (`from_safetensors_dir`) quantizes HF-layout weights in memory (default Q8_0; `--quant <name>` or `TINY_CPM_QUANT` to override).
 
 ### Chat sampling note
 
