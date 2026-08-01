@@ -9,9 +9,11 @@
 
 #![recursion_limit = "256"]
 
+mod audio;
 mod codec;
 mod config;
 mod model;
+mod speaker_encoder;
 mod talker;
 
 use std::time::Instant;
@@ -78,6 +80,10 @@ fn main() -> Result<()> {
     let mut language = "auto".to_string();
     let mut max_frames = 2048usize;
     let mut codes_file: Option<String> = None;
+    let mut encode_wav: Option<String> = None;
+    let mut spk_embed_wav: Option<String> = None;
+    let mut ref_wav: Option<String> = None;
+    let mut ref_text: Option<String> = None;
     let mut i = 4;
     while i < args.len() {
         match args[i].as_str() {
@@ -91,6 +97,22 @@ fn main() -> Result<()> {
             }
             "--codes-file" => {
                 codes_file = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--encode-wav" => {
+                encode_wav = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--spk-embed" => {
+                spk_embed_wav = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--ref" => {
+                ref_wav = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--ref-text" => {
+                ref_text = args.get(i + 1).cloned();
                 i += 2;
             }
             other => bail!("unknown flag {other}"),
@@ -154,6 +176,70 @@ fn main() -> Result<()> {
         t0.elapsed()
     );
 
+    // --encode-wav: codec-encoder-only verification — encode a wav to (16, T)
+    // codes and dump them (compare against candle's QWEN3_TTS_DUMP_REF=1).
+    if let Some(ew) = encode_wav {
+        let (samples, sr) = audio::decode_audio(&ew)?;
+        let samples = if sr == sample_rate {
+            samples
+        } else {
+            audio::resample_sinc(&samples, sr, sample_rate)
+        };
+        let n = samples.len();
+        let wav_t: Tensor<3, burn::tensor::Float> =
+            Tensor::<1, burn::tensor::Float>::from_floats(samples.as_slice(), &device)
+                .reshape([1, 1, n]);
+        let encoder = codec::CodecEncoder::new(
+            &wc,
+            &codec_cfg.encoder_config,
+            codec_cfg.encoder_valid_num_quantizers,
+        )?;
+        let t1 = Instant::now();
+        let codes = encoder.encode(wav_t)?; // (1, 16, T)
+        let codes = codes.squeeze_dim::<2>(0); // (16, T)
+        let v: Vec<i32> = codes
+            .to_data()
+            .to_vec::<i32>()
+            .map_err(|e| anyhow::anyhow!("codes read: {e}"))?;
+        let t = v.len() / 16;
+        eprintln!(
+            "encode-wav: {ew} {n} samples → {t} frames in {:.2?}",
+            t1.elapsed()
+        );
+        eprintln!("BURN_REF_CODE {t} {:?}", v);
+        return Ok(());
+    }
+
+    // --spk-embed: speaker-encoder-only verification — dump the raw embedding.
+    if let Some(sw) = spk_embed_wav {
+        let (samples, sr) = audio::decode_audio(&sw)?;
+        let samples = if sr == sample_rate {
+            samples
+        } else {
+            audio::resample_sinc(&samples, sr, sample_rate)
+        };
+        let spk_params = config::SpeakerEncoderParams {
+            enc_dim: tts_cfg.speaker_encoder_config.enc_dim,
+            sample_rate: tts_cfg.speaker_encoder_config.sample_rate,
+            ..Default::default()
+        };
+        let spk = speaker_encoder::SpeakerEncoder::new(&w, spk_params.clone())?;
+        let t1 = Instant::now();
+        let emb = spk.embed(&samples, &device)?; // (enc_dim,)
+        let v: Vec<f32> = emb
+            .to_data()
+            .to_vec::<f32>()
+            .map_err(|e| anyhow::anyhow!("spk read: {e}"))?;
+        eprintln!(
+            "spk-embed: {sw} {} samples → dim {} in {:.2?}",
+            samples.len(),
+            v.len(),
+            t1.elapsed()
+        );
+        eprintln!("BURN_REF_SPK {:?}", v);
+        return Ok(());
+    }
+
     // --codes-file: skip the talker, decode a (n,16) code sequence straight to
     // PCM (codec-only verification against candle's codes).
     if let Some(cf) = codes_file {
@@ -211,12 +297,67 @@ fn main() -> Result<()> {
 
     let mut talker = talker::Talker::new(&w, &tts_cfg)?;
 
+    // --- ref voice (ICL cloning): speaker embed + ref codes + ref text ids ---
+    let ref_voice: Option<talker::RefVoice> = match (&ref_wav, &ref_text) {
+        (Some(rw), Some(rt)) => {
+            let (samples, sr) = audio::decode_audio(rw)?;
+            let samples = if sr == sample_rate {
+                samples
+            } else {
+                audio::resample_sinc(&samples, sr, sample_rate)
+            };
+            let spk_params = config::SpeakerEncoderParams {
+                enc_dim: tts_cfg.speaker_encoder_config.enc_dim,
+                sample_rate: tts_cfg.speaker_encoder_config.sample_rate,
+                ..Default::default()
+            };
+            let spk = speaker_encoder::SpeakerEncoder::new(&w, spk_params)?;
+            let emb = spk.embed(&samples, &device)?.cast(model::dt()); // (enc_dim,) talker dtype
+            let n = samples.len();
+            let wav_t: Tensor<3, burn::tensor::Float> =
+                Tensor::<1, burn::tensor::Float>::from_floats(samples.as_slice(), &device)
+                    .reshape([1, 1, n]);
+            let encoder = codec::CodecEncoder::new(
+                &wc,
+                &codec_cfg.encoder_config,
+                codec_cfg.encoder_valid_num_quantizers,
+            )?;
+            let ref_code = encoder.encode(wav_t)?.squeeze_dim::<2>(0); // (16, T)
+            let ref_text_ids = tokenizer
+                .encode(rt.clone(), false)
+                .map_err(|e| anyhow::anyhow!("ref text tokenize: {e}"))?
+                .get_ids()
+                .to_vec();
+            eprintln!(
+                "ref voice: {rw} {} samples → {} frames, spk dim {}, ref-text {} tokens",
+                samples.len(),
+                ref_code.dims()[1],
+                emb.dims()[0],
+                ref_text_ids.len()
+            );
+            Some(talker::RefVoice {
+                spk_embed: emb,
+                ref_code,
+                ref_text_ids,
+            })
+        }
+        (None, None) => None,
+        _ => bail!("--ref and --ref-text must be given together"),
+    };
+
     // --- synthesize: warmup run then measured run ---
     let synth = |talker: &mut talker::Talker,
                  tag: &str|
      -> Result<(Vec<f32>, usize, std::time::Duration)> {
         let t1 = Instant::now();
-        let codes = talker.generate(&text_ids, &language, newline_token, &gen_cfg, max_frames)?; // (n, 16)
+        let codes = talker.generate(
+            &text_ids,
+            &language,
+            newline_token,
+            ref_voice.as_ref(),
+            &gen_cfg,
+            max_frames,
+        )?; // (n, 16)
         let n_frames = codes.dims()[0];
         if std::env::var("BURN_TTS_DUMP_CODES").is_ok() {
             let v: Vec<i32> = codes

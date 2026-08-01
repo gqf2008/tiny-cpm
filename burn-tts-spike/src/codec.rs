@@ -13,7 +13,7 @@ use burn::tensor::{
     ops::{ConvOptions, ConvTransposeOptions},
 };
 
-use crate::config::CodecDecoderConfig;
+use crate::config::{CodecDecoderConfig, CodecEncoderConfig};
 use crate::model::{CODEC_DT, Weights, layer_norm, linear, repeat_kv, rms_norm};
 
 fn embed(x: Tensor<3>, w: Tensor<2>, b: Option<Tensor<1>>) -> Tensor<3> {
@@ -812,5 +812,311 @@ impl CodecDecoder {
             start = end;
         }
         Ok(Tensor::cat(wavs, 2))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CodecEncoder (voice cloning): Mimi SEANet + transformer + split-RVQ encode.
+// Ported 1:1 from tiny-cpm src/models/qwen3_tts/codec.rs (encoder half), F32.
+// ---------------------------------------------------------------------------
+
+/// Mimi residual block: ELU → conv k3 (dim→dim/2) → ELU → conv k1 (dim/2→dim),
+/// residual add. Convs at `...block.1` and `...block.3` (block.0/2 are ELU).
+struct MimiResnetBlock {
+    conv1: CausalConv,
+    conv2: CausalConv,
+}
+
+impl MimiResnetBlock {
+    fn new(w: &Weights, prefix: &str, dim: usize) -> Result<Self> {
+        Ok(Self {
+            conv1: CausalConv::new(w, &format!("{prefix}.1"), dim, dim / 2, 3, 1, 1, 1, true)?,
+            conv2: CausalConv::new(w, &format!("{prefix}.3"), dim / 2, dim, 1, 1, 1, 1, true)?,
+        })
+    }
+    fn forward(&self, x: Tensor<3>, device: &burn::tensor::Device) -> Tensor<3> {
+        let residual = x.clone();
+        let h = burn::tensor::activation::elu(x, 1.0);
+        let h = self.conv1.forward(h, device);
+        let h = burn::tensor::activation::elu(h, 1.0);
+        let h = self.conv2.forward(h, device);
+        h + residual
+    }
+}
+
+/// Mimi encoder transformer layer: LayerNorm(+bias) → causal MHA (sliding-window
+/// 250, RoPE θ1e4) → LayerScale residual; LayerNorm → fc1→GELU→fc2 → LayerScale.
+struct MimiEncoderLayer {
+    q_w: Tensor<2>,
+    k_w: Tensor<2>,
+    v_w: Tensor<2>,
+    o_w: Tensor<2>,
+    fc1_w: Tensor<2>,
+    fc2_w: Tensor<2>,
+    in_ln_w: Tensor<1>,
+    in_ln_b: Tensor<1>,
+    post_ln_w: Tensor<1>,
+    post_ln_b: Tensor<1>,
+    attn_scale: LayerScale,
+    mlp_scale: LayerScale,
+    num_heads: usize,
+    head_dim: usize,
+    scaling: f64,
+    eps: f64,
+}
+
+impl MimiEncoderLayer {
+    fn new(w: &Weights, prefix: &str, cfg: &CodecEncoderConfig) -> Result<Self> {
+        let h = cfg.hidden_size;
+        Ok(Self {
+            q_w: w.get(&format!("{prefix}.self_attn.q_proj.weight"), CODEC_DT)?,
+            k_w: w.get(&format!("{prefix}.self_attn.k_proj.weight"), CODEC_DT)?,
+            v_w: w.get(&format!("{prefix}.self_attn.v_proj.weight"), CODEC_DT)?,
+            o_w: w.get(&format!("{prefix}.self_attn.o_proj.weight"), CODEC_DT)?,
+            fc1_w: w.get(&format!("{prefix}.mlp.fc1.weight"), CODEC_DT)?,
+            fc2_w: w.get(&format!("{prefix}.mlp.fc2.weight"), CODEC_DT)?,
+            in_ln_w: w.get(&format!("{prefix}.input_layernorm.weight"), CODEC_DT)?,
+            in_ln_b: w.get(&format!("{prefix}.input_layernorm.bias"), CODEC_DT)?,
+            post_ln_w: w.get(
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                CODEC_DT,
+            )?,
+            post_ln_b: w.get(&format!("{prefix}.post_attention_layernorm.bias"), CODEC_DT)?,
+            attn_scale: LayerScale::new(
+                w,
+                &format!("{prefix}.self_attn_layer_scale"),
+                cfg.hidden_size,
+            )?,
+            mlp_scale: LayerScale::new(w, &format!("{prefix}.mlp_layer_scale"), cfg.hidden_size)?,
+            num_heads: cfg.num_attention_heads,
+            head_dim: cfg.head_dim,
+            scaling: (cfg.head_dim as f64).powf(-0.5),
+            eps: cfg.norm_eps,
+        })
+    }
+    fn forward(
+        &self,
+        x: Tensor<3>,
+        cos: &Tensor<2>,
+        sin: &Tensor<2>,
+        mask: &Tensor<4>,
+    ) -> Tensor<3> {
+        let [b, t, _] = x.dims();
+        let residual = x.clone();
+        // LayerNorm(+bias); num_kv_heads == num_heads here (8/8), so k/v use num_heads.
+        let h = layer_norm(x, self.in_ln_w.clone(), self.in_ln_b.clone(), self.eps);
+        let q = embed(h.clone(), self.q_w.clone(), None)
+            .reshape([b, t, self.num_heads, self.head_dim])
+            .swap_dims(1, 2);
+        let k = embed(h.clone(), self.k_w.clone(), None)
+            .reshape([b, t, self.num_heads, self.head_dim])
+            .swap_dims(1, 2);
+        let v = embed(h, self.v_w.clone(), None)
+            .reshape([b, t, self.num_heads, self.head_dim])
+            .swap_dims(1, 2);
+        let (q, k) = apply_rope_codec(q, k, cos, sin);
+        let attn = q.matmul(k.swap_dims(2, 3)) * self.scaling;
+        let attn = attn + mask.clone();
+        let attn = burn::tensor::activation::softmax(attn, 3);
+        let h = attn
+            .matmul(v)
+            .swap_dims(1, 2)
+            .reshape([b, t, self.num_heads * self.head_dim]);
+        let h = embed(h, self.o_w.clone(), None);
+        let h = residual + self.attn_scale.forward(h);
+        let residual = h.clone();
+        let m = layer_norm(h, self.post_ln_w.clone(), self.post_ln_b.clone(), self.eps);
+        let m = burn::tensor::activation::gelu(embed(m, self.fc1_w.clone(), None));
+        let m = embed(m, self.fc2_w.clone(), None);
+        residual + self.mlp_scale.forward(m)
+    }
+}
+
+/// One encode-side RVQ: input_proj (512→256), N codebooks; greedy residual
+/// nearest-neighbor by L2 (`||a||² + ||b||² - 2a·b`).
+struct RvqEncode {
+    input_proj_w: Tensor<3>, // (256, 512, 1)
+    codebooks: Vec<Tensor<2>>,
+}
+
+impl RvqEncode {
+    fn new(w: &Weights, prefix: &str, n_layers: usize) -> Result<Self> {
+        let input_proj_w = w.get(&format!("{prefix}.input_proj.weight"), CODEC_DT)?;
+        let mut codebooks = Vec::with_capacity(n_layers);
+        for i in 0..n_layers {
+            let cb = format!("{prefix}.layers.{i}.codebook");
+            // NOTE: encoder files spell it `embed_sum` (decoder uses `embedding_sum`).
+            let embed_sum: Tensor<2> = w.get(&format!("{cb}.embed_sum"), CODEC_DT)?;
+            let cluster_usage: Tensor<1> = w.get(&format!("{cb}.cluster_usage"), CODEC_DT)?;
+            let usage = cluster_usage.clamp_min(1e-5).unsqueeze_dim::<2>(1);
+            codebooks.push(embed_sum / usage);
+        }
+        Ok(Self {
+            input_proj_w,
+            codebooks,
+        })
+    }
+    /// embeddings (B, 512, T) → codes (B, T), one per codebook.
+    fn encode(&self, embeddings: Tensor<3>, device: &burn::tensor::Device) -> Vec<Tensor<2, Int>> {
+        let opts = ConvOptions::new([1], [0], [1], 1);
+        let mut residual = module::conv1d(embeddings, self.input_proj_w.clone(), None, opts); // (B, 256, T)
+        let [b, _d, t] = residual.dims();
+        let mut out = Vec::with_capacity(self.codebooks.len());
+        for embed in &self.codebooks {
+            let flat = residual.clone().swap_dims(1, 2).reshape([b * t, 256]); // (N, 256)
+            let a2 = flat.clone().powf_scalar(2.0).sum_dim(1); // (N, 1)
+            let b2 = embed.clone().powf_scalar(2.0).sum_dim(1).swap_dims(0, 1); // (1, 2048)
+            let dots = flat.clone().matmul(embed.clone().swap_dims(0, 1)); // (N, 2048)
+            let dists = a2 + b2 - dots * 2.0; // broadcast (N,1)+(1,2048)
+            let idx = dists.argmin(1).reshape([b * t]); // (N,)
+            let gathered = embed.clone().select(0, idx.clone()).reshape([b, t, 256]); // (N,256)→(B,T,256)
+            out.push(idx.reshape([b, t]));
+            residual = residual - gathered.swap_dims(1, 2); // (B, 256, T)
+        }
+        out
+    }
+}
+
+/// SEANet encoder: conv k7 → 4× (resnet + downsample conv k=2s s=s) → conv k3 →
+/// 8-layer transformer → replicate-pad downsample k4 s2 → split-RVQ (1 semantic
+/// + 15 acoustic).
+pub struct CodecEncoder {
+    conv_in: CausalConv,
+    stages: Vec<(MimiResnetBlock, CausalConv)>,
+    conv_out: CausalConv,
+    layers: Vec<MimiEncoderLayer>,
+    inv_freq: Vec<f32>,
+    downsample_w: Tensor<3>, // (512, 512, 4)
+    semantic: RvqEncode,
+    acoustic: RvqEncode,
+    sliding_window: usize,
+    device: burn::tensor::Device,
+}
+
+impl CodecEncoder {
+    pub fn new(w: &Weights, cfg: &CodecEncoderConfig, valid_num_quantizers: usize) -> Result<Self> {
+        let device = w.device();
+        let nf = cfg.num_filters; // 64
+        // SEANet layout (weight names): conv_in at layers.0; per stride s in
+        // [4,5,6,8]: resnet at layers.{1,4,7,10}.block, down at layers.{3,6,9,12};
+        // conv_out at layers.14.
+        let conv_in = CausalConv::new(
+            w,
+            "encoder.encoder.layers.0",
+            cfg.audio_channels,
+            nf,
+            cfg.kernel_size,
+            1,
+            1,
+            1,
+            true,
+        )?;
+        let strides: Vec<usize> = cfg.upsampling_ratios.iter().rev().cloned().collect(); // [4,5,6,8]
+        let resnet_idx = [1usize, 4, 7, 10];
+        let down_idx = [3usize, 6, 9, 12];
+        let mut stages = Vec::with_capacity(strides.len());
+        let mut dim = nf;
+        for (s, (&ri, &di)) in strides.iter().zip(resnet_idx.iter().zip(down_idx.iter())) {
+            let resnet =
+                MimiResnetBlock::new(w, &format!("encoder.encoder.layers.{ri}.block"), dim)?;
+            let down = CausalConv::new(
+                w,
+                &format!("encoder.encoder.layers.{di}"),
+                dim,
+                dim * 2,
+                2 * s,
+                *s,
+                1,
+                1,
+                true,
+            )?;
+            stages.push((resnet, down));
+            dim *= 2;
+        }
+        let conv_out = CausalConv::new(
+            w,
+            "encoder.encoder.layers.14",
+            dim,
+            cfg.hidden_size,
+            cfg.last_kernel_size,
+            1,
+            1,
+            1,
+            true,
+        )?;
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for i in 0..cfg.num_hidden_layers {
+            layers.push(MimiEncoderLayer::new(
+                w,
+                &format!("encoder.encoder_transformer.layers.{i}"),
+                cfg,
+            )?);
+        }
+        let inv_freq =
+            crate::model::compute_default_rope_parameters(cfg.head_dim, cfg.rope_theta as f32);
+        let downsample_w = w.get("encoder.downsample.conv.weight", CODEC_DT)?; // (512, 512, 4)
+        let n_semantic = cfg.num_semantic_quantizers; // 1
+        let n_acoustic = valid_num_quantizers - n_semantic; // 15
+        let semantic = RvqEncode::new(
+            w,
+            "encoder.quantizer.semantic_residual_vector_quantizer",
+            n_semantic,
+        )?;
+        let acoustic = RvqEncode::new(
+            w,
+            "encoder.quantizer.acoustic_residual_vector_quantizer",
+            n_acoustic,
+        )?;
+        Ok(Self {
+            conv_in,
+            stages,
+            conv_out,
+            layers,
+            inv_freq,
+            downsample_w,
+            semantic,
+            acoustic,
+            sliding_window: cfg.sliding_window,
+            device,
+        })
+    }
+
+    /// wav (B, 1, T_samples) f32 @ 24 kHz → codes (B, 16, T) Int @ 12.5 Hz.
+    pub fn encode(&self, wav: Tensor<3>) -> Result<Tensor<3, Int>> {
+        let mut h = self.conv_in.forward(wav, &self.device);
+        for (resnet, down) in &self.stages {
+            h = resnet.forward(h, &self.device);
+            h = burn::tensor::activation::elu(h, 1.0);
+            h = down.forward(h, &self.device);
+        }
+        h = burn::tensor::activation::elu(h, 1.0);
+        h = self.conv_out.forward(h, &self.device); // (B, 512, 25 Hz)
+        let mut z = h.swap_dims(1, 2); // (B, T, 512)
+        let t = z.dims()[1];
+        let mask = sliding_window_causal_mask(t, self.sliding_window, &self.device);
+        let (cos, sin) = crate::model::rotary(&self.device, &self.inv_freq, 0, t, CODEC_DT);
+        for layer in &self.layers {
+            z = layer.forward(z, &cos, &sin, &mask);
+        }
+        let z = z.swap_dims(1, 2); // (B, 512, T)
+        let z = self.downsample_replicate(z); // (B, 512, 12.5 Hz)
+        let mut codes = self.semantic.encode(z.clone(), &self.device);
+        codes.extend(self.acoustic.encode(z, &self.device));
+        // stack (16 per-layer (B,T)) → (B, 16, T)
+        let stacked: Tensor<3, Int> = Tensor::stack(codes, 1);
+        Ok(stacked)
+    }
+
+    /// Mimi downsample conv: replicate left-pad (kernel-stride=2) + computed
+    /// right extra-pad, k4 s2, no bias.
+    fn downsample_replicate(&self, x: Tensor<3>) -> Tensor<3> {
+        let [_, _, t] = x.dims();
+        let left = 4 - 2; // kernel - stride
+        let extra = conv1d_extra_padding(t, 4, left, 2);
+        let first = x.clone().narrow(2, 0, 1).repeat_dim(2, left);
+        let last = x.clone().narrow(2, t - 1, 1).repeat_dim(2, extra);
+        let x = Tensor::cat(vec![first, x, last], 2);
+        let opts = ConvOptions::new([2], [0], [1], 1);
+        module::conv1d(x, self.downsample_w.clone(), None, opts)
     }
 }

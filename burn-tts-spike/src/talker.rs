@@ -57,6 +57,19 @@ pub fn gpu_sample_token(
 }
 
 // ---------------------------------------------------------------------------
+// RefVoice (voice cloning): pre-encoded reference from `--ref` + `--ref-text`.
+// ---------------------------------------------------------------------------
+
+pub struct RefVoice {
+    /// Raw speaker-encoder embedding (enc_dim,) in the talker dtype (f16).
+    pub spk_embed: Tensor<1>,
+    /// Codec-encoded ref audio (16, T_ref) Int.
+    pub ref_code: Tensor<2, Int>,
+    /// BPE ids of the ref transcript.
+    pub ref_text_ids: Vec<u32>,
+}
+
+// ---------------------------------------------------------------------------
 // Code predictor (5 layers, codebooks 1..=15)
 // ---------------------------------------------------------------------------
 
@@ -255,6 +268,19 @@ impl Talker {
         acc
     }
 
+    /// Sum of all 16 codebook embeddings for one frame's codes (CPU ids) →
+    /// (1, 1, hidden). codes[0] uses the talker embedding; codes[1..16] the
+    /// predictor's. Used to embed the ref-voice codec track in ICL mode.
+    fn frame_embed(&self, codes: &[u32]) -> Tensor<3> {
+        let mut acc = self.codec_embed1(codes[0]);
+        for g in 1..self.cfg.num_code_groups {
+            let t = Tensor::<2, Int>::from_ints([[codes[g] as i32]], &self.device);
+            let e = module::embedding(self.code_predictor.codec_embedding[g - 1].clone(), t);
+            acc = acc + e;
+        }
+        acc
+    }
+
     /// One decoder forward over `embeds` (1, T, hidden) → (last hidden (1,1,hidden),
     /// codec_head logits (1, vocab)).
     fn forward_step_gpu(
@@ -286,6 +312,7 @@ impl Talker {
         text_ids: &[u32],
         language: &str,
         newline_token: u32,
+        ref_voice: Option<&RefVoice>,
         gen_cfg: &Qwen3TTSGenerationConfig,
         max_new_tokens: usize,
     ) -> Result<Tensor<2, Int>> {
@@ -333,6 +360,9 @@ impl Talker {
         for &id in &think_ids {
             codec_rows.push(self.codec_embed1(id));
         }
+        if let Some(rv) = ref_voice {
+            codec_rows.push(rv.spk_embed.clone().reshape([1, 1, hidden]));
+        }
         codec_rows.push(self.codec_embed1(cfg.codec_pad_id));
         codec_rows.push(self.codec_embed1(cfg.codec_bos_id));
         let codec_prefix: Tensor<3> = Tensor::cat(codec_rows, 1); // (1, P, hidden)
@@ -350,16 +380,54 @@ impl Talker {
         let head = text_track_head + codec_prefix.clone().narrow(1, 0, p_len - 1); // (1, P-1, hidden)
         let prompt0 = Tensor::cat(vec![role, head], 1); // (1, 3 + (P-1), hidden)
 
-        // --- non-ICL: first text token ⊕ last codec prefix row (bos); rest → trailing ---
-        let first = self.text_embed(&text_ids[0..1]) + codec_prefix.narrow(1, p_len - 1, 1);
-        let prompt = Tensor::cat(vec![prompt0, first], 1);
-        let rest = if text_ids.len() > 1 {
-            let body = self.text_embed(&text_ids[1..]);
-            Tensor::cat(vec![body, tts_eos_embed], 1)
+        // --- text body + ICL ------------------------------------------------
+        if let Some(rv) = ref_voice {
+            // ICL: text track = ref_text + target_text + eos; codec track = ref codes.
+            let mut text_body_ids: Vec<u32> = rv.ref_text_ids.clone();
+            text_body_ids.extend_from_slice(text_ids);
+            let text_body = self.text_embed(&text_body_ids);
+            let text_track = Tensor::cat(vec![text_body, tts_eos_embed.clone()], 1); // (1, T1+1, hidden)
+            // codec track: [codec_bos] + Σ16 embeddings per ref frame.
+            let ref_code = &rv.ref_code; // (16, T_ref)
+            let t_ref = ref_code.dims()[1];
+            let codes_all: Vec<i32> = ref_code
+                .clone()
+                .to_data()
+                .to_vec::<i32>()
+                .map_err(|e| anyhow!("ref codes read: {e}"))?; // codebook-major
+            let mut codec_track_rows = vec![self.codec_embed1(cfg.codec_bos_id)];
+            for fr in 0..t_ref {
+                let codes: Vec<u32> = (0..16).map(|g| codes_all[g * t_ref + fr] as u32).collect();
+                codec_track_rows.push(self.frame_embed(&codes));
+            }
+            let codec_track = Tensor::cat(codec_track_rows, 1); // (1, T_ref+1, hidden)
+            let t1 = text_track.dims()[1];
+            let c1 = codec_track.dims()[1];
+            let (prompt, trailing) = if t1 >= c1 {
+                let head_part = text_track.clone().narrow(1, 0, c1) + codec_track;
+                let prompt = Tensor::cat(vec![prompt0, head_part], 1);
+                let rest = text_track.narrow(1, c1, t1 - c1); // trailing
+                (prompt, Some(rest))
+            } else {
+                let pad_rows = tts_pad_embed.clone().repeat_dim(1, c1 - t1);
+                let text_track = Tensor::cat(vec![text_track, pad_rows], 1);
+                let head_part = text_track + codec_track;
+                let prompt = Tensor::cat(vec![prompt0, head_part], 1);
+                (prompt, None)
+            };
+            self.generate_inner(prompt, trailing, tts_pad_embed, gen_cfg, max_new_tokens)
         } else {
-            tts_eos_embed
-        };
-        self.generate_inner(prompt, Some(rest), tts_pad_embed, gen_cfg, max_new_tokens)
+            // Non-ICL: first text token ⊕ last codec prefix row (bos); rest → trailing.
+            let first = self.text_embed(&text_ids[0..1]) + codec_prefix.narrow(1, p_len - 1, 1);
+            let prompt = Tensor::cat(vec![prompt0, first], 1);
+            let rest = if text_ids.len() > 1 {
+                let body = self.text_embed(&text_ids[1..]);
+                Tensor::cat(vec![body, tts_eos_embed], 1)
+            } else {
+                tts_eos_embed
+            };
+            self.generate_inner(prompt, Some(rest), tts_pad_embed, gen_cfg, max_new_tokens)
+        }
     }
 
     /// The AR decode loop. Returns (n_frames, 16) Int codes.

@@ -13,6 +13,58 @@ pub struct Qwen3TTSConfig {
     pub tts_eos_token_id: u32,
     pub tts_pad_token_id: u32,
     pub talker_config: TalkerConfig,
+    pub speaker_encoder_config: SpeakerEncoderConfigJson,
+}
+
+/// config.json.speaker_encoder_config — the checkpoint only carries
+/// enc_dim/sample_rate; the rest of the ECAPA-TDNN hyper-params are the
+/// upstream defaults (SpeakerEncoderParams::default).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SpeakerEncoderConfigJson {
+    pub enc_dim: usize,
+    pub sample_rate: usize,
+}
+
+/// ECAPA-TDNN hyper-params (upstream configuration_qwen3_tts.py defaults, same
+/// as candle's SpeakerEncoderParams).
+#[derive(Debug, Clone)]
+pub struct SpeakerEncoderParams {
+    pub mel_dim: usize,
+    pub enc_dim: usize,
+    pub channels: [usize; 5],
+    pub kernel_sizes: [usize; 5],
+    pub dilations: [usize; 5],
+    pub attention_channels: usize,
+    pub res2net_scale: usize,
+    pub se_channels: usize,
+    pub sample_rate: usize,
+    // Mel frontend.
+    pub n_fft: usize,
+    pub hop_length: usize,
+    pub win_length: usize,
+    pub fmin: f32,
+    pub fmax: f32,
+}
+
+impl Default for SpeakerEncoderParams {
+    fn default() -> Self {
+        Self {
+            mel_dim: 128,
+            enc_dim: 2048,
+            channels: [512, 512, 512, 512, 1536],
+            kernel_sizes: [5, 3, 3, 3, 1],
+            dilations: [1, 2, 3, 4, 1],
+            attention_channels: 128,
+            res2net_scale: 8,
+            se_channels: 128,
+            sample_rate: 24000,
+            n_fft: 1024,
+            hop_length: 256,
+            win_length: 1024,
+            fmin: 0.0,
+            fmax: 12000.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,7 +172,35 @@ fn default_max_new_tokens() -> usize {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpeechTokenizerConfig {
     pub output_sample_rate: usize,
+    pub encoder_valid_num_quantizers: usize,
+    pub input_sample_rate: usize,
+    pub encoder_config: CodecEncoderConfig,
     pub decoder_config: CodecDecoderConfig,
+}
+
+/// speech_tokenizer/config.json.encoder_config — a transformers MimiConfig
+/// (encoder only). All convs causal.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodecEncoderConfig {
+    pub audio_channels: usize,
+    pub num_filters: usize,
+    pub kernel_size: usize,
+    pub last_kernel_size: usize,
+    /// Encoder downsampling strides; applied in REVERSE order ([8,6,5,4] → 4,5,6,8).
+    pub upsampling_ratios: Vec<usize>,
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+    pub norm_eps: f64,
+    pub rope_theta: f64,
+    pub sliding_window: usize,
+    pub num_quantizers: usize,
+    pub num_semantic_quantizers: usize,
+    pub codebook_size: usize,
+    pub codebook_dim: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]

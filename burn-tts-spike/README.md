@@ -11,10 +11,11 @@ codec decoder + GPU 采样**。明确不做：`--ref` 声音克隆（speaker enc
 ## 用法
 
 ```bash
-cargo run --release -- <model-dir> "<text>" <out.wav> [--language zh|en] [--max-frames N] [--codes-file <file>]
+cargo run --release -- <model-dir> "<text>" <out.wav> [--language zh|en] [--max-frames N] [--codes-file <file>] [--encode-wav <file>] [--spk-embed <file>] [--ref <wav> --ref-text "<text>"]
 # 例：
 ../target-shared/release/burn-tts-spike /Volumes/Workspace/GitHub/tiny-cpm/models/Qwen3-TTS-12Hz-1.7B-Base \
-    "The quick brown fox jumps over the lazy dog." /tmp/out.wav
+    "The quick brown fox jumps over the lazy dog." /tmp/out.wav \
+    --ref ref.wav --ref-text "full ref transcript"
 ```
 
 - 音频时长 / gen、codec 分段耗时、RTF → stderr。
@@ -61,6 +62,19 @@ cargo run --release -- <model-dir> "<text>" <out.wav> [--language zh|en] [--max-
 结论：**codec 移植数值等价**（余量是 fp32 算子级舍入，-70 dB 以下听不到）。
 顺带验证了 `chunked_decode(300,25)` 语义：41 帧 < 300 → 单 chunk、context 0 → 等价于
 全量 decode。
+
+### Phase 4 — --ref 声音克隆（ICL）验证
+
+参考音频 `Fun-ASR-Nano-2512/example/en.mp3`（7.17s，172224 samples @ 24k → 90 codec 帧）：
+
+| 验证项 | 结果 |
+|---|---|
+| V-1 codec encoder codes | **99.44% 逐位一致**（1432/1440），8 帧各 1 个 code 分歧，归因为 RVQ 最近邻**近平票**（top-2 距离差 1.6e-3 ~ 1e-1，F32 舍入翻转 argmin） |
+| V-2 speaker embedding | **max\|Δ\|=0.008**（信号 RMS 0.42，rel 1.9%，F32 舍入水平）。期间抓到并修复一个真 bug：ASP `weighted_stats` 把 softmax 权重先乘到残差上再平方（`((x-mean)·m)²`），应为 `(x-mean)²·m` —— 症状是 embedding 整体 ~0.65× 缩放（BLK0-4 统计量一致、BLK5 分歧，二分定位） |
+| V-3 端到端 ICL greedy codes | **前 6 帧（96 codes）逐位一致**；帧 0 cb7 分歧为**精确平票**：candle `logits[1202]==logits[1434]==26.625` 取先者，burn 差 0.06 取 1434 —— 近平票 tie-break，非移植 bug |
+| 端到端 wav | 能量正常（RMS ~5000，与 candle 同级），无 babble |
+
+ICL 模式基准（采样）：candle RTF ~1.9 vs burn ~6.3（gen ~3×，codec ~3× 已知）。gen 的额外惩罚来自**长 prompt decode**：ref 90 帧 → prompt ~100 token，burn 的 eager attention 每帧重建 O(seq²) mask 且无因果优化，长序列下每帧成本放大（无 ref 时 113ms/帧 vs 有 ref 350ms/帧；candle 同条件只慢 1.8×）。记录为后续优化点。
 
 ### Phase 3 — 端到端基准（同机同负载，M4，`vm.loadavg` 1min ~2.4，采样模式默认配置）
 
@@ -117,6 +131,25 @@ codec 小 conv 的 fused kernel；预测器 15 步的并行/投机解码提高 m
 10. **tokenizer**：Qwen2 BPE 走 vocab+merges 文件路径（sentencepiece 风格的特殊
     token 由模型 config 提供，无需额外加载）。
 
+11. **codec encoder 权重是双层 `encoder.` 前缀**：`encoder.encoder.layers.*`（SEANet）、
+    `encoder.encoder_transformer.layers.*`、`encoder.downsample.conv.weight`、
+    `encoder.quantizer.{semantic,acoustic}_residual_vector_quantizer.*` —— candle 的
+    `vb.pp("encoder")` 与外层前缀叠加；encoder 侧 codebook 用 `embed_sum`（decoder 侧才叫
+    `embedding_sum`）。
+12. **ASP 的加权 std 必须是 `(x-mean)²·m`**（softmax 权重乘在平方**后**）—— 先乘再平方
+    会导致 embedding 整体 ~0.65× 缩放（见 Phase 4）。
+13. **speaker encoder 的 Hann 窗是 torch `hann_window(periodic=True)`**
+    （`0.5·(1-cos(2πn/N))`），不是 candle `create_hann_window` 的公式（≈periodic=False）——
+    两者差 ~0.002，虽然后来证明不是主因。
+14. **RVQ 最近邻 argmin 有近平票**：`dists = a²+b²-2ab` 在候选接近时 catastrophic
+    cancellation，top-2 距离差可到 1e-3（绝对距离 ~O(100)），F32 舍入即可翻转 —— 与
+    talker 的 logits 平票同属"非移植 bug"类差异，采样式（gumbel）下无影响。
+15. **ReflectConv 的 `.conv` 前缀由调用方决定**：`TimeDelayNetBlock` 加 `.conv`，
+    `SqueezeExcitationBlock` 的 conv1/conv2 和 `fc` 不加（镜像 candle 的 `vb.pp` 结构）。
+16. **长 prompt 下 decode 慢**：eager attention 每帧重建 (seq,seq) mask，无因果优化；
+    90 帧 ref → ~100 token prompt → 每帧 ~3× 慢（candle 同条件 1.8×）。优化方向：
+    mask 复用 / 滑动 attention。
+
 ## 文件结构（镜像 candle 侧）
 
 - `src/config.rs` — serde config（只留用到的字段）+ `Qwen3TTSGenerationConfig` Default。
@@ -130,5 +163,9 @@ codec 小 conv 的 fused kernel；预测器 15 步的并行/投机解码提高 m
   SnakeBeta、EuclideanCodebookDecode、SplitRvqDecode、DecoderPreTransformer（8 层、
   sliding-window 72、LayerScale、RoPE θ1e4）、ConvNeXtBlock、DecoderResidualUnit、
   `CodecDecoder::decode` + `chunked_decode(300,25)`。
+- `src/speaker_encoder.rs` — ECAPA-TDNN（ReflectConv、Res2Net scale8、SE、ASP、fc）+ F32。
+- `src/audio.rs` — 解码（symphonia）、sinc 重采样、speaker mel 前端（reflect pad +
+  periodic Hann + realfft STFT + slaney mel）—— CPU 侧 f32，与 candle 参考一致。
 - `src/main.rs` — 权重加载（bf16→f16）、BPE tokenizer、warmup + 计时、`--codes-file`
-  codec-only 路径、`save_wav_mono`（i16，ratio 32767，与 candle 相同）。
+  codec-only 路径、`--encode-wav`/`--spk-embed` 单模块验证入口、`--ref`/`--ref-text`
+  ICL 声音克隆、`save_wav_mono`（i16，ratio 32767，与 candle 相同）。
