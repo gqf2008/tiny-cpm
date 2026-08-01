@@ -651,7 +651,14 @@ impl Talker {
         // QWEN3_TTS_GREEDY equivalent: BURN_TTS_GREEDY=1 forces argmax.
         let greedy = std::env::var("BURN_TTS_GREEDY").is_ok();
 
+        let gen_prof = std::env::var("BURN_TTS_GENPROF").is_ok();
+        let mut prof_wall = 0.0f64;
+        let mut prof_gpu = 0.0f64;
+        let mut prof_cp = 0.0f64;
+        let mut prof_fwd = 0.0f64;
+        let mut prof_n = 0usize;
         for step in 0..max_new_tokens {
+            let prof_t0 = std::time::Instant::now();
             // Sample codebook 0 on the GPU (suppression bias + rep penalty + temp + Gumbel).
             let lg = logits_gpu + suppress_bias.clone();
             let rep = if apply_rep && step >= 2 {
@@ -676,7 +683,11 @@ impl Talker {
             }
 
             // Code predictor fills codebooks 1..=15 (on-device tokens, no readback).
+            let prof_cp0 = std::time::Instant::now();
             let rest_t = self.code_predictor_predict(&past_hidden, &code0_t, gen_cfg)?;
+            if gen_prof {
+                prof_cp += prof_cp0.elapsed().as_secs_f64() * 1e3;
+            }
 
             // Next input embedding: Σ16 codebook embeddings + trailing text row.
             let mut next = self.frame_embed_gpu(&code0_t.clone().reshape([1, 1]), &rest_t);
@@ -695,10 +706,14 @@ impl Talker {
                 no_sync_toks.extend(all_t);
             } else {
                 let flat: Tensor<1, Int> = Tensor::cat(all_t, 0);
+                let prof_rb0 = std::time::Instant::now();
                 let flat_vec: Vec<i32> = flat
                     .to_data()
                     .to_vec::<i32>()
                     .map_err(|e| anyhow::anyhow!("frame readback: {e}"))?;
+                if gen_prof {
+                    prof_gpu += prof_rb0.elapsed().as_secs_f64() * 1e3;
+                }
                 let flat_vec: Vec<u32> = flat_vec.iter().map(|&v| v as u32).collect();
                 let code0 = flat_vec[0];
 
@@ -710,10 +725,29 @@ impl Talker {
                 frames.push(flat_vec);
             }
 
+            let prof_f0 = std::time::Instant::now();
             let (h, l) = self.forward_step_gpu(next, offset);
+            if gen_prof {
+                prof_fwd += prof_f0.elapsed().as_secs_f64() * 1e3;
+            }
             past_hidden = h;
             logits_gpu = l;
             offset += 1;
+            if gen_prof {
+                prof_wall += prof_t0.elapsed().as_secs_f64() * 1e3;
+                prof_n += 1;
+            }
+        }
+        if gen_prof && prof_n > 0 {
+            eprintln!(
+                "[gen-prof] {prof_n} frames: wall {:.1}ms/f, GPU {:.1}ms/f, CPU {:.1}ms/f | fwd28 {:.1}ms/f, predictor {:.1}ms/f, other {:.1}ms/f",
+                prof_wall / prof_n as f64,
+                prof_gpu / prof_n as f64,
+                (prof_wall - prof_gpu) / prof_n as f64,
+                prof_fwd / prof_n as f64,
+                prof_cp / prof_n as f64,
+                (prof_wall - prof_fwd - prof_cp) / prof_n as f64
+            );
         }
 
         let flat: Vec<i32> = if no_sync {
@@ -748,7 +782,13 @@ impl Talker {
         let n_groups = cp.cfg.num_code_groups - 1;
         let mut offset = 2usize;
         let mut tokens: Vec<Tensor<1, Int>> = Vec::with_capacity(n_groups);
+        let cp_prof = std::env::var("BURN_TTS_GENPROF").is_ok();
+        let mut prof_lin = 0.0f64;
+        let mut prof_smp = 0.0f64;
+        let mut prof_fwd = 0.0f64;
         for g in 0..n_groups {
+            let mut cp_delta = [0.0f64; 3];
+            let mut cp_marks = [std::time::Instant::now(); 4];
             if std::env::var("BURN_TTS_DEBUG").is_ok() && g == 2 {
                 let v: Vec<f32> = hidden
                     .clone()
@@ -760,6 +800,7 @@ impl Talker {
             }
             let logits =
                 linear(hidden.clone(), cp.lm_head[g].clone(), None).reshape([1, cp.cfg.vocab_size]); // (1, vocab)
+            cp_marks[1] = std::time::Instant::now();
             if std::env::var("BURN_TTS_DEBUG").is_ok() && g == 3 {
                 let v: Vec<f32> = logits
                     .clone()
@@ -778,13 +819,31 @@ impl Talker {
                 gen_cfg.subtalker_temperature,
                 None, // code predictor applies no repetition penalty
             ); // (1,) Int on device
+            cp_marks[2] = std::time::Instant::now();
             if g + 1 < n_groups {
                 let emb =
                     module::embedding(cp.codec_embedding[g].clone(), token.clone().reshape([1, 1]));
                 hidden = cp.forward_hidden(emb, offset);
                 offset += 1;
             }
+            cp_marks[3] = std::time::Instant::now();
+            if cp_prof {
+                cp_delta[0] = (cp_marks[1] - cp_marks[0]).as_secs_f64() * 1e3;
+                cp_delta[1] = (cp_marks[2] - cp_marks[1]).as_secs_f64() * 1e3;
+                cp_delta[2] = (cp_marks[3] - cp_marks[2]).as_secs_f64() * 1e3;
+                prof_lin += cp_delta[0];
+                prof_smp += cp_delta[1];
+                prof_fwd += cp_delta[2];
+            }
             tokens.push(token);
+        }
+        if cp_prof {
+            eprintln!(
+                "[gen-prof] predictor/step: linear {:.2}ms, sample {:.2}ms, fwd5 {:.2}ms",
+                prof_lin / n_groups as f64,
+                prof_smp / n_groups as f64,
+                prof_fwd / n_groups as f64
+            );
         }
         Ok(tokens)
     }

@@ -377,6 +377,40 @@ codec-only RTF 约 2.3 → 2.0；全流程 codec 部分 RTF ~1.07 → ~0.85（�
 T=640 residual（92ms，im2col 但 T 太小）、shifted matmul 在 codec 内比隔离
 bench 慢 ~4–5×（非连续输入 + fusion 组合），是 burn kernel 效率上限。
 
+### Phase 10 — talker/predictor CPU-bound 定位（burn-perf 分支，阶段 2 结论）
+
+**测量**（`BURN_TTS_GENPROF=1`，gen 循环内拆分 wall / GPU / CPU + fwd28 /
+predictor / other）：
+
+| 项 | 值（负载 ~7–13） |
+|---|---|
+| gen wall | 90–94 ms/帧 |
+| GPU（每帧 readback 等待） | **1.1–3.6 ms/帧（~3%）** |
+| CPU | **87–91 ms/帧（~97%）** |
+| └ fwd28（28 层 talker） | 30 ms/帧 |
+| └ predictor（15 步 × 5 层） | **59 ms/帧（65%）** |
+| └ 其他（采样/embed/rep） | 4 ms/帧 |
+
+predictor 每步 ~3.4ms CPU：lm_head linear 0.01ms + sample 0.02ms + **5 层
+forward 3.4ms** —— 纯 op 分发成本（~100 op × ~35µs）。
+
+**CPU 采样**（macOS `sample`，60 帧）：热点栈 =
+`cubecl ComputeClient::launch_inner` → `wgpu create_bind_group` /
+`create_buffer_binding` → Metal `MTLRangeAllocator` → cubecl `memory_pool`
+（coalesce/try_reserve）+ `semaphore_wait`/`mach_msg`（同步）。即**每次 kernel
+launch 的绑定组创建 + 缓冲分配 + 内存池管理**，~35–50µs/op。
+
+**结论**：
+1. **talker+predictor 是 CPU-bound**（GPU 闲置 ~3%），瓶颈在 cubecl/wgpu/Metal
+   的逐 kernel 启动路径（bind group + 分配），不是 matmul 本身。
+2. **fusion 对 talker 无净收益**（同负载 A/B：融合 CPU 281ms/帧 vs 非融合
+   231–236ms/帧——plan 簿记 ≥ launch 节省）。
+3. **spike 层可动的只有 op 数**：`apply_rope` 的 `narrow` 在 burn 是 slice 拷贝
+   kernel（~412 次/帧，占 CPU 采样 ~7%），消除可省 ~15–20ms/帧；predictor 的
+   75 层/帧 forward 无法减 op（顺序依赖）。
+4. **要根治需引擎级**：cubecl 缓存 bind group / 复用 buffer binding、减少内存池
+   争用、或换后端策略——超出本分支范围。
+
 ## 文件结构（镜像 candle 侧）
 
 - `src/config.rs` — serde config（只留用到的字段）+ `Qwen3TTSGenerationConfig` Default。
