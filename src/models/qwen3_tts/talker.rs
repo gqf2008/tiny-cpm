@@ -461,9 +461,11 @@ impl Talker {
         let backbone = TalkerBackbone::Quant(quantized_talker::load(&vb_cpu, cfg, quant, device)?);
         // Code-predictor quantization: clean back-to-back A/B shows Q4_K is a small
         // but real win (~25.1 vs ~26.1 ms/frame) — NOT the 3× the bandwidth math
-        // hinted (predictor is launch-bound, not bandwidth-bound) and NOT the
-        // regression an earlier load-polluted run suggested. Default ON when the
-        // talker is quantized; opt out with QWEN3_TTS_PREDICTOR_QUANT=0.
+        // hinted. The predictor is m=1 GEMV-occupancy-bound (GPU-busy, not launch
+        // latency): fusing its QKV/gate-up projections cut the *launch* count but left
+        // per-frame GPU-busy unchanged (~24ms, PROF_SYNC-measured), so it is NOT
+        // launch-bound either. Default ON when the talker is quantized; opt out with
+        // QWEN3_TTS_PREDICTOR_QUANT=0.
         let predictor_quant = match std::env::var("QWEN3_TTS_PREDICTOR_QUANT").as_deref() {
             Ok("0") | Ok("off") | Ok("none") => None,
             _ => Some(quant),
