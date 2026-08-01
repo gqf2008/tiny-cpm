@@ -19,7 +19,15 @@ use candle_core::{Device, Tensor};
 /// Gumbel-max categorical sample, identical math to the talker's GPU path.
 fn gumbel_max(logits: &Tensor) -> u32 {
     let u = Tensor::rand_like(logits, 1e-7, 1.0).unwrap();
-    let g = u.log().unwrap().neg().unwrap().log().unwrap().neg().unwrap();
+    let g = u
+        .log()
+        .unwrap()
+        .neg()
+        .unwrap()
+        .log()
+        .unwrap()
+        .neg()
+        .unwrap();
     let perturbed = (logits + g).unwrap();
     perturbed
         .argmax(candle_core::D::Minus1)

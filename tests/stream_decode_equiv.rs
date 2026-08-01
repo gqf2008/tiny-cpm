@@ -57,10 +57,9 @@ fn streaming_decode(
 fn streaming_matches_batch_decode() {
     let device = Device::new_metal(0).unwrap();
     let dir = "models/Qwen3-TTS-12Hz-1.7B-Base/speech_tokenizer";
-    let cfg: SpeechTokenizerConfig = serde_json::from_str(
-        &std::fs::read_to_string(format!("{dir}/config.json")).unwrap(),
-    )
-    .unwrap();
+    let cfg: SpeechTokenizerConfig =
+        serde_json::from_str(&std::fs::read_to_string(format!("{dir}/config.json")).unwrap())
+            .unwrap();
     let files: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
         .filter_map(|e| {
