@@ -114,7 +114,7 @@ pub fn apply_rotary_pos_emb(
             && (dt == DType::F32 || dt == DType::BF16)
             && matches!(q.device(), Device::Metal(_));
         if fusible && (!tof32 || dt == DType::F32) {
-            // The fused path .contiguous()s non-contiguous inputs itself.
+            // The fused path reads the transpose(1,2) views directly.
             return crate::models::qwen3_tts::rope_fused::apply_rope_fused(q, k, cos, sin)
                 .map_err(Into::into);
         }

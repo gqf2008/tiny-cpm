@@ -2,11 +2,21 @@
 //! Qwen3-TTS Q4_K talker path.
 //!
 //! Replaces the ~12 GPU kernels `apply_rotary_pos_emb` (src/position_embed/
-//! rope.rs) issues per layer with ONE launch — the m=1 decode cost driver is
-//! kernel-launch overhead (~39µs each), not the elementwise math. This does NOT
-//! fork candle: candle-metal-kernels compiles MSL at runtime from a source
-//! string via `Device::new_library_with_source`, and we ride candle's shared
-//! command encoder, so ordering with surrounding ops is automatic.
+//! rope.rs) issues per layer — per q/k: narrow×2 + affine(-1) + cat + broadcast_mul
+//! ×2 + add — with a single launch. At m=1 decode this is 336 launches/frame for
+//! the 28-layer talker; the fusion target is launch overhead, not math.
+//!
+//! The kernel consumes the post-transpose(1,2) q/k views directly (no contiguous
+//! copy) and — on the cache path — appends k/v into a caller-owned preallocated
+//! KV buffer, eliminating the per-step `Tensor::cat` (2 kernels/layer) from the
+//! code-predictor decode path.
+//!
+//! Math (split-half_d / GPT-NeoX convention, matching rotate_half in rope.rs):
+//!   partner(i) = i < half_d ? x[i+half_d] : x[i-half_d]      (half_d = head_dim/2)
+//!   rot(i)     = i < half_d ? -partner(i) : partner(i)
+//!   out[i]     = x[i]*cos[i] + rot[i]*sin[i]
+//! cos/sin use the cat(freqs,freqs) layout, so cos[i]==cos[i+half_d]; we index them
+//! directly (no duplication needed).
 //!
 //! Fallback: on a non-Metal device (or any unexpected shape), we fall back to
 //! the composite `apply_rotary_pos_emb_composite` directly — NOT the public
@@ -61,50 +71,89 @@ fn pipeline_for(
 }
 
 /// Fused RoPE for one attention layer. q `(b, q_heads, seq, head_dim)`, k
-/// `(b, kv_heads, seq, head_dim)`, cos/sin broadcastable to `(1,1,seq,head_dim)`
-/// (we only need the `(seq, head_dim)` values). Returns (q_rot, k_rot) with the
-/// same shapes/dtypes as the inputs. Falls back to the composite op sequence on
-/// any non-Metal device or shape we don't handle.
-///
-/// The q/k inputs may be non-contiguous (they're the transpose(1,2) of the
-/// (b, seq, heads, head_dim) projections). We `.contiguous()` them into the
-/// canonical (b, heads, seq, head_dim) layout — at m=1 that copy is 1–2 kernels,
-/// far cheaper than the ~12 the composite path issues, and it lets the kernel use
-/// a simple contiguous row*head_dim offset (no stride plumbing).
+/// `(b, kv_heads, seq, head_dim)` — the transpose(1,2) views are consumed
+/// directly (no copy). Returns (q_rot, k_rot) freshly allocated contiguous.
+/// Falls back to the composite op sequence on non-Metal / unsupported.
 pub fn apply_rope_fused(
     q: &Tensor,
     k: &Tensor,
     cos: &Tensor,
     sin: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
-    // Only handle the Metal + 4D + F32/BF16 case; anything else uses the
-    // well-tested composite path.
+    let (q, k, _v) = rope_fused_inner(q, k, None, cos, sin, 0)?;
+    Ok((q, k))
+}
+
+/// `apply_rope_fused` + **preallocated KV append**: k/v are appended directly
+/// into the caller-owned KV buffers (kv_heads, kv_cap, head_dim) at position
+/// `kv_pos` — eliminating the per-step `Tensor::cat` (2 kernels/layer) from the
+/// code-predictor decode path. Returns (q_rot, k_view, v_view): q is a fresh
+/// contiguous buffer; k/v are strided views into the KV buffers covering the
+/// appended range, consumable by the fused SDPA (`call_sdpa_vector`, which takes
+/// explicit strides) without a copy.
+pub fn apply_rope_fused_cache(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    kv_k: &Tensor, // (kv_heads, kv_cap, head_dim)
+    kv_v: &Tensor, // (kv_heads, kv_cap, head_dim)
+    kv_pos: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    rope_fused_inner(q, k, Some((v, kv_k, kv_v)), cos, sin, kv_pos)
+}
+
+/// The `v` / `kv` args are `Some((v, kv_k, kv_v))` only on the cache path.
+#[allow(clippy::type_complexity)]
+fn rope_fused_inner(
+    q: &Tensor,
+    k: &Tensor,
+    kv: Option<(&Tensor, &Tensor, &Tensor)>,
+    cos: &Tensor,
+    sin: &Tensor,
+    kv_pos: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let fallback = |q: &Tensor, k: &Tensor| -> Result<(Tensor, Tensor)> {
+        apply_rotary_pos_emb_composite(q, k, cos, sin, false).map_err(Into::into)
+    };
+
+    // Only handle the Metal + 4D + F32/BF16 + b==1 case; anything else uses the
+    // well-tested composite path (b>1 shares one stride set in the kernel).
     let device = match q.device() {
         Device::Metal(_) => q.device(),
-        _ => return apply_rotary_pos_emb_composite(q, k, cos, sin, false).map_err(Into::into),
+        _ => {
+            let (q, k) = fallback(q, k)?;
+            let v = match kv {
+                Some((v, _, _)) => v.clone(),
+                None => Tensor::zeros((), DType::F32, &Device::Cpu)?,
+            };
+            return Ok((q, k, v));
+        }
     };
     let dtype = q.dtype();
-    if dtype != k.dtype() || (dtype != DType::F32 && dtype != DType::BF16) {
-        return apply_rotary_pos_emb_composite(q, k, cos, sin, false).map_err(Into::into);
-    }
-
-    // Normalize q/k to 4D (b, heads, seq, head_dim). A 3D (b, seq, hidden) input
-    // can't be split into heads without knowing head_dim, so only 4D is fused.
-    if q.rank() != 4 || k.rank() != 4 {
-        return apply_rotary_pos_emb_composite(q, k, cos, sin, false).map_err(Into::into);
+    if dtype != k.dtype()
+        || (dtype != DType::F32 && dtype != DType::BF16)
+        || q.rank() != 4
+        || k.rank() != 4
+    {
+        let (q, k) = fallback(q, k)?;
+        let v = match kv {
+            Some((v, _, _)) => v.clone(),
+            None => Tensor::zeros((), DType::F32, &Device::Cpu)?,
+        };
+        return Ok((q, k, v));
     }
     let (b, q_heads, seq_len, head_dim) = q.dims4()?;
-    let k_dims = k.dims4()?;
-    let kv_heads = k_dims.1;
-    if k_dims.0 != b || k_dims.2 != seq_len || k_dims.3 != head_dim || b != 1 {
-        // b>1 shares one stride set in the kernel — only b==1 is exact there.
-        return apply_rotary_pos_emb_composite(q, k, cos, sin, false).map_err(Into::into);
+    let (kb, kv_heads, k_seq, khd) = k.dims4()?;
+    if b != 1 || kb != 1 || k_seq != seq_len || khd != head_dim {
+        let (q, k) = fallback(q, k)?;
+        let v = match kv {
+            Some((v, _, _)) => v.clone(),
+            None => Tensor::zeros((), DType::F32, &Device::Cpu)?,
+        };
+        return Ok((q, k, v));
     }
-
-    // Canonicalize to contiguous (b, heads, seq, head_dim). This collapses the
-    // transpose(1,2) non-contiguity into a clean layout the kernel indexes simply.
-    let q = q.contiguous()?;
-    let k = k.contiguous()?;
 
     let metal_dev = device.as_metal_device()?.clone();
     let pipeline = pipeline_for(&metal_dev, dtype)?;
@@ -124,9 +173,9 @@ pub fn apply_rope_fused(
     let k_rows = (b * kv_heads * seq_len) as i64;
     let head_dim_i = head_dim as i64;
     let seq_len_i = seq_len as i64;
+    let heads_q_i = q_heads as i64;
+    let heads_k_i = kv_heads as i64;
 
-    // Inputs are now contiguous (b, heads, seq, head_dim) → strides are the plain
-    // row-major ones. Pass them anyway so the kernel stays general.
     let q_el = q.elem_count();
     let k_el = k.elem_count();
 
@@ -134,12 +183,6 @@ pub fn apply_rope_fused(
     let (k_storage, k_layout) = k.storage_and_layout();
     let (cos_storage, cos_layout) = cos.storage_and_layout();
     let (sin_storage, sin_layout) = sin.storage_and_layout();
-
-    let st = q_layout.stride();
-    if st.len() != 4 || k_layout.stride() != st {
-        return apply_rotary_pos_emb_composite(&q, &k, &cos, &sin, false).map_err(Into::into);
-    }
-    let (sb, sh, ss, sd) = (st[0] as i64, st[1] as i64, st[2] as i64, st[3] as i64);
 
     let (q_ms, k_ms, cos_ms, sin_ms) =
         match (&*q_storage, &*k_storage, &*cos_storage, &*sin_storage) {
@@ -150,7 +193,56 @@ pub fn apply_rope_fused(
         };
 
     let q_out_buf = metal_dev.new_buffer(q_el, dtype, "rope_q_out")?;
-    let k_out_buf = metal_dev.new_buffer(k_el, dtype, "rope_k_out")?;
+    // Output targets: fresh k/v buffers (non-cache) or the preallocated KV
+    // buffers (cache). v is only read on the cache path.
+    let (k_out_buf, v_out_buf) = match kv {
+        Some((_, kv_k, kv_v)) => {
+            let (k_storage, _) = kv_k.storage_and_layout();
+            let (v_storage, _) = kv_v.storage_and_layout();
+            let (a, b) = match (&*k_storage, &*v_storage) {
+                (Storage::Metal(a), Storage::Metal(b)) => (a, b),
+                _ => bail!("rope_fused: non-metal kv cache storage"),
+            };
+            (
+                std::sync::Arc::new(a.buffer().clone()),
+                std::sync::Arc::new(b.buffer().clone()),
+            )
+        }
+        None => {
+            let k_out = metal_dev.new_buffer(k_el, dtype, "rope_k_out")?;
+            let v_out = metal_dev.new_buffer(k_el, dtype, "rope_v_out")?;
+            (k_out, v_out)
+        }
+    };
+    let (kv_cap_i, kv_pos_i, use_cache_i) = match kv {
+        Some((_, kv_k, _)) => {
+            let (_, cap, _) = kv_k.dims3()?;
+            (cap as i64, kv_pos as i64, 1i32)
+        }
+        None => (seq_len_i, 0, 0i32),
+    };
+    // v input buffer (cache path only): pass its REAL layout — v is a different
+    // narrow window of the qkv projection, so it has its own start offset (and
+    // the same strides as k). The kernel indexes v with k's strides; the
+    // per-tensor stride params stay identical across k and v (same shape).
+    // Non-cache arm: v_out is never read (the v rows early-return), so a dummy
+    // layout is fine there.
+    let id_layout = candle_core::Layout::contiguous(&[1, 1, 1, 1]);
+    let (v_buf, v_layout) = match kv {
+        Some((v, _, _)) => {
+            let (v_storage, v_layout) = v.storage_and_layout();
+            match &*v_storage {
+                Storage::Metal(a) => (std::sync::Arc::new(a.buffer().clone()), v_layout),
+                _ => bail!("rope_fused: non-metal v storage"),
+            }
+        }
+        None => (v_out_buf.clone(), &id_layout),
+    };
+    // Layout strides (elements) along the seq / head dims for q and k — the
+    // kernel consumes the post-transpose(1,2) views directly (decode: head
+    // stride = dim, seq stride = heads*dim) or contiguous inputs (prefill).
+    let (ss_q, sh_q) = (q_layout.stride()[2], q_layout.stride()[1]);
+    let (ss_k, sh_k) = (k_layout.stride()[2], k_layout.stride()[1]);
 
     {
         let guard = metal_dev.command_encoder()?;
@@ -161,22 +253,29 @@ pub fn apply_rope_fused(
             (
                 &buffer_o(q_ms.buffer(), q_layout, dtype),
                 &buffer_o(k_ms.buffer(), k_layout, dtype),
+                &buffer_o(&v_buf, &v_layout, dtype),
                 &buffer_o(cos_ms.buffer(), cos_layout, DType::F32),
                 &buffer_o(sin_ms.buffer(), sin_layout, DType::F32),
                 Output::new(&q_out_buf),
                 Output::new(&k_out_buf),
+                Output::new(&v_out_buf),
                 q_rows,
                 k_rows,
                 head_dim_i,
                 seq_len_i,
-                sb,
-                sh,
-                ss,
-                sd
+                heads_q_i,
+                heads_k_i,
+                ss_q as i64,
+                sh_q as i64,
+                ss_k as i64,
+                sh_k as i64,
+                kv_cap_i,
+                kv_pos_i,
+                use_cache_i
             )
         );
-        // Grid: x = head_dim (one thread per element), y = q_rows + k_rows.
-        let total_rows = (q_rows + k_rows) as usize;
+        // Grid: x = head_dim (one thread per element), y = q_rows + k_rows + v_rows.
+        let total_rows = (q_rows + k_rows + k_rows) as usize;
         let tgs = MTLSize {
             width: head_dim.min(256),
             height: 1,
@@ -196,11 +295,30 @@ pub fn apply_rope_fused(
         BackpropOp::none(),
         false,
     );
-    let k_out = Tensor::from_storage(
-        Storage::Metal(MetalStorage::new(k_out_buf, metal_dev.clone(), k_el, dtype)),
-        k.dims().to_vec(),
-        BackpropOp::none(),
-        false,
-    );
-    Ok((q_out, k_out))
+    match kv {
+        Some((_, kv_k, kv_v)) => {
+            // k/v views over the appended range: (1, kv_heads, kv_pos+seq_len, head_dim)
+            // via unsqueeze(0) (a view, no copy) — the fused SDPA takes explicit
+            // strides and reads the strided views directly. Per-head stride is
+            // kv_cap*head_dim (the preallocated buffers' dim-1 stride).
+            let kv_k = kv_k.narrow(1, 0, kv_pos + seq_len)?.unsqueeze(0)?;
+            let kv_v = kv_v.narrow(1, 0, kv_pos + seq_len)?.unsqueeze(0)?;
+            Ok((q_out, kv_k, kv_v))
+        }
+        None => {
+            let k_out = Tensor::from_storage(
+                Storage::Metal(MetalStorage::new(k_out_buf, metal_dev.clone(), k_el, dtype)),
+                k.dims().to_vec(),
+                BackpropOp::none(),
+                false,
+            );
+            let v_out = Tensor::from_storage(
+                Storage::Metal(MetalStorage::new(v_out_buf, metal_dev.clone(), k_el, dtype)),
+                k.dims().to_vec(),
+                BackpropOp::none(),
+                false,
+            );
+            Ok((q_out, k_out, v_out))
+        }
+    }
 }

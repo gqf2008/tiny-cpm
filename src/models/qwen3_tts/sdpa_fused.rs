@@ -62,11 +62,28 @@ pub fn sdpa_vector_attention(
         return Ok(None);
     }
 
-    // The kernel reads raw buffers with explicit strides; it needs contiguous q
-    // and contiguous k/v in (b, heads, seq, head_dim) layout.
+    // The kernel reads raw buffers with explicit strides; it needs q and k/v in
+    // (b, heads, seq, head_dim) layout. q is always materialized fresh
+    // (contiguous). k/v are kernel-readable when positions are contiguous in
+    // memory (seq-dim stride == head_dim) — true for a canonical contiguous
+    // tensor and for the quant path's preallocated-KV views (per-head stride =
+    // kv_cap*head_dim via k_stride, positions contiguous) — but NOT for the
+    // Full path's `Tensor::cat` output, which is a strided view of the prefill
+    // buffer with seq stride 1024 (heads interleaved in memory). Only those get
+    // copied to the canonical layout.
     let q = q.contiguous()?;
-    let k = k.contiguous()?;
-    let v = v.contiguous()?;
+    let (_unused_k, k_layout) = k.storage_and_layout();
+    let (_unused_v, v_layout) = v.storage_and_layout();
+    let k = if k.is_contiguous() || k_layout.stride()[2] == head_dim {
+        k.clone()
+    } else {
+        k.contiguous()?
+    };
+    let v = if v.is_contiguous() || v_layout.stride()[2] == head_dim {
+        v.clone()
+    } else {
+        v.contiguous()?
+    };
 
     let metal_dev = device.as_metal_device()?.clone();
     let out_el = b * q_heads * q_seq * head_dim;

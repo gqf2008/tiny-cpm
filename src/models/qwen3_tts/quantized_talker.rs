@@ -29,7 +29,7 @@ use candle_nn::{Module, RmsNorm, VarBuilder, ops};
 
 use crate::common::modules::eager_attention_forward;
 use crate::models::qwen3_tts::config::TalkerConfig;
-use crate::models::qwen3_tts::rope_fused::apply_rope_fused;
+use crate::models::qwen3_tts::rope_fused::apply_rope_fused_cache;
 use crate::models::qwen3_tts::swiglu_fused::swiglu_fused;
 
 /// One decoder layer, semantically identical to `Qwen3DecoderLayer` (RMSNorm →
@@ -60,19 +60,36 @@ struct QuantizedTalkerLayer {
     /// Output-row width of one of gate / up inside the fused gate_up_proj result
     /// (intermediate_size).
     mlp_rows: usize,
-    kv_cache: Option<(Tensor, Tensor)>,
+    /// Preallocated KV buffers, `(kv_heads, kv_cap, head_dim)` — the fused RoPE
+    /// kernel appends k/v directly (no per-step `Tensor::cat`), and decode
+    /// attention reads them as strided views (the fused SDPA takes explicit
+    /// strides). Both talker (cap = max generated frames) and code-predictor
+    /// (cap = 17) paths share this shape.
+    kv_k: Tensor,
+    kv_v: Tensor,
+    kv_pos: usize,
 }
 
 impl QuantizedTalkerLayer {
     /// Mirror of `Qwen3DecoderLayer::forward` + `QKNormAttention::forward` +
     /// `GateUpDownMLP::forward`. QMatMul takes/returns F32 (Metal kernel
     /// constraint), so the whole stream stays F32 here.
+    ///
+    /// KV cache: k/v are appended by the fused RoPE kernel directly into the
+    /// preallocated `(kv_heads, kv_cap, head_dim)` buffers at `kv_pos` (no
+    /// per-step `Tensor::cat`); decode attention consumes the narrowed strided
+    /// views via the fused SDPA (explicit strides). The masked prefill path
+    /// falls to the eager attention, which `contiguous()`s the views (copy —
+    /// once per frame, before the 15 decode steps). `kv_pos` is bumped by
+    /// `seq_len` here; the multi-step prefill (code predictor, 2 tokens) passes
+    /// the position in/out.
     fn forward(
         &mut self,
         xs: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        kv_pos: usize,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
@@ -90,17 +107,14 @@ impl QuantizedTalkerLayer {
         let v = v
             .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
-        // Fused RoPE: one Metal kernel instead of the ~12-op composite (falls back
-        // to `apply_rotary_pos_emb` internally on non-Metal / unexpected shapes).
-        let (q, k) = apply_rope_fused(&q, &k, cos, sin)?;
-        let (k, v) = match &self.kv_cache {
-            None => (k, v),
-            Some((prev_k, prev_v)) => (
-                Tensor::cat(&[prev_k, &k], 2)?,
-                Tensor::cat(&[prev_v, &v], 2)?,
-            ),
-        };
-        self.kv_cache = Some((k.clone(), v.clone()));
+        // Fused RoPE + KV append: ONE Metal kernel does the rotation AND writes
+        // k/v into the preallocated KV buffers at kv_pos (falls back to the
+        // composite `apply_rotary_pos_emb` internally on non-Metal / unexpected
+        // shapes, keeping the CPU test path working). Returns strided k/v views
+        // over the appended range — the fused SDPA consumes them without a copy.
+        let (q, k, v) =
+            apply_rope_fused_cache(&q, &k, &v, cos, sin, &self.kv_k, &self.kv_v, kv_pos)?;
+        self.kv_pos = kv_pos + q_len;
         let attn = eager_attention_forward(
             &q,
             &k,
@@ -139,6 +153,8 @@ pub struct QuantizedTalkerBackbone {
 impl QuantizedTalkerBackbone {
     /// Run the layer stack over `xs` (1, T, hidden), F32 in/out.
     /// `cos`/`sin`/`attention_mask` are built by the caller (`Talker::forward_step`).
+    /// `kv_pos` is the KV-cache write position — the SAME position for every layer
+    /// (each layer has its own buffer; the caller bumps it by T after the stack).
     ///
     /// NOTE: like the `Full` path (`Vec<Qwen3DecoderLayer>`), this returns the
     /// **raw** layer-stack output WITHOUT the final norm — `Talker::forward_step`
@@ -151,11 +167,12 @@ impl QuantizedTalkerBackbone {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        kv_pos: usize,
     ) -> Result<Tensor> {
         // QMatMul needs F32 activations on Metal.
         let mut xs = xs.to_dtype(DType::F32)?;
         for layer in self.layers.iter_mut() {
-            xs = layer.forward(&xs, cos, sin, attention_mask)?;
+            xs = layer.forward(&xs, cos, sin, attention_mask, kv_pos)?;
         }
         Ok(xs)
     }
@@ -170,14 +187,15 @@ impl QuantizedTalkerBackbone {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        kv_pos: usize,
     ) -> Result<Tensor> {
         let xs = xs.to_dtype(DType::F32)?;
-        self.layers[0].forward(&xs, cos, sin, attention_mask)
+        self.layers[0].forward(&xs, cos, sin, attention_mask, kv_pos)
     }
 
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
-            layer.kv_cache = None;
+            layer.kv_pos = 0;
         }
     }
 
@@ -189,11 +207,12 @@ impl QuantizedTalkerBackbone {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        kv_pos: usize,
     ) -> Result<Vec<Tensor>> {
         let mut xs = xs.to_dtype(DType::F32)?;
         let mut outs = Vec::with_capacity(self.layers.len());
         for layer in self.layers.iter_mut() {
-            xs = layer.forward(&xs, cos, sin, attention_mask)?;
+            xs = layer.forward(&xs, cos, sin, attention_mask, kv_pos)?;
             outs.push(xs.clone());
         }
         Ok(outs)
@@ -253,7 +272,10 @@ fn norm(vb: &VarBuilder, name: &str, eps: f64, device: &Device) -> Result<RmsNor
 /// `layers.{i}.self_attn.{q,k,v,o}_proj.weight`, `layers.{i}.mlp.{gate,up,down}_proj.weight`,
 /// the per-head `q_norm`/`k_norm`, and the layer norms — `"talker.model"` for the
 /// talker, `"code_predictor.model"` for the code predictor. `quant` is typically
-/// `GgmlDType::Q4K`. The final norm is NOT loaded here (the caller owns it).
+/// `GgmlDType::Q4K`. `kv_cap` is the per-head KV-cache capacity (the max total
+/// sequence the caller will ever run — talker: max generated frames, predictor:
+/// 2 prefill + 15 decode = 17). The final norm is NOT loaded here (the caller
+/// owns it).
 #[allow(clippy::too_many_arguments)]
 pub fn load_stack(
     vb: &VarBuilder,
@@ -265,6 +287,7 @@ pub fn load_stack(
     intermediate_size: usize,
     rms_norm_eps: f64,
     quant: GgmlDType,
+    kv_cap: usize,
     device: &Device,
 ) -> Result<QuantizedTalkerBackbone> {
     let eps = rms_norm_eps;
@@ -276,6 +299,10 @@ pub fn load_stack(
         let l = m.pp(format!("layers.{i}"));
         let a = l.pp("self_attn");
         let f = l.pp("mlp");
+        // Preallocated (kv_heads, kv_cap, head_dim) buffers; the fused RoPE kernel
+        // appends into them (initial garbage is never read before it is written).
+        let kv_k = Tensor::zeros((num_key_value_heads, kv_cap, head_dim), DType::F32, device)?;
+        let kv_v = Tensor::zeros((num_key_value_heads, kv_cap, head_dim), DType::F32, device)?;
         layers.push(QuantizedTalkerLayer {
             qkv_proj: qmat_fused(
                 &a,
@@ -297,7 +324,9 @@ pub fn load_stack(
             q_rows,
             kv_rows,
             mlp_rows: intermediate_size,
-            kv_cache: None,
+            kv_k,
+            kv_v,
+            kv_pos: 0,
         });
     }
     Ok(QuantizedTalkerBackbone { layers })
@@ -314,6 +343,7 @@ pub fn load(
 ) -> Result<QuantizedTalkerBackbone> {
     // The final norm (`talker.model.norm.weight`) is deliberately NOT loaded
     // here: `Talker` already owns and applies it once in `forward_step`.
+    // KV capacity: 4096 covers prompt + ICL ref + the max generated frames.
     load_stack(
         vb,
         "talker.model",
@@ -324,6 +354,7 @@ pub fn load(
         cfg.intermediate_size,
         cfg.rms_norm_eps,
         quant,
+        4096,
         device,
     )
 }

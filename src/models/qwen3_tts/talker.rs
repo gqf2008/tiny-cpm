@@ -128,6 +128,10 @@ struct CodePredictor {
     /// are equal (e.g. 0.6B, whose code predictor runs at the talker's 1024 and so has
     /// no `small_to_mtp_projection` tensor in the checkpoint); 1.7B projects 2048→1024.
     small_to_mtp: Option<Linear>,
+    /// Running KV write position for the Quant backbone's preallocated cache
+    /// (0 after `clear_kv_cache`; 2 after the prefill; bumped by each decode
+    /// step). The Full path tracks its own cache and ignores this.
+    kv_pos: usize,
 }
 
 /// The predictor's 5-layer Qwen3 stack: either the BF16 `Qwen3DecoderLayer`s or a
@@ -146,6 +150,7 @@ impl CodePredictorBackbone {
         cos: &Tensor,
         sin: &Tensor,
         mask: Option<&Tensor>,
+        kv_pos: usize,
     ) -> Result<Tensor> {
         match self {
             CodePredictorBackbone::Full(layers) => {
@@ -155,7 +160,7 @@ impl CodePredictorBackbone {
                 }
                 Ok(h)
             }
-            CodePredictorBackbone::Quant(backbone) => backbone.forward(xs, cos, sin, mask),
+            CodePredictorBackbone::Quant(backbone) => backbone.forward(xs, cos, sin, mask, kv_pos),
         }
     }
 
@@ -209,6 +214,9 @@ impl CodePredictor {
                 cfg.intermediate_size,
                 cfg.rms_norm_eps,
                 q,
+                // KV capacity: 2-token prefill + 15 codebook decode steps, cleared
+                // per frame. The fused-RoPE append writes at kv_pos = 0..16.
+                17,
                 device,
             )?),
             _ => {
@@ -265,15 +273,19 @@ impl CodePredictor {
             lm_head,
             dtype,
             small_to_mtp,
+            kv_pos: 0,
         })
     }
 
     fn clear_kv_cache(&mut self) {
         self.layers.clear_kv_cache();
+        self.kv_pos = 0;
     }
 
     /// One decoder forward over `embeds` (1, T, talker_hidden), projecting to predictor
     /// hidden size first. Returns the last-position hidden (1, predictor_hidden).
+    /// Bumps `self.kv_pos` by T (the Quant backbone's preallocated-cache write
+    /// position).
     fn forward_hidden(&mut self, embeds: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         // Project to predictor hidden only when the dims differ (0.6B runs them equal).
         let xs = match &self.small_to_mtp {
@@ -292,7 +304,13 @@ impl CodePredictor {
             )?)
         };
         let (cos, sin) = self.rotary.forward(seqlen_offset, seq_len, xs.device())?;
-        let h = self.layers.forward(&xs, &cos, &sin, mask.as_ref())?;
+        // `kv_pos` is the KV write position for the Quant backbone (the Full
+        // path's layers track their own caches; `seqlen_offset` is only used for
+        // RoPE/cos-sin indexing, which stays exact on both paths).
+        let h = self
+            .layers
+            .forward(&xs, &cos, &sin, mask.as_ref(), self.kv_pos)?;
+        self.kv_pos += seq_len;
         // The Quant backbone returns F32; the final norm + lm_head run at
         // `self.dtype` (BF16 in the checkpoint), so cast back (mirrors how
         // Talker::forward_step_gpu casts the quant talker output to self.dtype).
@@ -391,6 +409,7 @@ impl TalkerBackbone {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        kv_pos: usize,
     ) -> Result<Tensor> {
         match self {
             Self::Full(layers) => {
@@ -400,7 +419,7 @@ impl TalkerBackbone {
                 }
                 Ok(h)
             }
-            Self::Quant(b) => b.forward(xs, cos, sin, attention_mask),
+            Self::Quant(b) => b.forward(xs, cos, sin, attention_mask, kv_pos),
         }
     }
     fn clear_kv_cache(&mut self) {
@@ -422,6 +441,7 @@ impl TalkerBackbone {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        kv_pos: usize,
     ) -> Result<Vec<Tensor>> {
         match self {
             Self::Full(layers) => {
@@ -435,7 +455,7 @@ impl TalkerBackbone {
                 }
                 Ok(outs)
             }
-            Self::Quant(b) => b.forward_trace(xs, cos, sin, attention_mask),
+            Self::Quant(b) => b.forward_trace(xs, cos, sin, attention_mask, kv_pos),
         }
     }
 }
@@ -648,7 +668,13 @@ impl Talker {
         let (cos, sin) = self
             .rotary
             .forward(seqlen_offset, seq_len, embeds.device())?;
-        let h = self.backbone.forward(embeds, &cos, &sin, mask.as_ref())?;
+        // `seqlen_offset` IS the KV write position: the prefill runs with offset
+        // 0 (and its own mask), every later single-token step runs with the
+        // running position. The Quant backbone appends k/v into its preallocated
+        // buffers at this position (the Full path ignores it).
+        let h = self
+            .backbone
+            .forward(embeds, &cos, &sin, mask.as_ref(), seqlen_offset)?;
         // The Quant backbone runs F32 (Metal QMatMul); cast back to the talker
         // dtype for norm/codec_head. No-op on the Full path.
         let h = h.to_dtype(self.dtype)?;
@@ -1099,6 +1125,12 @@ impl Talker {
         // GPU path: keep the running token as an on-device (1,) u32 tensor; gather its
         // embedding without a readback. Collect the 15 token tensors; the caller does
         // the single end-of-frame readback (code0 + these + EOS) in generate_stream.
+        //
+        // `QWEN3_TTS_PRED_GC=1` forces greedy (argmax) predictor sampling — the
+        // measured top-1 confidence is only 5-9%, so greedy visibly degrades the
+        // output; this switch exists for A/B benchmarking of the greedy batched
+        // prefill path, not as a production knob.
+        let greedy_pred = env_flag("QWEN3_TTS_PRED_GC", false);
         let spec_probe = env_flag("QWEN3_TTS_SPEC_PROBE", false);
         let mut token_tensors: Vec<Tensor> = Vec::with_capacity(n_groups);
         for g in 0..n_groups {
@@ -1124,7 +1156,7 @@ impl Talker {
             }
             let token = gpu_sample_token(
                 &logits,
-                gen_cfg.subtalker_dosample,
+                gen_cfg.subtalker_dosample && !greedy_pred,
                 gen_cfg.subtalker_temperature,
                 gen_cfg.subtalker_top_k,
                 gen_cfg.subtalker_top_p,

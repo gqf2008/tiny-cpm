@@ -145,6 +145,7 @@ fn check_layer0_matches(
         qcfg.intermediate_size,
         qcfg.rms_norm_eps,
         candle_core::quantized::GgmlDType::F32,
+        4096, // kv_cap: 4096 covers prefill(6) + decode in this test
         &device,
     )
     .unwrap();
@@ -163,7 +164,7 @@ fn check_layer0_matches(
         .forward(&prefill_x, &cos, &sin, Some(&mask))
         .unwrap();
     let mir_pre = mirror
-        .forward_layer0_only(&prefill_x, &cos, &sin, Some(&mask))
+        .forward_layer0_only(&prefill_x, &cos, &sin, Some(&mask), 0)
         .unwrap();
     let e_pre = max_rel(&ref_pre, &mir_pre);
     eprintln!("{label} prefill  layer0: ref vs mirror rel={e_pre:.3e}");
@@ -172,7 +173,7 @@ fn check_layer0_matches(
     let (cos1, sin1) = rotary.forward(p, 1, &device).unwrap();
     let ref_dec = ref_layer.forward(&decode_x, &cos1, &sin1, None).unwrap();
     let mir_dec = mirror
-        .forward_layer0_only(&decode_x, &cos1, &sin1, None)
+        .forward_layer0_only(&decode_x, &cos1, &sin1, None, p)
         .unwrap();
     let e_dec = max_rel(&ref_dec, &mir_dec);
     eprintln!("{label} decode   layer0: ref vs mirror rel={e_dec:.3e}");
