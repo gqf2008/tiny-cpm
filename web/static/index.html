@@ -428,9 +428,14 @@ function handleMicFrame(in0){
   $('rmsMeter').style.width = Math.min(100, r*400)+'%';
   $('rmsVal').textContent = r.toFixed(4);
   if (!ws || ws.readyState !== 1) return;
-  if (r < rmsGate) return;
-  // Anti-aliasing low-pass (in-place; the raw frame is no longer needed).
+  // Anti-aliasing low-pass (in-place; the raw frame is no longer needed). Applied
+  // to every frame (even gated-out ones) so the filter state stays continuous and
+  // speech resuming after a quiet gap doesn't hit a stale-filter discontinuity.
   const lpA = 1 - Math.exp(-2 * Math.PI * 8000 / ctx.sampleRate);
+  if (r < rmsGate) {
+    for (let i = 0; i < in0.length; i++) micLpState += lpA * (in0[i] - micLpState);
+    return;
+  }
   for (let i = 0; i < in0.length; i++) { micLpState += lpA * (in0[i] - micLpState); in0[i] = micLpState; }
   const ratio = ctx.sampleRate / IN_SR;
   const outLen = Math.floor(in0.length / ratio);

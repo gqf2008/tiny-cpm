@@ -1037,7 +1037,6 @@ impl Talker {
         Ok(Tensor::from_vec(flat, (n, num_code_groups), &self.device)?)
     }
 
-    /// Run the code predictor for one frame (codebook 0 already known). Returns 15 codes.
     /// Run the code predictor for one frame (codebook 0 already known). Returns the
     /// 15 codebook-1..=15 tokens as **on-device** (1,) u32 tensors (default GPU path)
     /// so the caller can feed them back into `frame_embed_gpu` without a readback;

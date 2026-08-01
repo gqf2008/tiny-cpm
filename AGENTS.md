@@ -74,6 +74,7 @@ Upstream `quantized_llama` assumes `head_dim == hidden_size / num_heads` and `nu
 ## Testing strategy
 
 - `cargo test` runs CPU-only unit tests: causal-mask tests in `quantized_minicpm5.rs`, `is_repeating`/`after_think` boundary tests in `exec/chat.rs`, plus config-parsing / feature-length / splice-shape tests added during the aha ports.
+- Integration tests (`tests/layer_wiring.rs`, `tests/gpu_sampling.rs`) need Metal + weights in `./models/` and are not part of the CPU-only `cargo test` run.
 - No CI. Real verification is empirical: run the binary against actual weights in `./models/` and check output quality.
 
 ## Code conventions

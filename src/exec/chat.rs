@@ -230,9 +230,13 @@ pub fn generate_reply_with_history(
     // Decode loop: stream each token (tags stripped) until EOS or max_tokens.
     let t_dec = std::time::Instant::now();
     let mut generated = 0usize;
-    // Repetition-guard kill-switch: TINY_CPM_REPEAT_GUARD=0 disables it.
+    // Repetition-guard kill-switch: TINY_CPM_REPEAT_GUARD=0/off/false/no disables it
+    // (same value convention as the qwen3-tts env knobs).
     let repeat_guard = match std::env::var("TINY_CPM_REPEAT_GUARD") {
-        Ok(v) => v.trim() != "0",
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "off" | "false" | "no"
+        ),
         Err(_) => true,
     };
     for index in 0..max_tokens {

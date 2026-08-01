@@ -34,7 +34,8 @@ cargo build --release
 cargo check
 cargo fmt
 cargo clippy
-cargo test    # CPU-only unit tests (masks, feature-length math, config parsing, chat repeat-guard)
+cargo test    # CPU-only unit tests (masks, feature-length math, config parsing, chat repeat-guard);
+                # layer_wiring/gpu_sampling need Metal + weights in ./models/
 ```
 
 Output contract: payload (chat/transcript) → **stdout**; diagnostics → **stderr**; TTS writes WAV to the given path.
