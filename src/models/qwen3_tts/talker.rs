@@ -1031,9 +1031,6 @@ impl Talker {
 
         let flat: Vec<u32> = frames.into_iter().flatten().collect();
         let n = flat.len() / num_code_groups;
-        if std::env::var("QWEN3_TTS_DUMP_CODES").is_ok() {
-            eprintln!("CANDLE_CODES frames={n} {flat:?}");
-        }
         Ok(Tensor::from_vec(flat, (n, num_code_groups), &self.device)?)
     }
 
@@ -1125,18 +1122,9 @@ impl Talker {
                     p1 / z
                 );
             }
-            if std::env::var("QWEN3_TTS_DUMP_CODES").is_ok() && g == 6 {
-                let lf: Vec<f32> = logits.to_dtype(DType::F32)?.to_vec2::<f32>()?[0].clone();
-                let mut idx: Vec<usize> = (0..lf.len()).collect();
-                idx.sort_by(|&a, &b| lf[b].total_cmp(&lf[a]));
-                eprintln!(
-                    "CANDLE_DUMP cp g=0 top5 {:?}",
-                    idx[..5].iter().map(|&i| (lf[i], i)).collect::<Vec<_>>()
-                );
-            }
             let token = gpu_sample_token(
                 &logits,
-                gen_cfg.subtalker_dosample && std::env::var("QWEN3_TTS_GREEDY").is_err(),
+                gen_cfg.subtalker_dosample,
                 gen_cfg.subtalker_temperature,
                 gen_cfg.subtalker_top_k,
                 gen_cfg.subtalker_top_p,
