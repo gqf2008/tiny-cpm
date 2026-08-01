@@ -187,6 +187,7 @@ impl CodePredictor {
                 cfg.num_attention_heads,
                 cfg.num_key_value_heads,
                 cfg.head_dim,
+                cfg.intermediate_size,
                 cfg.rms_norm_eps,
                 q,
                 device,

@@ -36,12 +36,14 @@ use crate::models::qwen3_tts::swiglu_fused::swiglu_fused;
 /// per-head-QK-norm GQA attention with KV cache → residual → RMSNorm → SwiGLU
 /// MLP → residual), but with the 7 projections as QMatMul.
 struct QuantizedTalkerLayer {
-    q_proj: QMatMul,
-    k_proj: QMatMul,
-    v_proj: QMatMul,
+    /// Fused q/k/v projection: the three F32 weight matrices are stacked along the
+    /// output dim and quantized as ONE QTensor, so a single GEMV launch produces
+    /// `[q | k | v]` (split after the matmul). Cuts 3 launches/layer → 1.
+    qkv_proj: QMatMul,
     o_proj: QMatMul,
-    gate_proj: QMatMul,
-    up_proj: QMatMul,
+    /// Fused gate/up projection: stacked along the output dim into one QTensor; one
+    /// GEMV produces `[gate | up]`, which swiglu_fused consumes after a split.
+    gate_up_proj: QMatMul,
     down_proj: QMatMul,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
@@ -51,6 +53,13 @@ struct QuantizedTalkerLayer {
     num_kv_heads: usize,
     num_kv_groups: usize,
     head_dim: usize,
+    /// Output-row widths of the q / k / v slices inside the fused qkv_proj result
+    /// (num_heads*head_dim, num_kv_heads*head_dim, num_kv_heads*head_dim).
+    q_rows: usize,
+    kv_rows: usize,
+    /// Output-row width of one of gate / up inside the fused gate_up_proj result
+    /// (intermediate_size).
+    mlp_rows: usize,
     kv_cache: Option<(Tensor, Tensor)>,
 }
 
@@ -68,20 +77,18 @@ impl QuantizedTalkerLayer {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
         let (b_sz, q_len, _) = xs.dims3()?;
-        // Per-head QK RMSNorm on (b, q_len, heads, head_dim) before transpose+RoPE.
-        let q = self
-            .q_proj
-            .forward(&xs)?
+        // Fused QKV: one GEMV over the stacked [q|k|v] weight, then split the output
+        // rows. Per-head QK RMSNorm on (b, q_len, heads, head_dim) before transpose+RoPE.
+        let qkv = self.qkv_proj.forward(&xs)?; // (b, q_len, q_rows + 2*kv_rows)
+        let q = qkv.narrow(2, 0, self.q_rows)?;
+        let k = qkv.narrow(2, self.q_rows, self.kv_rows)?;
+        let v = qkv.narrow(2, self.q_rows + self.kv_rows, self.kv_rows)?;
+        let q = q
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?;
         let q = self.q_norm.forward(&q)?.transpose(1, 2)?;
-        let k =
-            self.k_proj
-                .forward(&xs)?
-                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?;
+        let k = k.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?;
         let k = self.k_norm.forward(&k)?.transpose(1, 2)?;
-        let v = self
-            .v_proj
-            .forward(&xs)?
+        let v = v
             .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
         // Fused RoPE: one Metal kernel instead of the ~12-op composite (falls back
@@ -108,10 +115,11 @@ impl QuantizedTalkerLayer {
 
         let residual = &xs;
         let xs = self.post_attention_layernorm.forward(&xs)?;
-        // SwiGLU: fuse silu(gate)*up into one Metal kernel when possible (the
-        // QMatMul projections output F32 on Metal, which swiglu_fused handles).
-        let gate = self.gate_proj.forward(&xs)?;
-        let up = self.up_proj.forward(&xs)?;
+        // Fused gate/up: one GEMV over the stacked [gate|up] weight, split, then SwiGLU
+        // (fuse silu(gate)*up into one Metal kernel when possible).
+        let gate_up = self.gate_up_proj.forward(&xs)?; // (b, q_len, 2*mlp_rows)
+        let gate = gate_up.narrow(2, 0, self.mlp_rows)?;
+        let up = gate_up.narrow(2, self.mlp_rows, self.mlp_rows)?;
         let gated = match swiglu_fused(&gate, &up) {
             Some(f) => f?,
             None => (ops::silu(&gate)? * up)?,
@@ -203,6 +211,34 @@ fn qmat(vb: &VarBuilder, name: &str, quant: GgmlDType, device: &Device) -> Resul
     Ok(QMatMul::from_qtensor(qt)?)
 }
 
+/// Quantize SEVERAL 2-D weights (CPU), stacked along the output rows (dim 0) into ONE
+/// QTensor → a single `QMatMul` whose forward produces the concatenated output. The
+/// caller splits the rows back out. Fusing q/k/v (or gate/up) into one GEMV cuts the
+/// per-layer kernel-launch count, which is the predictor's binding constraint at m=1.
+/// Stacking happens in F32 *before* quantization, so each output row is quantized by
+/// the same Q4_K super-block scheme the separate path would use (numerics equivalent,
+/// not bit-identical, to the unfused weights — validated by the ASR round-trip).
+fn qmat_fused(
+    vb: &VarBuilder,
+    names: &[&str],
+    quant: GgmlDType,
+    device: &Device,
+) -> Result<QMatMul> {
+    let mut mats = Vec::with_capacity(names.len());
+    for name in names {
+        let t = vb
+            .get_unchecked(name)
+            .with_context(|| format!("talker weight `{name}`"))?
+            .to_dtype(DType::F32)?;
+        mats.push(t);
+    }
+    let refs: Vec<&Tensor> = mats.iter().collect();
+    let stacked = Tensor::cat(&refs, 0).context("stack fused projection weights")?;
+    let qt = QTensor::quantize_onto(&stacked, quant, device)
+        .with_context(|| format!("quantize fused {names:?} to {quant:?}"))?;
+    Ok(QMatMul::from_qtensor(qt)?)
+}
+
 /// Load a small (norm) weight to an F32 `RmsNorm` on `device`.
 fn norm(vb: &VarBuilder, name: &str, eps: f64, device: &Device) -> Result<RmsNorm> {
     let w = vb
@@ -227,6 +263,7 @@ pub fn load_stack(
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
+    intermediate_size: usize,
     rms_norm_eps: f64,
     quant: GgmlDType,
     device: &Device,
@@ -234,17 +271,21 @@ pub fn load_stack(
     let eps = rms_norm_eps;
     let m = vb.pp(prefix);
     let mut layers = Vec::with_capacity(num_hidden_layers);
+    let q_rows = num_attention_heads * head_dim;
+    let kv_rows = num_key_value_heads * head_dim;
     for i in 0..num_hidden_layers {
         let l = m.pp(format!("layers.{i}"));
         let a = l.pp("self_attn");
         let f = l.pp("mlp");
         layers.push(QuantizedTalkerLayer {
-            q_proj: qmat(&a, "q_proj.weight", quant, device)?,
-            k_proj: qmat(&a, "k_proj.weight", quant, device)?,
-            v_proj: qmat(&a, "v_proj.weight", quant, device)?,
+            qkv_proj: qmat_fused(
+                &a,
+                &["q_proj.weight", "k_proj.weight", "v_proj.weight"],
+                quant,
+                device,
+            )?,
             o_proj: qmat(&a, "o_proj.weight", quant, device)?,
-            gate_proj: qmat(&f, "gate_proj.weight", quant, device)?,
-            up_proj: qmat(&f, "up_proj.weight", quant, device)?,
+            gate_up_proj: qmat_fused(&f, &["gate_proj.weight", "up_proj.weight"], quant, device)?,
             down_proj: qmat(&f, "down_proj.weight", quant, device)?,
             q_norm: norm(&a, "q_norm.weight", eps, device)?,
             k_norm: norm(&a, "k_norm.weight", eps, device)?,
@@ -254,6 +295,9 @@ pub fn load_stack(
             num_kv_heads: num_key_value_heads,
             num_kv_groups: num_attention_heads / num_key_value_heads,
             head_dim,
+            q_rows,
+            kv_rows,
+            mlp_rows: intermediate_size,
             kv_cache: None,
         });
     }
@@ -278,6 +322,7 @@ pub fn load(
         cfg.num_attention_heads,
         cfg.num_key_value_heads,
         cfg.head_dim,
+        cfg.intermediate_size,
         cfg.rms_norm_eps,
         quant,
         device,
