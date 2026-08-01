@@ -34,3 +34,6 @@ target
 # Local reference audio (voice-clone inputs, not committed)
 *.wav
 !models/**/*.wav
+
+# Editor/tool session state (Zed .zcode plans, etc.)
+.zcode/
