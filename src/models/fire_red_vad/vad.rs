@@ -58,6 +58,14 @@ pub struct FireRedVad {
     look_back_frames: usize,
     min_speach_ratio: f32,
     end_silence_ratio: f32,
+    // Trailing-silence endpointing for the streaming path: how many CONSECUTIVE
+    // non-speech frames must pass before we cut the segment. Without this the
+    // else-branch below cut on a SINGLE non-speech frame, so any mid-utterance
+    // breath/pause/word-search fragmented one utterance into many short turns
+    // ("ASR only hears the first phrase"). This is what the web `silence_ms`
+    // slider actually maps onto (silence_ms / 10ms per frame).
+    trailing_silence_frames: usize,
+    silence_run: usize,
     // Per-frame neural speech flag from the last `detect_frame` call — set from
     // `preds_sum > probs_len * min_speach_ratio` (the same threshold the segment
     // accumulator uses). Exposed for realtime barge-in: a caller can read it to
@@ -112,8 +120,16 @@ impl FireRedVad {
                 .unwrap_or(default)
         };
         // Postprocessor config (VadPostprocessor reads these).
-        cfg.speech_threshold = envf("VAD_SPEECH_THRESHOLD", ov.speech_threshold, cfg.speech_threshold);
-        cfg.min_speech_frame = envu("VAD_MIN_SPEECH_FRAME", ov.min_speech_frame, cfg.min_speech_frame);
+        cfg.speech_threshold = envf(
+            "VAD_SPEECH_THRESHOLD",
+            ov.speech_threshold,
+            cfg.speech_threshold,
+        );
+        cfg.min_speech_frame = envu(
+            "VAD_MIN_SPEECH_FRAME",
+            ov.min_speech_frame,
+            cfg.min_speech_frame,
+        );
         // Default min_silence_frame 45 (raised from upstream 20) for realtime
         // dialogue: a longer minimum trailing silence before endpointing, so
         // mid-sentence pauses don't cut the user off. The `vad` subcommand
@@ -133,8 +149,13 @@ impl FireRedVad {
         let look_back_frames = envu("VAD_LOOK_BACK_FRAMES", ov.look_back_frames, 50);
         eprintln!(
             "vad params: speech_threshold={} min_speech_frame={} min_silence_frame={} | min_speach_ratio={} end_silence_ratio={} min_speach_frames={} look_back_frames={}",
-            cfg.speech_threshold, cfg.min_speech_frame, cfg.min_silence_frame,
-            min_speach_ratio, end_silence_ratio, min_speach_frames, look_back_frames
+            cfg.speech_threshold,
+            cfg.min_speech_frame,
+            cfg.min_silence_frame,
+            min_speach_ratio,
+            end_silence_ratio,
+            min_speach_frames,
+            look_back_frames
         );
         Ok(Self {
             audio_feat,
@@ -151,6 +172,11 @@ impl FireRedVad {
             look_back_frames,  // 约 80ms
             min_speach_ratio,
             end_silence_ratio,
+            // Default 80 frames (~800ms at the 10ms frame shift): match the web
+            // `silence_ms=800` default so mid-utterance pauses up to ~0.8s don't
+            // cut the user off. Tunable via VadOverrides / silence_ms.
+            trailing_silence_frames: 80,
+            silence_run: 0,
             last_frame_speech: false,
         })
     }
@@ -180,6 +206,8 @@ impl FireRedVad {
         let frame_is_speech = preds_sum as f32 > probs_len as f32 * self.min_speach_ratio;
         self.last_frame_speech = frame_is_speech;
         let final_data = if frame_is_speech {
+            // 有人声：重置连续静音计数，累积人声帧。
+            self.silence_run = 0;
             self.speech_cache.push(audio_frame.clone());
             let preds = binary_preds.to_vec1::<u32>()?;
             self.pred_cache.extend_from_slice(&preds);
@@ -207,17 +235,26 @@ impl FireRedVad {
                 }
             }
         } else {
-            // 认为这帧数据没有人声
-            // 有缓存数据, 且数据够长
-            if self.pred_cache.len() >= self.min_speach_frames {
+            // 这帧被判为非人声。不立即切——累计连续静音帧，只有持续静音达到
+            // trailing_silence_frames 才结束这一段。这样句中换气/停顿/想词
+            // （短暂的非人声帧）不会把一整句话切成好几段。
+            self.silence_run += 1;
+            if self.pred_cache.len() >= self.min_speach_frames
+                && self.silence_run >= self.trailing_silence_frames
+            {
                 let data = Tensor::cat(&self.speech_cache, 0)?;
                 self.speech_cache.clear();
                 self.pred_cache.clear();
+                self.silence_run = 0;
                 Some(data)
-            } else {
-                // 否则直接清空缓存
+            } else if self.silence_run >= self.trailing_silence_frames {
+                // 静音够长但人声缓存太短（不足 min_speach_frames，多为噪声段），丢弃。
                 self.speech_cache.clear();
                 self.pred_cache.clear();
+                self.silence_run = 0;
+                None
+            } else {
+                // 还在尾部静音窗口内，继续等（保留缓存，人声可能恢复）。
                 None
             }
         };
@@ -314,6 +351,11 @@ impl FireRedVad {
         }
         if let Some(v) = o.min_silence_frame {
             self.vad_postprocessor.min_silence_frame = v;
+            // Also drive the streaming trailing-silence endpoint: the web
+            // `silence_ms` slider is converted to frames (silence_ms/10) by the
+            // caller and arrives here as min_silence_frame, so keep the two in
+            // sync — this is the value the streaming path actually uses.
+            self.trailing_silence_frames = v;
         }
         if let Some(v) = o.min_speach_ratio {
             self.min_speach_ratio = v;
@@ -338,7 +380,6 @@ impl FireRedVad {
         self.last_frame_speech
     }
 }
-
 
 /// aha `utils::get_device` (metal-build branch; tiny-cpm is Metal-only).
 fn get_device(device: Option<&Device>) -> Device {
