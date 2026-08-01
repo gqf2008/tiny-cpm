@@ -1,0 +1,134 @@
+# burn-tts-spike
+
+Qwen3-TTS-12Hz-1.7B-Base 核心路径移植到 **burn 0.22.0-pre.1**（本地 checkout，
+`/Volumes/Workspace/GitHub/burn`，`metal` feature = burn-wgpu → cubecl wgpu runtime +
+MSL 编译器），评估 tiny-cpm 从 candle 迁移到 burn 的可行性（第二阶段：TTS）。
+
+范围（用户确认）：**talker（28 层 Qwen3）+ code predictor（5 层 × 15 AR 步）+ Mimi
+codec decoder + GPU 采样**。明确不做：`--ref` 声音克隆（speaker encoder + codec encoder）、
+`--stream` 流式、量化（GGUF/k-quant 缺口）。
+
+## 用法
+
+```bash
+cargo run --release -- <model-dir> "<text>" <out.wav> [--language zh|en] [--max-frames N] [--codes-file <file>]
+# 例：
+../target-shared/release/burn-tts-spike /Volumes/Workspace/GitHub/tiny-cpm/models/Qwen3-TTS-12Hz-1.7B-Base \
+    "The quick brown fox jumps over the lazy dog." /tmp/out.wav
+```
+
+- 音频时长 / gen、codec 分段耗时、RTF → stderr。
+- 先完整跑 1 轮 warmup（MSL 着色器编译 + matmul autotune），再计正式轮。
+- `--codes-file <file>`：跳过 talker，把外部 (n,16) codes 直接喂给 codec
+  （codec 单独验证用）。**注意**：文件是 frame-major 的（每帧 16 个 code 连续），
+  见踩坑 #2。
+- 权重 bf16 safetensors → 加载时统一转 **f16**（cubecl-wgpu Metal 无 BF16）。
+  talker 用 f16，codec 保持 **f32**（与 candle 一致，也便于逐位对照）。
+
+### 诊断环境变量（全部可选）
+
+| env | 作用 |
+|---|---|
+| `BURN_TTS_GREEDY=1` | 强制 argmax（对照 candle 的 `QWEN3_TTS_GREEDY=1` 验证用） |
+| `BURN_TTS_DUMP_CODES=1` | stderr 打印 (n,16) codes（对照 candle 的 `CANDLE_CODES` dump） |
+| `BURN_TTS_DUMP_PCM=1` | stderr 打印 F32 PCM（codec 数值对照用） |
+| `BURN_TTS_DEBUG=1` | predictor 每步中间值 dump（g=2 hidden / g=3 logits top5，对照 `CANDLE_DUMP`） |
+| `BURN_TTS_F32=1` | talker 改用 f32（诊断用，**慢 8 倍**，见基准表） |
+
+## 验证结果
+
+### Phase 1 — talker + predictor codes 逐位对比（candle `QWEN3_TTS_GREEDY=1` + codes dump）
+
+同文本 greedy 对比：**帧 0–1 的 32 个 codes 逐位一致**；帧 2 起分歧，归因为
+**并行 logits 平票的精度翻转**而非移植 bug：
+
+- candle（bf16）：`logits[1174] == logits[1531] == 32.75`（完全平票，argmax 取先者）
+- burn（f32 对照）：`logits[1531]` 高 0.04 → 选 1531
+- f16 与 f32 两个 burn 版本在同一位置分歧方向一致，排除 dtype 转换 bug；
+  gumbel 采样模式下平票被噪声打破，实际输出不受影响。
+
+（candle 侧靠临时 env-gated 补丁 dump codes，验证完已还原。）
+
+### Phase 2 — 同 codes → PCM 数值对比（candle 41 帧 greedy codes 喂两边 codec）
+
+| 指标 | 值 |
+|---|---|
+| max\|Δ\| | **10 LSB**（满量程 32767） |
+| 逐位一致 | 71.7%（56434/78720 samples） |
+| mean\|Δ\| | 0.37 LSB |
+| RMS | 1438.2 vs 1438.0（candle / burn） |
+
+结论：**codec 移植数值等价**（余量是 fp32 算子级舍入，-70 dB 以下听不到）。
+顺带验证了 `chunked_decode(300,25)` 语义：41 帧 < 300 → 单 chunk、context 0 → 等价于
+全量 decode。
+
+### Phase 3 — 端到端基准（同机同负载，M4，`vm.loadavg` 1min ~2.4，采样模式默认配置）
+
+文本：`The quick brown fox jumps over the lazy dog.`
+
+| | candle 0.11 (bf16) | burn 0.22-pre (f16 talker + f32 codec) |
+|---|---|---|
+| load | 9.0 s（冷，首次 mmap）→ 0.6 s（暖） | 3.7–6.9 s |
+| RTF | 1.03 / 1.01 / 0.99 | **2.49 / 2.38 / 2.51** |
+| 分段 | — | gen ~4.5–5.0 s（40–46 帧），codec ~3.4–3.8 s |
+
+结论：**总 RTF ~2.5，比 candle BF16（~1.0）慢 ~2.4 倍**。分段看：talker 生成
+~1.8×，codec ~3×。对照 burn-asr-spike 的持平结论（ASR 是 prefill 主导的大 matmul、
+占用率高；TTS 是每帧 16 步串行 m=1 decode + 大量小 conv，**launch-bound**）——
+burn 的算子融合没有自动补偿这部分开销，且 `BURN_TTS_F32=1` 时 gen 慢 8 倍
+（37.5 s vs 4.5 s），说明 f16 是硬需求，剩余差距在 kernel 调度而非 dtype。
+
+后续优化点（记录，不在本次范围）：causal conv 的左 pad+cat 合并进单个 kernel；
+codec 小 conv 的 fused kernel；预测器 15 步的并行/投机解码提高 m=1 占用率。
+
+## 移植要点与踩坑记录（burn 0.22.0-pre.1，TTS 特有）
+
+1. **f16 方差溢出**（与 ASR spike 相同）：所有 rms_norm/layer_norm 的方差计算上提
+   f32，否则 talker 激活 ~5800 的平方溢出 65504 → norm 退化为恒等 → 整网乱码。
+2. **codes 的 frame-major → (1,16,n) 布局必须转置，不能 reshape**（本 spike 最大的坑）：
+   dump/生成是 frame-major（`[f0c0..f0c15, f1c0..]`），codec 要 codebook-major
+   `(1,16,n)`。`reshape([1,16,n])` 会把 codebook 和帧交织（元素 `[cb][f] = flat[cb*n+f]`，
+   而正确值在 `flat[f*16+cb]`；n=41 时全乱）。正确做法：
+   `from_ints(..).reshape([n,16]).swap_dims(0,1).unsqueeze()`（与 candle 的
+   `codes.t().unsqueeze(0)` 等价）。症状：**codes 逐位一致但 PCM 完全不对**
+   （波形相关度 ~0、音量差 3.5×），非常隐蔽——Phase 1 只验 codes 抓不到。
+3. **`conv_transpose1d` 在 burn 0.22 可用**：权重布局 `(in, out, k)`（与 candle
+   一致），`ConvTransposeOptions`；EnCodec 语义 = 裸 conv + 右侧裁 `k-stride` 样本。
+4. **EnCodec causal conv 精确 padding**：左侧 pad `kernel_eff - stride` + 右侧
+   `extra padding`（整除补长）——burn 的 `PaddedConvOptions` 不支持这种不对称左右
+   补法，手动 `Tensor::cat` 拼零再裸 `ConvOptions` 卷积（多花 2-3 次 kernel launch，
+   正是 codec 慢的来源之一）。
+5. **`scatter_nd` 的 `IndexingUpdateOp::Assign` 可用**（rep-penalty 乘子逐帧打散用），
+   而 `select_assign` 只有 Add（ASR spike 已记录）——同一更新语义两个 API 支持度不同。
+6. **`squeeze_dim<D2>` 的 D2 是输出 rank**：`wav` (1,1,T) 要
+   `squeeze_dim::<2>(0).squeeze_dim::<1>(0)` 连剥两维，不是 `squeeze()`（后者删所有
+   size-1 维）。
+7. **权重名嵌套**：codec 的 RVQ 前缀必须以 `decoder.` 开头（`decoder.quantizer.*`），
+   不是 `quantizer.*`；conv 权重在 `.conv.weight/.conv.bias` 下（与 candle 同）；
+   codebook 用 `embedding_sum`（encoder 侧才叫 `embed_sum`）；
+   `cluster_usage` 归一要在 f32 上 clamp 后 `unsqueeze_dim::<2>(1)`（unsqueeze 插最前，
+   位置 1 要显式）。
+8. **sliding-window causal mask / suppress bias**：`from_floats` + `reshape([1,1,t,t])`
+   需 `Tensor::<2,Float>` 注解推 rank；suppress bias 用 `mask_fill(-inf)` 盖
+   `[2048,3072)` 除 `codec_eos(2150)`（与 candle 相同）。
+9. **GPU gumbel-max 采样**：`Tensor::random_like` Uniform(1e-7,1) →
+   `-log(-log(u))` → `argmax(logits + gumbel)`，f32 上算；每帧仅 1 次标量读回
+   （1 code0 + 15 predictor u32），与 candle 的同步点一致。
+10. **tokenizer**：Qwen2 BPE 走 vocab+merges 文件路径（sentencepiece 风格的特殊
+    token 由模型 config 提供，无需额外加载）。
+
+## 文件结构（镜像 candle 侧）
+
+- `src/config.rs` — serde config（只留用到的字段）+ `Qwen3TTSGenerationConfig` Default。
+- `src/model.rs` — 共享算子：`rms_norm`/`layer_norm`（f32 方差）、`linear`、`repeat_kv`
+  （沿 seq 维 cat）、`eager_attention`、`apply_rope`（rank-2 cos/sin）、`DecoderLayer`
+  （Qwen3：QK-norm attention + KV cache + GatedMLP silu）、RoPE 参数。
+- `src/talker.rs` — `Talker`（双 embedding + text_projection + 28 层 + codec_head +
+  prompt 构造）、`CodePredictor`（5 层 × 15 路 embedding/lm_head）、`gpu_sample_token`
+  （gumbel-max + suppression bias + rep-penalty scatter）。
+- `src/codec.rs` — Mimi decoder：CausalConv（手动 pad）、CausalTransConv（右裁）、
+  SnakeBeta、EuclideanCodebookDecode、SplitRvqDecode、DecoderPreTransformer（8 层、
+  sliding-window 72、LayerScale、RoPE θ1e4）、ConvNeXtBlock、DecoderResidualUnit、
+  `CodecDecoder::decode` + `chunked_decode(300,25)`。
+- `src/main.rs` — 权重加载（bf16→f16）、BPE tokenizer、warmup + 计时、`--codes-file`
+  codec-only 路径、`save_wav_mono`（i16，ratio 32767，与 candle 相同）。
