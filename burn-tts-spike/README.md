@@ -411,6 +411,31 @@ launch 的绑定组创建 + 缓冲分配 + 内存池管理**，~35–50µs/op。
 4. **要根治需引擎级**：cubecl 缓存 bind group / 复用 buffer binding、减少内存池
    争用、或换后端策略——超出本分支范围。
 
+### Phase 11 — cubecl bind-group 缓存实验（burn-perf 分支，阶段 2b）
+
+**动机**：CPU 采样显示 `wgpu create_bind_group` / `create_buffer_binding` 是
+launch 路径热点之一。用户在本地克隆了 cubecl（`/Volumes/Workspace/GitHub/cubecl`，
+`be278a1e…`），实现了**有界 bind-group 缓存**（key = pipeline + 每个绑定的
+(物理 buffer id, offset, size)），`[patch]` 接入 spike。
+
+**实现**（cubecl-wgpu，2 文件 +85/-18）：
+- `WgpuMemory` 加 `phys_id`（创建时分配一次，内存池复用 buffer 时稳定）；
+- `WgpuStream` 加 `HashMap<BindGroupKey, Arc<BindGroup>>`（容量 8192，满则清空）；
+- `register_pipeline` 命中复用、未命中创建后插入。复用 bind group 语义正确
+  （bind group 只命名 buffer 区间，不捕获内容）。
+
+**实测结论：无效（命中率 ~8%）**。30 帧真实生成：miss ~39.8 万次、hit ~3.2 万次
+（按 StorageId key 和物理 buffer id key 结果相同）。原因：**这个模型每个 launch
+绑定的 (物理 buffer, offset, size) 组合几乎唯一**——每个 op 输出都在内存池里拿
+新分片（offset 漂移），权重/稳定张量只占少数。bind-group 缓存被"每 op 唯一绑定"
+结构性打败；CPU 仍是 178–214ms/帧（负载 7–13 下）。
+
+**结论（阶段 2 终）**：talker/predictor 的 CPU 瓶颈是 launch 路径的**组合成本**
+（每 launch 唯一绑定 → 无法缓存；缓冲分配 + 同步 + 提交），不是单一可缓存点。
+减少 launch 数（fusion）被自身簿记抵消。**burn 在此场景的 CPU 天花板在引擎
+launch 架构层面，spike/cubecl 单点优化无法突破**；MLX/candle 的 kernel 少、
+手写、无此开销。
+
 ## 文件结构（镜像 candle 侧）
 
 - `src/config.rs` — serde config（只留用到的字段）+ `Qwen3TTSGenerationConfig` Default。
