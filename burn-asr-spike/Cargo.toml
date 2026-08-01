@@ -1,0 +1,21 @@
+# burn spike: Qwen3-ASR-0.6B ported to burn 0.22.0-pre.1 (Metal via burn-wgpu/cubecl).
+# Purpose: measure feasibility of migrating tiny-cpm (candle) to burn — transcript
+# fidelity vs the candle version plus decode RTF/tok-s on the same audio.
+[package]
+name = "burn-asr-spike"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone crate (own workspace root) so it does not join tiny-cpm's workspace.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+half = "2.7"
+burn = { path = "../../burn/crates/burn", default-features = false, features = ["metal", "std"] }
+realfft = "3.5"
+safetensors = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+symphonia = { version = "0.5", features = ["mp3", "wav"] }
+tokenizers = "0.22"
