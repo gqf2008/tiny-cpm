@@ -1,22 +1,3 @@
-//! tiny-cpm: on-device inference on Apple Metal via the official `candle` crate.
-//!
-//! Subcommands:
-//!   chat   MiniCPM5-1B GGUF/bf16 text generation (original tiny-cpm path)
-//!   asr    Fun-ASR-Nano / Qwen3-ASR speech recognition
-//!   tts    VoxCPM2 / MOSS-TTS-Nano / CosyVoice3 speech synthesis
-//!   vad    FireRedVAD voice activity detection
-//!   dialogue  Fun-ASR -> MiniCPM5 -> MOSS-TTS voice-dialogue pipeline
-//!   live   realtime voice dialogue: mic -> VAD -> Qwen3-ASR -> MiniCPM5 -> TTS (moss|qwen3) -> speaker
-//!
-//! Usage:
-//!     tiny-cpm chat <bf16-dir> <tokenizer.json> "<prompt>" [max_tokens] [--quant <name>]
-//!     tiny-cpm asr <funasr|qwen3> <model-dir> <audio-file> [max_tokens]
-//!     tiny-cpm tts <voxcpm|moss> <model-dir> "<text>" <out.wav> [--codec <codec-dir>] [--ref <ref.wav>] [--max-len N]
-//!     tiny-cpm tts cosyvoice3 <model-dir> "<text>" <out.wav> [--voice <name>] [--ref <ref.wav> --ref-text "<text>"] [--steps N] [--max-tokens N]
-//!     tiny-cpm vad <model-dir> <audio-file>
-//!     tiny-cpm dialogue <funasr-dir> <bf16-dir> <tokenizer.json> <moss-dir> <codec-dir> <input.wav> <output.wav> [max_tokens]
-//!     tiny-cpm live <vad-dir> <qwen3asr-dir> <bf16-dir> <tokenizer.json> <tts-model-dir> [<codec-dir: MOSS only>] [--tts moss|qwen3] [--ref <wav> [--ref-text "<text>"]] [--input <wav>] [--output <wav>] [--max-tokens N]
-
 use tiny_cpm::{
     common, exec, models, position_embed, quantized_minicpm5, token_output_stream, tokenizer, utils,
 };

@@ -1,32 +1,3 @@
-//! Quantized MiniCPM5 model implementation (GGUF, for the official `candle` crate).
-//!
-//! MiniCPM5 is a LLaMA-architecture model with one non-standard twist:
-//! `head_dim (128) != hidden_size / num_heads (1536/16 = 96)`, so the Q/K/V
-//! projection output (`num_heads * head_dim = 2048`) differs from the hidden
-//! size (`1536`). The upstream `candle_transformers::models::quantized_llama`
-//! assumes `head_dim == hidden/heads` and `num_heads*head_dim == hidden`, both
-//! of which break on MiniCPM5.
-//!
-//! This module is a vendored copy of `quantized_llama` with these patches:
-//! 1. `head_dim` is read from the GGUF (`llama.rope.dimension_count`) / config
-//!    instead of `embedding_length / head_count`.
-//! 2. The attention output is reshaped to `num_heads * head_dim` (not `hidden`)
-//!    before the output projection maps it back to `hidden`.
-//! 3. RoPE is always NEOX (non-interleaved / half-split), matching the HF
-//!    `LlamaForCausalLM` reference (`rotate_half`). Real MiniCPM5-1B GGUFs
-//!    declare `general.architecture = "llama"`, which would select NORM
-//!    (interleaved) RoPE from the arch string and silently corrupt attention.
-//!
-//! Also adds a bf16 safetensors loader (`from_safetensors_dir` → `from_vb`)
-//! that quantizes HF-layout weights in memory — `QTensor::quantize_onto`
-//! requires a CPU-mapped VarBuilder source, so the safetensors are mmapped on
-//! CPU first.
-//!
-//! Loads weights from a bf16 safetensors directory via
-//! `ModelWeights::from_safetensors_dir` (in-memory quantization to a
-//! `GgmlDType` such as Q8_0/Q4_K at load time; GGUF files are not supported).
-//!
-
 use std::collections::HashMap;
 
 use candle_core::quantized::{GgmlDType, QTensor};
@@ -329,8 +300,8 @@ fn precomput_freqs_cis(
 
 impl ModelWeights {
     /// Load + quantize from a directory of bf16 safetensors (HF layout) +
-    /// config.json. Avoids a pre-converted GGUF — weights are quantized to
-    /// `dtype` (e.g. Q8_0) in memory at load time. `device` is the inference
+    /// config.json. Weights are quantized to `dtype` (e.g. Q8_0) in memory
+    /// at load time (no pre-quantized file needed). `device` is the inference
     /// device (Metal); quantization itself runs on CPU (candle's requirement).
     pub fn from_safetensors_dir(dir: &str, dtype: GgmlDType, device: &Device) -> Result<Self> {
         let cfg_bytes = std::fs::read(format!("{dir}/config.json"))
