@@ -303,10 +303,12 @@ impl MossEngine {
         on_chunk: &mut dyn FnMut(Vec<f32>) -> bool,
     ) -> Result<MossGenStats> {
         let has_ref = ref_codes.is_some();
-        let mode = self
-            .processor
-            .resolved_mode(None, false, has_ref)?;
-        let mode = if has_ref { mode } else { MossTTSMode::Continuation };
+        let mode = self.processor.resolved_mode(None, false, has_ref)?;
+        let mode = if has_ref {
+            mode
+        } else {
+            MossTTSMode::Continuation
+        };
         let input_ids = self.processor.build_inference_input_ids_from_codes(
             text,
             ref_codes,

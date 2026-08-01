@@ -117,7 +117,14 @@ impl MossTTSProcessor {
         } else {
             None
         };
-        self.build_inference_input_ids_from_codes(text, audio_code.as_ref(), prompt_text, mode, text_tokenizer, device)
+        self.build_inference_input_ids_from_codes(
+            text,
+            audio_code.as_ref(),
+            prompt_text,
+            mode,
+            text_tokenizer,
+            device,
+        )
     }
 
     /// Same as [`build_inference_input_ids`](Self::build_inference_input_ids)

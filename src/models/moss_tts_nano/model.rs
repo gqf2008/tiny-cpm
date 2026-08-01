@@ -108,6 +108,15 @@ pub struct MossTTSModel {
     audio_top_k: usize,
     audio_top_p: f32,
     audio_repetition_penalty: f32,
+    // Sampling for the per-frame text gate (the binary "emit another audio
+    // frame vs. end" decision). This is a SEPARATE sampler from the audio-token
+    // one above: audio.cpp / the official config use temperature 1.5 (Nano),
+    // top_k 50, top_p 1.0 here — NOT the audio-token 1.7/0.8/25 set. Sampling
+    // the gate off raw logits (temperature 1.0, no top-k/p) makes the end token
+    // fire too readily on close decisions, truncating speech mid-phoneme.
+    text_temperature: f64,
+    text_top_k: usize,
+    text_top_p: f32,
     // audio_processor: LogitsProcessor,
 }
 
@@ -182,6 +191,13 @@ impl MossTTSModel {
             audio_top_k: env_usize("MOSS_TOP_K", 25),
             audio_top_p: env_f32("MOSS_TOP_P", 0.8),
             audio_repetition_penalty: env_f32("MOSS_REP_PENALTY", 1.0),
+            // Text-gate sampler (audio.cpp moss_tts_nano.json: text_temperature
+            // 1.5 for Nano, top_p 1.0, top_k 50; official config.json generic
+            // block agrees: temperature 1.0→but Nano generate() bumps to 1.5,
+            // top_k 50, top_p 1.0). Override via MOSS_TEXT_*.
+            text_temperature: env_f64("MOSS_TEXT_TEMPERATURE", 1.5),
+            text_top_k: env_usize("MOSS_TEXT_TOP_K", 50),
+            text_top_p: env_f32("MOSS_TEXT_TOP_P", 1.0),
             // audio_processor,
         })
     }
@@ -239,7 +255,15 @@ impl MossTTSModel {
             .index_select(&idx, 0)?
             .to_dtype(candle_core::DType::F32)?
             .to_vec1::<f32>()?;
-        let token = sample_from_logits_vec(&pair, true, None, None, None, None, 1.0)?;
+        let token = sample_from_logits_vec(
+            &pair,
+            true,
+            Some(self.text_temperature),
+            Some(self.text_top_k),
+            Some(self.text_top_p),
+            None,
+            1.0,
+        )?;
         if token == 0 {
             Ok(self.audio_assistant_slot_token_id)
         } else {
