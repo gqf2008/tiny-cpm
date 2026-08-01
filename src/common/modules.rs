@@ -779,6 +779,32 @@ pub fn eager_attention_forward(
 ) -> Result<Tensor> {
     // input q shape:(b, num_head, seq_len, dim)
     // input k/v shape:(b, num_kv_head, seq_len, dim)
+    //
+    // Decode fast path (single query position, no mask, Metal): the fused SDPA
+    // vector kernel handles GQA internally via gqa_factor, so we hand it the RAW
+    // kv_heads k/v — skipping the repeat_kv expansion (2 kernels) AND its
+    // contiguous copies entirely. Only q needs to be contiguous for the kernel.
+    let is_decode = attention_mask.is_none()
+        && query_states.rank() == 4
+        && matches!(query_states.dim(2), Ok(1));
+    if is_decode {
+        let q = query_states.contiguous()?;
+        match crate::models::qwen3_tts::sdpa_fused::sdpa_vector_attention(
+            &q,
+            key_states,
+            value_states,
+            scaling as f32,
+        ) {
+            Ok(Some(out)) => {
+                // (b, n_head, 1, dim) -> (b, 1, n_head, dim) to match the caller.
+                return Ok(out.transpose(1, 2)?.contiguous()?);
+            }
+            _ => {} // fall through to the eager path
+        }
+    }
+
+    // Eager path (prefill / masked / non-Metal / SDPA-unsupported): expand GQA
+    // explicitly, then the classic matmul→scale→softmax→matmul.
     let key_states = match num_key_value_groups {
         Some(g) => repeat_kv(key_states.clone(), g)?,
         None => key_states.clone(),
@@ -790,41 +816,13 @@ pub fn eager_attention_forward(
     let query_states = query_states.contiguous()?;
     let key_states = key_states.contiguous()?;
     let value_states = value_states.contiguous()?;
-    let attn_output = {
-        // flash-attn path from aha dropped: tiny-cpm has no `candle_flash_attn`
-        // dependency. On Metal at decode (single query position, no mask), route
-        // through candle-metal-kernels' fused SDPA vector kernel — ONE kernel
-        // instead of matmul+scale+softmax+matmul (+ the repeat_kv/contiguous
-        // setup above). Fall back to the pure eager path otherwise.
-        if attention_mask.is_none()
-            && query_states.rank() == 4
-            && matches!(query_states.dim(2), Ok(1))
-        {
-            match crate::models::qwen3_tts::sdpa_fused::sdpa_vector_attention(
-                &query_states,
-                &key_states,
-                &value_states,
-                scaling as f32,
-            ) {
-                Ok(Some(out)) => out,
-                _ => eager_attention_math(
-                    &query_states,
-                    &key_states,
-                    &value_states,
-                    attention_mask,
-                    scaling,
-                )?,
-            }
-        } else {
-            eager_attention_math(
-                &query_states,
-                &key_states,
-                &value_states,
-                attention_mask,
-                scaling,
-            )?
-        }
-    };
+    let attn_output = eager_attention_math(
+        &query_states,
+        &key_states,
+        &value_states,
+        attention_mask,
+        scaling,
+    )?;
     //(b, n_head, seq_len, dim) -> (b, seq_len, n_head, dim)
     let attn_output = attn_output.transpose(1, 2)?.contiguous()?;
 
