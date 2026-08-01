@@ -1,4 +1,4 @@
-//! burn spike 2 CLI: `burn-tts-spike <model-dir> "<text>" <out.wav> [--language <lang>] [--max-frames N]`
+//! burn spike 2 CLI: `burn-tts-spike <model-dir> "<text>" <out.wav> [--language <lang>] [--max-frames N] [--bench-gen N]`
 //!
 //! Qwen3-TTS-12Hz-1.7B core path on burn 0.22.0-pre.1 Metal:
 //! Qwen2 BPE → talker (codebook 0, 12.5 Hz) → code predictor (books 1-15) →
@@ -68,21 +68,22 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let Some(model_dir) = args.get(1) else {
         bail!(
-            "usage: burn-tts-spike <model-dir> \"<text>\" <out.wav> [--language <lang>] [--max-frames N]"
+            "usage: burn-tts-spike <model-dir> \"<text>\" <out.wav> [--language <lang>] [--max-frames N] [--bench-gen N]"
         );
     };
     let Some(text) = args.get(2) else {
         bail!(
-            "usage: burn-tts-spike <model-dir> \"<text>\" <out.wav> [--language <lang>] [--max-frames N]"
+            "usage: burn-tts-spike <model-dir> \"<text>\" <out.wav> [--language <lang>] [--max-frames N] [--bench-gen N]"
         );
     };
     let Some(out_wav) = args.get(3) else {
         bail!(
-            "usage: burn-tts-spike <model-dir> \"<text>\" <out.wav> [--language <lang>] [--max-frames N]"
+            "usage: burn-tts-spike <model-dir> \"<text>\" <out.wav> [--language <lang>] [--max-frames N] [--bench-gen N]"
         );
     };
     let mut language = "auto".to_string();
     let mut max_frames = 2048usize;
+    let mut bench_frames: Option<usize> = None;
     let mut codes_file: Option<String> = None;
     let mut encode_wav: Option<String> = None;
     let mut spk_embed_wav: Option<String> = None;
@@ -99,6 +100,10 @@ fn main() -> Result<()> {
             }
             "--max-frames" => {
                 max_frames = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(2048);
+                i += 2;
+            }
+            "--bench-gen" => {
+                bench_frames = args.get(i + 1).and_then(|s| s.parse().ok());
                 i += 2;
             }
             "--codes-file" => {
@@ -186,8 +191,9 @@ fn main() -> Result<()> {
     let wc = Weights::new(codec_weights, device.clone());
     let decoder = codec::CodecDecoder::new(&wc, &codec_cfg.decoder_config)?;
     eprintln!(
-        "loaded models in {:?} (talker f16 + codec f32)",
-        t0.elapsed()
+        "loaded models in {:?} (talker f16 + codec f32), rss {:.0} MiB",
+        t0.elapsed(),
+        rss_mib()
     );
 
     // --encode-wav: codec-encoder-only verification — encode a wav to (16, T)
@@ -488,6 +494,7 @@ fn main() -> Result<()> {
     } else {
         talker::Talker::new(&w, &tts_cfg)?
     };
+    eprintln!("rss after talker build: {:.0} MiB", rss_mib());
 
     // --- ref voice (ICL cloning): speaker embed + ref codes + ref text ids ---
     let ref_voice: Option<talker::RefVoice> = match (&ref_wav, &ref_text) {
@@ -536,6 +543,34 @@ fn main() -> Result<()> {
         (None, None) => None,
         _ => bail!("--ref and --ref-text must be given together"),
     };
+
+    // The CPU weight maps (talker ~3.4 GB f16 + codec) are only needed during
+    // construction — release them before the measured runs so RSS reflects
+    // actual inference residency, not load-time working set.
+    drop(w);
+    drop(wc);
+    eprintln!("rss after dropping CPU weight maps: {:.0} MiB", rss_mib());
+
+    // --bench-gen: no-readback generation benchmark (the reproducible harness
+    // for the fusion speedup claim, README Phase 6). Warmup run (MSL shader
+    // compile) then the measured run; the benchmark loop's single final
+    // readback is its only sync point.
+    if let Some(n) = bench_frames {
+        let t1 = Instant::now();
+        let _ = talker.bench_generate(&text_ids, &language, newline_token, &gen_cfg, 5)?;
+        eprintln!("bench warmup 5 frames: {:?}", t1.elapsed());
+        let t2 = Instant::now();
+        let codes = talker.bench_generate(&text_ids, &language, newline_token, &gen_cfg, n)?;
+        let t3 = Instant::now();
+        let ms = (t3 - t2).as_secs_f64() * 1e3 / n as f64;
+        eprintln!(
+            "bench-gen: {n} frames, no per-frame readback, greedy: {ms:.2} ms/frame → RTF {:.3} (12.5 fps audio)",
+            ms * 12.5 / 1000.0
+        );
+        let v: Vec<i32> = codes.to_data().to_vec::<i32>()?;
+        eprintln!("bench code0 head: {:?}", &v[..v.len().min(8)]);
+        return Ok(());
+    }
 
     // --- synthesize: warmup run then measured run ---
     let synth = |talker: &mut talker::Talker,
@@ -596,6 +631,23 @@ fn main() -> Result<()> {
         pcm.len()
     );
     Ok(())
+}
+
+/// Current process RSS in MiB (macOS `ps`; burn 0.22-pre has no
+/// `Backend::memory()` API). -1.0 if unavailable.
+fn rss_mib() -> f64 {
+    let pid = std::process::id().to_string();
+    match std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid])
+        .output()
+    {
+        Ok(out) => String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<f64>()
+            .map(|kb| kb / 1024.0)
+            .unwrap_or(-1.0),
+        Err(_) => -1.0,
+    }
 }
 
 /// Same i16 normalization as candle's save_wav_mono.

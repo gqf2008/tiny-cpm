@@ -89,7 +89,15 @@ pub struct CodePredictor {
 }
 
 impl CodePredictor {
-    pub fn new(w: &Weights, cfg: &CodePredictorConfig, talker_hidden: usize) -> Result<Self> {
+    /// `build_layers=false` (quantized path) skips the f16 decoder layers
+    /// entirely — `new_quant` loads Q4_K weights instead, so the f16 copies
+    /// must not exist at all (they'd double the resident weight memory).
+    pub fn new(
+        w: &Weights,
+        cfg: &CodePredictorConfig,
+        talker_hidden: usize,
+        build_layers: bool,
+    ) -> Result<Self> {
         let device = w.device();
         let mut codec_embedding = Vec::with_capacity(cfg.num_code_groups - 1);
         for g in 0..cfg.num_code_groups - 1 {
@@ -98,16 +106,22 @@ impl CodePredictor {
                 dt(),
             )?);
         }
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        for i in 0..cfg.num_hidden_layers {
-            layers.push(DecoderLayer::new(
-                w,
-                &format!("talker.code_predictor.model.layers.{i}"),
-                cfg.num_attention_heads,
-                cfg.num_key_value_heads,
-                cfg.head_dim,
-                cfg.rms_norm_eps,
-            )?);
+        let mut layers = Vec::with_capacity(if build_layers {
+            cfg.num_hidden_layers
+        } else {
+            0
+        });
+        if build_layers {
+            for i in 0..cfg.num_hidden_layers {
+                layers.push(DecoderLayer::new(
+                    w,
+                    &format!("talker.code_predictor.model.layers.{i}"),
+                    cfg.num_attention_heads,
+                    cfg.num_key_value_heads,
+                    cfg.head_dim,
+                    cfg.rms_norm_eps,
+                )?);
+            }
         }
         let norm_w = w.get("talker.code_predictor.model.norm.weight", dt())?;
         let inv_freq = compute_default_rope_parameters(cfg.head_dim, cfg.rope_theta as f32);
@@ -142,7 +156,6 @@ impl CodePredictor {
         for l in self.layers.iter_mut() {
             l.clear_cache();
         }
-        #[cfg(not(feature = "fusion"))]
         #[cfg(not(feature = "fusion"))]
         if let Some(q) = self.layers_quant.as_mut() {
             q.clear_kv_cache();
@@ -227,19 +240,35 @@ pub struct Talker {
 
 impl Talker {
     pub fn new(w: &Weights, tts: &Qwen3TTSConfig) -> Result<Self> {
+        Self::new_inner(w, tts, true)
+    }
+
+    /// `build_layers=false` skips the f16 decoder layers (both talker 28 and
+    /// predictor 5) — used by `new_quant`, which substitutes Q4_K backbones.
+    /// The f16 copies are ~3.4 GB on this 1.7B model; loading them just to
+    /// drop them (the old `Self::new` + overwrite) both wasted peak memory and
+    /// left the f16 weights resident alongside the Q4_K ones.
+    fn new_inner(w: &Weights, tts: &Qwen3TTSConfig, build_layers: bool) -> Result<Self> {
         let cfg = &tts.talker_config;
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        for i in 0..cfg.num_hidden_layers {
-            layers.push(DecoderLayer::new(
-                w,
-                &format!("talker.model.layers.{i}"),
-                cfg.num_attention_heads,
-                cfg.num_key_value_heads,
-                cfg.head_dim,
-                cfg.rms_norm_eps,
-            )?);
+        let mut layers = Vec::with_capacity(if build_layers {
+            cfg.num_hidden_layers
+        } else {
+            0
+        });
+        if build_layers {
+            for i in 0..cfg.num_hidden_layers {
+                layers.push(DecoderLayer::new(
+                    w,
+                    &format!("talker.model.layers.{i}"),
+                    cfg.num_attention_heads,
+                    cfg.num_key_value_heads,
+                    cfg.head_dim,
+                    cfg.rms_norm_eps,
+                )?);
+            }
         }
-        let code_predictor = CodePredictor::new(w, &cfg.code_predictor_config, cfg.hidden_size)?;
+        let code_predictor =
+            CodePredictor::new(w, &cfg.code_predictor_config, cfg.hidden_size, build_layers)?;
         Ok(Self {
             cfg: cfg.clone(),
             tts: tts.clone(),
@@ -263,14 +292,17 @@ impl Talker {
     }
 
     /// Load with a Q4_K quantized backbone (7 GEMVs per layer instead of f16
-    /// matmuls). `anchor` supplies the cubecl client for weight upload.
+    /// matmuls). `anchor` supplies the cubecl client for weight upload. The
+    /// f16 decoder layers are never loaded (`new_inner` with build_layers=false)
+    /// — resident weights are the Q4_K blocks plus the small shared tensors
+    /// (embeddings/norms/heads), not f16 + Q4_K copies.
     #[cfg(not(feature = "fusion"))]
     pub fn new_quant(
         w: &Weights,
         tts: &Qwen3TTSConfig,
         anchor: &crate::qmat::RTAnchor,
     ) -> Result<Self> {
-        let mut t = Self::new(w, tts)?;
+        let mut t = Self::new_inner(w, tts, false)?;
         t.layers_quant = Some(QuantTalkerBackbone::new(w, &tts.talker_config, anchor)?);
         let pc = &tts.talker_config.code_predictor_config;
         t.code_predictor.layers_quant = Some(QuantPredictorBackbone::new(
@@ -289,7 +321,6 @@ impl Talker {
         for l in self.layers.iter_mut() {
             l.clear_cache();
         }
-        #[cfg(not(feature = "fusion"))]
         #[cfg(not(feature = "fusion"))]
         if let Some(q) = self.layers_quant.as_mut() {
             q.clear_kv_cache();
@@ -408,6 +439,50 @@ impl Talker {
             return Err(anyhow!("talker.generate: empty text"));
         }
         self.clear_kv_cache();
+        let (prompt, trailing, tts_pad_embed) =
+            self.build_prompt(text_ids, language, newline_token, ref_voice)?;
+        self.generate_inner(prompt, trailing, tts_pad_embed, gen_cfg, max_new_tokens, false)
+    }
+
+    /// No-readback generation benchmark (README Phase 6): the real AR loop for
+    /// exactly `n_frames` frames, but every sampling readback is deferred to a
+    /// single final sync (EOS detection skipped, greedy forced for
+    /// determinism). This is the reproducible harness for the fusion speedup
+    /// claim — the normal loop's per-frame `to_data` is what trips
+    /// burn-fusion's plan-replay bug, so this is also the only path fusion can
+    /// currently run end-to-end.
+    pub fn bench_generate(
+        &mut self,
+        text_ids: &[u32],
+        language: &str,
+        newline_token: u32,
+        gen_cfg: &Qwen3TTSGenerationConfig,
+        n_frames: usize,
+    ) -> Result<Tensor<2, Int>> {
+        if text_ids.is_empty() {
+            return Err(anyhow!("talker.bench_generate: empty text"));
+        }
+        self.clear_kv_cache();
+        let (prompt, trailing, tts_pad_embed) =
+            self.build_prompt(text_ids, language, newline_token, None)?;
+        let g = Qwen3TTSGenerationConfig {
+            do_sample: false,
+            subtalker_dosample: false,
+            ..gen_cfg.clone()
+        };
+        self.generate_inner(prompt, trailing, tts_pad_embed, &g, n_frames, true)
+    }
+
+    /// Build the (prompt, trailing, tts_pad_embed) inputs for AR decode —
+    /// shared by `generate` and `bench_generate`. Mirrors candle's prompt
+    /// construction 1:1: role prefix, think/nothink codec block, ICL ref track.
+    fn build_prompt(
+        &self,
+        text_ids: &[u32],
+        language: &str,
+        newline_token: u32,
+        ref_voice: Option<&RefVoice>,
+    ) -> Result<(Tensor<3>, Option<Tensor<3>>, Tensor<3>)> {
         let cfg = &self.cfg;
         let hidden = cfg.hidden_size;
 
@@ -503,7 +578,7 @@ impl Talker {
                 let prompt = Tensor::cat(vec![prompt0, head_part], 1);
                 (prompt, None)
             };
-            self.generate_inner(prompt, trailing, tts_pad_embed, gen_cfg, max_new_tokens)
+            Ok((prompt, trailing, tts_pad_embed))
         } else {
             // Non-ICL: first text token ⊕ last codec prefix row (bos); rest → trailing.
             let first = self.text_embed(&text_ids[0..1]) + codec_prefix.narrow(1, p_len - 1, 1);
@@ -514,11 +589,13 @@ impl Talker {
             } else {
                 tts_eos_embed
             };
-            self.generate_inner(prompt, Some(rest), tts_pad_embed, gen_cfg, max_new_tokens)
+            Ok((prompt, Some(rest), tts_pad_embed))
         }
     }
 
-    /// The AR decode loop. Returns (n_frames, 16) Int codes.
+    /// The AR decode loop. `no_sync=true` (benchmark) skips the per-frame
+    /// readback/EOS check and queues all sampled tokens for one final sync.
+    /// Returns (n_frames, 16) Int codes.
     fn generate_inner(
         &mut self,
         prompt: Tensor<3>,
@@ -526,6 +603,7 @@ impl Talker {
         tts_pad_embed: Tensor<3>,
         gen_cfg: &Qwen3TTSGenerationConfig,
         max_new_tokens: usize,
+        no_sync: bool,
     ) -> Result<Tensor<2, Int>> {
         let vocab_size = self.cfg.vocab_size;
         let codec_eos = self.cfg.codec_eos_token_id;
@@ -549,6 +627,7 @@ impl Talker {
         };
 
         let mut frames: Vec<Vec<u32>> = Vec::new();
+        let mut no_sync_toks: Vec<Tensor<1, Int>> = Vec::new(); // no_sync mode: 16/frame
         let mut gen_history: Vec<u32> = Vec::new(); // codebook-0 history for rep penalty
         let suppress_from = vocab_size - 1024; // suppress [2048, 3072) except codec_eos
         let suppress_bias: Vec<f32> = (0..vocab_size)
@@ -607,23 +686,29 @@ impl Talker {
             };
             next = next + text_row;
 
-            // Single per-frame readback: cat 16 tokens, read once.
+            // Per-frame readback: cat 16 tokens, read once. Skipped in
+            // no_sync (benchmark) mode — the tokens are queued for the single
+            // final sync instead.
             let mut all_t = vec![code0_t.clone().reshape([1])];
             all_t.extend(rest_t.iter().map(|t| t.clone().reshape([1])));
-            let flat: Tensor<1, Int> = Tensor::cat(all_t, 0);
-            let flat_vec: Vec<i32> = flat
-                .to_data()
-                .to_vec::<i32>()
-                .map_err(|e| anyhow::anyhow!("frame readback: {e}"))?;
-            let flat_vec: Vec<u32> = flat_vec.iter().map(|&v| v as u32).collect();
-            let code0 = flat_vec[0];
+            if no_sync {
+                no_sync_toks.extend(all_t);
+            } else {
+                let flat: Tensor<1, Int> = Tensor::cat(all_t, 0);
+                let flat_vec: Vec<i32> = flat
+                    .to_data()
+                    .to_vec::<i32>()
+                    .map_err(|e| anyhow::anyhow!("frame readback: {e}"))?;
+                let flat_vec: Vec<u32> = flat_vec.iter().map(|&v| v as u32).collect();
+                let code0 = flat_vec[0];
 
-            // EOS check AFTER the predictor (matches mlx/candle).
-            if code0 == codec_eos && step >= 2 {
-                break;
+                // EOS check AFTER the predictor (matches mlx/candle).
+                if code0 == codec_eos && step >= 2 {
+                    break;
+                }
+                gen_history.push(code0);
+                frames.push(flat_vec);
             }
-            gen_history.push(code0);
-            frames.push(flat_vec);
 
             let (h, l) = self.forward_step_gpu(next, offset);
             past_hidden = h;
@@ -631,7 +716,16 @@ impl Talker {
             offset += 1;
         }
 
-        let flat: Vec<i32> = frames.iter().flatten().map(|&v| v as i32).collect();
+        let flat: Vec<i32> = if no_sync {
+            // The single sync point of the benchmark: cat all queued tokens,
+            // read back once. Everything the loop queued executes here.
+            let all = Tensor::cat(no_sync_toks, 0); // (16*n,)
+            all.to_data()
+                .to_vec::<i32>()
+                .map_err(|e| anyhow::anyhow!("bench final readback: {e}"))?
+        } else {
+            frames.iter().flatten().map(|&v| v as i32).collect()
+        };
         let n = flat.len() / num_code_groups;
         let t = Tensor::<1, Int>::from_ints(flat.as_slice(), &self.device)
             .reshape([n, num_code_groups]);

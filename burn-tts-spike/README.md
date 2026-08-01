@@ -5,8 +5,8 @@ Qwen3-TTS-12Hz-1.7B-Base 核心路径移植到 **burn 0.22.0-pre.1**（本地 ch
 MSL 编译器），评估 tiny-cpm 从 candle 迁移到 burn 的可行性（第二阶段：TTS）。
 
 范围（用户确认）：**talker（28 层 Qwen3）+ code predictor（5 层 × 15 AR 步）+ Mimi
-codec decoder + GPU 采样**。明确不做：`--ref` 声音克隆（speaker encoder + codec encoder）、
-`--stream` 流式、量化（GGUF/k-quant 缺口）。
+codec decoder + GPU 采样**。`--ref` 声音克隆 / Q4_K 量化 / fusion 是 Phase 4-6 追加
+（初始范围外）。
 
 ## 用法
 
@@ -19,11 +19,14 @@ cargo run --release -- <model-dir> "<text>" <out.wav> [--language zh|en] [--max-
 ```
 
 `--talker-quant`：Q4_K 量化 talker + predictor backbone（自定义 cubecl GEMV kernel，
-省内存 ~2.7×，速度无收益 —— 见 Phase 5）。`--qmat-test`：Q4K GEMV vs f32 linear 的
-数值 + 延迟对照（验证工具）。
+省内存、速度无收益 —— 见 Phase 5）。`--qmat-test`：Q4K GEMV vs f32 linear 的
+数值 + 延迟对照（验证工具）。`--bench-gen <N>`：无 readback 生成基准（融合加速的
+可复现 harness —— 见 Phase 6）。
 
 - 音频时长 / gen、codec 分段耗时、RTF → stderr。
 - 先完整跑 1 轮 warmup（MSL 着色器编译 + matmul autotune），再计正式轮。
+- 加载/构建/释放各阶段的进程 RSS（MiB）随模型加载打印到 stderr（burn 0.22-pre 无
+  `Backend::memory()` API，用 `ps` 取 RSS）。
 - `--codes-file <file>`：跳过 talker，把外部 (n,16) codes 直接喂给 codec
   （codec 单独验证用）。**注意**：文件是 frame-major 的（每帧 16 个 code 连续），
   见踩坑 #2。
@@ -177,7 +180,13 @@ norms/attention 保持原 dtype。kernel 是 `#[cube(launch_unchecked)]` 自定�
 m=1 每步成本是 **op/launch 数瓶颈**（每层 ~20 个 op × 5 层 × 16 步/帧 × ~40µs），
 带宽不是瓶颈 —— Q4K 只省 matmul 的带宽，动不了 op 数。candle 的 Q4_K 收益（0.53）来自
 其 kernel 效率（带宽是真实瓶颈，且 predictor 量化也只省 4% —— candle 自己的注释）。
-**burn Q4K 的价值 = 内存**（talker 1.7B 权重 ~2.7× 缩小）。
+**burn Q4K 的价值 = 内存**，实测（`--bench-gen` 的 rss 打印，drop CPU 权重表后）：
+f16 路径 **1213 MiB** vs Q4K **408 MiB**。`new_quant` 只持有 Q4K 块 + 共享小张量
+（embeddings/norms/heads）；早期版本先 `Self::new` 全量加载 f16 28+5 层再叠加 Q4K
+（驻留 ≈ f16 + Q4K 两份，README 的 2.7× 不成立）—— 已修：`new_inner(build_layers=false)`
+使 quant 路径根本不加载 f16 层权重（GPU 侧 Metal 统一内存不完全计入 RSS，权重实际差
+~2.6×：f16 3.4 GB → Q4K 1.3 GB，RSS 只反映其中一部分）。CPU 权重表（f16 3.4 GB）在
+模型构建完成后 `drop`（仅构建期需要），各阶段 RSS 随加载打印到 stderr。
 
 **新坑**：
 17. **CubeDim 不能超过 wgpu 的 max units/cube（1024）**：2560 线程的 `CubeDim::new_1d(2560)`
@@ -195,25 +204,59 @@ m=1 每步成本是 **op/launch 数瓶颈**（每层 ~20 个 op × 5 层 × 16 �
 少数 kernel），不是量化。burn 的等价物是 **burn-cubecl-fusion 引擎**（opt-in feature，
 我们之前一直没开 —— 这是 m=1 每步慢的真正原因）。
 
-**实测（f16 路径，greedy 60 帧）**：gen **12.6ms/帧** vs 非融合 113ms/帧 —— **8.7× 加速**。
-prefill logits 与非融合一致（正确性 ✓）。
+**复现方法（评审要求，harness 已落进仓库）**：`--bench-gen <N>` 跑 N 帧完整 AR 循环
+（talker + code0 采样 + 15 步 predictor + KV cache 更新），所有采样读回推迟到循环
+结束的**一次**同步（跳过 EOS，强制 greedy）。这是"真实生成减去每帧 readback"的测量：
 
-**状态**：
+```bash
+CARGO_TARGET_DIR=../target-shared cargo build --release               # 非融合
+CARGO_TARGET_DIR=../target-shared cargo build --release --features fusion
+../target-shared/release/burn-tts-spike <model-dir> "text" /tmp/x.wav --bench-gen 60
+```
+
+**实测（f16，greedy 60 帧，同机同构建）**：
+
+| 构建 | ms/帧 | 相对 |
+|---|---|---|
+| 非融合 | 113 | 1× |
+| `--features fusion` | **当前不可复现**（见下） | — |
+
+非融合 bench 的 code0 头部与 `BURN_TTS_GREEDY=1` 生成逐位一致（确定性 ✓）。
+
+**状态（截至评审后复测，2026-08-01）**：
 - `[features] fusion = ["burn/fusion", "burn-wgpu/fusion"]`；`--features fusion` 构建。
   融合下 Q4_K 自定义 kernel 不可用（FusionTensor 无原始 buffer handle），
   `--talker-quant`/`--qmat-test` 已 cfg 门控禁用。
-- **引擎 bug（burn 0.22-pre）**：每帧 readback（EOS 检测的 `to_data`）打断优化图 →
-  plan 缓存重复执行 → `Ordering is bigger than operations` panic（`burn-fusion`
-  `stream/queue/execution.rs` + `ordering.rs`）。最小复现（`{op, readback}` 循环）**不
-  触发** —— 需要 talker 级别的大图（28 层 + predictor）。`device.sync()` 前置无效。
-  修复需上游级工作（plan 缓存语义）。**所以 fusion 目前只能跑通"无 readback"路径**
-  （GEMV 验证、prefill）；完整生成被引擎 bug 阻塞。
-- 修复方向（记录）：`execute_block_optimization` 空 operations 时跳过会死锁（read 等
-  待）；`ordering.rs` skip 会越界 —— 需要区分"首次执行"与"重复执行"（plan id 跟踪）。
+- **引擎 bug（burn 0.22-pre 本地 fork）比此前记录的更宽**：最初以为只有"每帧 readback
+  打断优化图"触发，实测（`--bench-gen`，单次最终 readback）**同样崩溃**。带埋点复测
+  确认完整根因链：
+  1. **第一 panic（真根因）**：cached plan 复用到新 queue 时 fused kernel 启动失败
+     —— `burn-cubecl-fusion/src/engine/launch/output.rs:207` 输出句柄
+     `unwrap(None)`（10-op composed plan 在 lockstep 队列上首次执行即崩，三表
+     `global/relative/operations` 长度一致）。**fused kernel 的跨帧重放句柄解析在
+     这个 AR streaming 场景坏了** —— 这是"plan 缓存重复执行"的实质。
+  2. **panic 损坏队列**：panic 在 `execute_block_optimization` 的
+     `core::mem::swap` 之后、`self.operations = operations` 之前展开 —— UnfusedOp
+     列表被清空而 `global`/`relative` 保留（实测：下一次派发 `global 12,
+     operations 1`）→ 此后所有派发看到损坏队列 → `ordering.rs:49` 连锁 panic
+     （`Ordering is bigger than operations`，循环到 OOM 被 SIGKILL）。
+  3. `Policy::action` 对 `found` plan 无长度校验是**独立的理论风险**（`action_sync`
+     有 `len == len` 校验、lazy 路径没有），但本次崩溃中不是触发点。
+  `device.sync()` 前置无效。**结论：12.6ms/帧（8.7×）目前无法通过仓库内任何路径
+  复现** —— 该数字来自当时未提交的测量（可能依赖当时本地 patch 过的 burn）。
+- 修复方向（已确认，上游级）：(a) fused kernel 重放的句柄/view 解析
+  （output.rs 的 `handle.unwrap()` 需对跨队列重放安全）；(b)
+  `execute_block_optimization` 的 panic 安全（swap 后必须恢复 `self.operations`，
+  或用 RAII guard 保证 unwind 不破坏队列）；(c) `Policy::action` 对 `found` 加
+  `length <= operations.len()` 校验。修复后需用 `--bench-gen` 复测 fusion 端到端。
 
-**结论**：burn 的 m=1 性能正解 = **fusion**（8.7× 已验证）；Q4K 量化在 burn 上无速度
-收益（op 数瓶颈，fusion 才是解药）；burn 0.22-pre 的 fusion 引擎在 streaming
-readback 场景有缺陷，修复后可望 RTF 从 2.5 → ~0.3（gen 12.6ms/帧 ≈ RTF 0.32）。
+**结论（校准后）**：burn 的 m=1 性能正解 = **fusion**（方向正确，机制上成立 ——
+融合消掉 op 数瓶颈）；Q4K 量化在 burn 上无速度收益（op 数瓶颈，fusion 才是解药）；
+但 **burn 0.22-pre 的 fusion 引擎在 AR streaming 场景有缺陷，当前 fusion 构建连
+无 readback 的 bench 都无法跑通，完整生成更不可用**。引擎 bug 修复后，gen 端到端
+可望从 2.5 → ~0.3 —— **RTF 0.32 是外推，不是实测**（假设 bench 的 ms/帧直接迁移到
+真实生成）；"性能逆天"的对外说法应撤回，改为"方向已验证 + 潜力可复现测量
+（`--bench-gen`）+ 引擎 bug 阻塞交付"。
 
 ## 文件结构（镜像 candle 侧）
 
@@ -223,7 +266,8 @@ readback 场景有缺陷，修复后可望 RTF 从 2.5 → ~0.3（gen 12.6ms/帧
   （Qwen3：QK-norm attention + KV cache + GatedMLP silu）、RoPE 参数。
 - `src/talker.rs` — `Talker`（双 embedding + text_projection + 28 层 + codec_head +
   prompt 构造）、`CodePredictor`（5 层 × 15 路 embedding/lm_head）、`gpu_sample_token`
-  （gumbel-max + suppression bias + rep-penalty scatter）。
+  （gumbel-max + suppression bias + rep-penalty scatter）、`build_prompt`（generate 与
+  `bench_generate` 共用）、`bench_generate`（无 readback 生成基准，Phase 6）。
 - `src/codec.rs` — Mimi decoder：CausalConv（手动 pad）、CausalTransConv（右裁）、
   SnakeBeta、EuclideanCodebookDecode、SplitRvqDecode、DecoderPreTransformer（8 层、
   sliding-window 72、LayerScale、RoPE θ1e4）、ConvNeXtBlock、DecoderResidualUnit、
