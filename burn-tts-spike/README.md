@@ -304,6 +304,38 @@ CARGO_TARGET_DIR=../target-shared cargo build --release --features fusion
 从 ~1.4 次/帧降到 **~0.1 次/帧**（10+10 帧仅 1 次：首次 stale 触发后缓存作废，
 下一个同样式按当前编号重新探索并正常 fused）。
 
+### Phase 8 — 最终裁定：burn 迁移结论（2026-08-01）
+
+**三实现 RTF 对比（同模型 Qwen3-TTS-12Hz-1.7B，M4，含每帧 readback + codec）**：
+
+| 实现 | RTF（量化） | RTF（bf16/f16） |
+|---|---|---|
+| mlx-audio（参考） | **0.47** | 0.86 |
+| candle（tiny-cpm 现路径） | **0.56** | 0.98 |
+| burn + fusion 修复（本 spike） | 无量化路径 | **~2.1–2.5** |
+
+**结论**：
+
+1. **burn 移植在正确性上成立**：核心路径（talker/predictor/codec/speaker-encoder/GPU
+   采样）全部跑通，codes 与非融合逐位一致；Q4_K 自定义 GEMV、--ref 克隆、融合缓存
+   重放崩溃均已修复（`burn-fusion-fix.patch` 已归档）。
+2. **burn 在性能上不达标**：融合修复后 ~2.1–2.5，仍为 candle bf16 的 ~2.2×、
+   mlx-audio 的 ~4.5×。差距来自基线（burn 非融合 2.5 vs candle 1.0）+ 融合 kernel
+   通用代码生成 vs 手写调优 + codec 未融合 + 每帧 ~4100 次 plan 命中的 CPU 簿记。
+3. **8.7× / RTF 0.3 的原始宣称不成立**：即使融合完美工作，bench（无 readback）数字
+   也低估真实生成（每帧 readback + codec）的成本。
+4. **建议**：tiny-cpm 的 TTS 性能路径保持 candle（bf16 0.98 / Q4_K 0.56）；本 spike
+   的价值 = 移植验证 + fusion 修复 patch（`burn-fusion-fix.patch`）+ 可复现基准
+   （`--bench-gen`）。若要在 burn 上追平 candle，需另开分支做引擎级优化（cubecl
+   fused kernel 调优、codec 融合、降低 plan 簿记、等待 burn 0.22 stable），
+   预计投入以周计且结果不确定——不在本 spike 范围。
+
+**交付物清单**：
+- `burn-fusion-fix.patch` — burn fork 5 文件修复 diff（`git apply` 可复用）
+- `--bench-gen <N>` — 无 readback 生成基准（复现/验证用）
+- `--qmat-test` — Q4K GEMV 数值/延迟对照
+- Phase 1–7 完整验证记录（逐位对比、基准表、踩坑）
+
 ## 文件结构（镜像 candle 侧）
 
 - `src/config.rs` — serde config（只留用到的字段）+ `Qwen3TTSGenerationConfig` Default。
