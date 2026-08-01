@@ -189,6 +189,32 @@ m=1 每步成本是 **op/launch 数瓶颈**（每层 ~20 个 op × 5 层 × 16 �
 20. **Q4KMatmul 只支持 s=1**（kernel 是单 token GEMV）；prefill（s>1）按 token 循环
     （一次性成本，可接受；batched kernel 是后续优化）。
 
+### Phase 6 — burn fusion（mlx-style graph fusion，`--features fusion`）
+
+参考 mlx-audio 的核心结论：**MLX 的快来自 lazy graph + 自动融合**（每帧 op 链融合成
+少数 kernel），不是量化。burn 的等价物是 **burn-cubecl-fusion 引擎**（opt-in feature，
+我们之前一直没开 —— 这是 m=1 每步慢的真正原因）。
+
+**实测（f16 路径，greedy 60 帧）**：gen **12.6ms/帧** vs 非融合 113ms/帧 —— **8.7× 加速**。
+prefill logits 与非融合一致（正确性 ✓）。
+
+**状态**：
+- `[features] fusion = ["burn/fusion", "burn-wgpu/fusion"]`；`--features fusion` 构建。
+  融合下 Q4_K 自定义 kernel 不可用（FusionTensor 无原始 buffer handle），
+  `--talker-quant`/`--qmat-test` 已 cfg 门控禁用。
+- **引擎 bug（burn 0.22-pre）**：每帧 readback（EOS 检测的 `to_data`）打断优化图 →
+  plan 缓存重复执行 → `Ordering is bigger than operations` panic（`burn-fusion`
+  `stream/queue/execution.rs` + `ordering.rs`）。最小复现（`{op, readback}` 循环）**不
+  触发** —— 需要 talker 级别的大图（28 层 + predictor）。`device.sync()` 前置无效。
+  修复需上游级工作（plan 缓存语义）。**所以 fusion 目前只能跑通"无 readback"路径**
+  （GEMV 验证、prefill）；完整生成被引擎 bug 阻塞。
+- 修复方向（记录）：`execute_block_optimization` 空 operations 时跳过会死锁（read 等
+  待）；`ordering.rs` skip 会越界 —— 需要区分"首次执行"与"重复执行"（plan id 跟踪）。
+
+**结论**：burn 的 m=1 性能正解 = **fusion**（8.7× 已验证）；Q4K 量化在 burn 上无速度
+收益（op 数瓶颈，fusion 才是解药）；burn 0.22-pre 的 fusion 引擎在 streaming
+readback 场景有缺陷，修复后可望 RTF 从 2.5 → ~0.3（gen 12.6ms/帧 ≈ RTF 0.32）。
+
 ## 文件结构（镜像 candle 侧）
 
 - `src/config.rs` — serde config（只留用到的字段）+ `Qwen3TTSGenerationConfig` Default。

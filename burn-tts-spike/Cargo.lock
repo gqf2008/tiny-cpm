@@ -345,6 +345,7 @@ version = "0.22.0-pre.1"
 dependencies = [
  "burn-autodiff",
  "burn-core",
+ "burn-ir",
  "burn-nn",
  "burn-optim",
  "burn-std",
@@ -429,6 +430,7 @@ version = "0.22.0-pre.1"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
+ "burn-fusion",
  "cubecl",
 ]
 
@@ -473,6 +475,7 @@ version = "0.22.0-pre.1"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
+ "burn-fusion",
  "cubecl",
 ]
 
@@ -496,6 +499,7 @@ dependencies = [
  "burn-cuda",
  "burn-flex",
  "burn-ndarray",
+ "burn-remote",
  "burn-rocm",
  "burn-tch",
  "burn-wgpu",
@@ -597,12 +601,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn-remote"
+version = "0.22.0-pre.1"
+dependencies = [
+ "burn-backend",
+ "burn-fusion",
+ "burn-ir",
+ "burn-router",
+ "burn-std",
+ "bytes",
+ "futures-util",
+ "gloo-timers",
+ "log",
+ "rand 0.10.2",
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "tokio",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
 name = "burn-rocm"
 version = "0.22.0-pre.1"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
+ "burn-fusion",
  "cubecl",
+]
+
+[[package]]
+name = "burn-router"
+version = "0.22.0-pre.1"
+dependencies = [
+ "burn-backend",
+ "burn-fusion",
+ "burn-ir",
+ "burn-std",
+ "hashbrown 0.16.1",
+ "log",
+ "serde",
+ "spin",
 ]
 
 [[package]]
@@ -700,6 +740,7 @@ dependencies = [
  "bon",
  "burn-core",
  "burn-cubecl",
+ "burn-fusion",
  "burn-ir",
  "bytemuck",
  "cubecl",
@@ -719,6 +760,7 @@ version = "0.22.0-pre.1"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
+ "burn-fusion",
  "cubecl",
 ]
 
@@ -2236,6 +2278,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures-macro"
+version = "0.3.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d6d3cde68c518367be28956066ddfef33813991b77a55005a69dae04bf3b10b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "futures-sink"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2255,6 +2308,7 @@ checksum = "a77a90a256fce34da66415271e30f94ee91c57b04b8a2c042d9cf3220179deaa"
 dependencies = [
  "futures-core",
  "futures-io",
+ "futures-macro",
  "futures-sink",
  "futures-task",
  "memchr",
@@ -2453,6 +2507,18 @@ dependencies = [
  "khronos_api",
  "log",
  "xml-rs",
+]
+
+[[package]]
+name = "gloo-timers"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -4680,6 +4746,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5238,8 +5314,21 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
+ "tokio-macros",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]

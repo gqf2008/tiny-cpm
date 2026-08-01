@@ -13,7 +13,9 @@ mod audio;
 mod codec;
 mod config;
 mod model;
+#[cfg(not(feature = "fusion"))]
 mod qmat;
+#[cfg(not(feature = "fusion"))]
 mod quant_talker;
 mod speaker_encoder;
 mod talker;
@@ -224,6 +226,10 @@ fn main() -> Result<()> {
 
     // --qmat-test: Q4K GEMV vs f32 linear on real talker weights (numerics + latency).
     if qmat_test {
+        #[cfg(feature = "fusion")]
+        bail!("--qmat-test unavailable with burn fusion");
+        #[cfg(not(feature = "fusion"))]
+        {
         use burn::tensor::{Float as _F, Tensor as _T};
         let wq: _T<2, _F> = w.get(
             "talker.model.layers.0.self_attn.q_proj.weight",
@@ -378,6 +384,7 @@ fn main() -> Result<()> {
             tf.as_secs_f64() / tq.as_secs_f64()
         );
         return Ok(());
+        }
     }
 
     // --spk-embed: speaker-encoder-only verification — dump the raw embedding.
@@ -466,13 +473,18 @@ fn main() -> Result<()> {
     }
 
     let mut talker = if talker_quant {
-        let anchor_t = Tensor::<1, burn::tensor::Float>::zeros([1], &device);
-        let anchor_c = anchor_t
-            .try_into_primitive::<burn_wgpu::Metal>()
-            .map_err(|e| anyhow::anyhow!("anchor: {e:?}"))?;
-        let anchor = qmat::RTAnchor(anchor_c);
-        eprintln!("talker backbone = Q4_K (custom cubecl GEMV)");
-        talker::Talker::new_quant(&w, &tts_cfg, &anchor)?
+        #[cfg(feature = "fusion")]
+        bail!("--talker-quant unavailable with burn fusion");
+        #[cfg(not(feature = "fusion"))]
+        {
+            let anchor_t = Tensor::<1, burn::tensor::Float>::zeros([1], &device);
+            let anchor_c = anchor_t
+                .try_into_primitive::<burn_wgpu::Metal>()
+                .map_err(|e| anyhow::anyhow!("anchor: {e:?}"))?;
+            let anchor = qmat::RTAnchor(anchor_c);
+            eprintln!("talker backbone = Q4_K (custom cubecl GEMV)");
+            talker::Talker::new_quant(&w, &tts_cfg, &anchor)?
+        }
     } else {
         talker::Talker::new(&w, &tts_cfg)?
     };

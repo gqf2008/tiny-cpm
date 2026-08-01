@@ -14,6 +14,7 @@ use crate::model::{
     DecoderLayer, Weights, causal_mask, compute_default_rope_parameters, dt, linear, rms_norm,
     rotary,
 };
+#[cfg(not(feature = "fusion"))]
 use crate::quant_talker::{QuantPredictorBackbone, QuantTalkerBackbone};
 
 use burn::tensor::DType;
@@ -78,6 +79,7 @@ pub struct CodePredictor {
     cfg: CodePredictorConfig,
     codec_embedding: Vec<Tensor<2>>, // 15 × (vocab, talker_hidden)
     layers: Vec<DecoderLayer>,       // 5 × Qwen3 (predictor hidden)
+    #[cfg(not(feature = "fusion"))]
     layers_quant: Option<QuantPredictorBackbone>,
     norm_w: Tensor<1>,
     inv_freq: Vec<f32>,
@@ -126,6 +128,7 @@ impl CodePredictor {
             cfg: cfg.clone(),
             codec_embedding,
             layers,
+            #[cfg(not(feature = "fusion"))]
             layers_quant: None,
             norm_w,
             inv_freq,
@@ -139,6 +142,8 @@ impl CodePredictor {
         for l in self.layers.iter_mut() {
             l.clear_cache();
         }
+        #[cfg(not(feature = "fusion"))]
+        #[cfg(not(feature = "fusion"))]
         if let Some(q) = self.layers_quant.as_mut() {
             q.clear_kv_cache();
         }
@@ -159,13 +164,22 @@ impl CodePredictor {
         };
         let (cos, sin) = rotary(&self.device, &self.inv_freq, seqlen_offset, seq_len, dt());
         let mut h = xs;
-        if let Some(q) = self.layers_quant.as_mut() {
-            for l in q.layers.iter_mut() {
-                h = l
-                    .forward(h, &cos, &sin, mask.as_ref())
-                    .expect("quant predictor layer");
+        #[cfg(not(feature = "fusion"))]
+        {
+            if let Some(q) = self.layers_quant.as_mut() {
+                for l in q.layers.iter_mut() {
+                    h = l
+                        .forward(h, &cos, &sin, mask.as_ref())
+                        .expect("quant predictor layer");
+                }
+            } else {
+                for l in self.layers.iter_mut() {
+                    h = l.forward(h, &cos, &sin, mask.as_ref());
+                }
             }
-        } else {
+        }
+        #[cfg(feature = "fusion")]
+        {
             for l in self.layers.iter_mut() {
                 h = l.forward(h, &cos, &sin, mask.as_ref());
             }
@@ -207,6 +221,7 @@ pub struct Talker {
     codec_head: Tensor<2>, // (vocab, hidden)
     code_predictor: CodePredictor,
     /// Q4_K quantized backbone (optional; `--talker-quant`). None = f16 layers.
+    #[cfg(not(feature = "fusion"))]
     layers_quant: Option<QuantTalkerBackbone>,
 }
 
@@ -242,12 +257,14 @@ impl Talker {
             inv_freq: compute_default_rope_parameters(cfg.head_dim, cfg.rope_theta as f32),
             codec_head: w.get("talker.codec_head.weight", dt())?,
             code_predictor,
+            #[cfg(not(feature = "fusion"))]
             layers_quant: None,
         })
     }
 
     /// Load with a Q4_K quantized backbone (7 GEMVs per layer instead of f16
     /// matmuls). `anchor` supplies the cubecl client for weight upload.
+    #[cfg(not(feature = "fusion"))]
     pub fn new_quant(
         w: &Weights,
         tts: &Qwen3TTSConfig,
@@ -272,6 +289,8 @@ impl Talker {
         for l in self.layers.iter_mut() {
             l.clear_cache();
         }
+        #[cfg(not(feature = "fusion"))]
+        #[cfg(not(feature = "fusion"))]
         if let Some(q) = self.layers_quant.as_mut() {
             q.clear_kv_cache();
         }
@@ -338,15 +357,34 @@ impl Talker {
         };
         let (cos, sin) = rotary(&self.device, &self.inv_freq, seqlen_offset, seq_len, dt());
         let mut h = embeds;
-        if let Some(q) = self.layers_quant.as_mut() {
-            for l in q.layers.iter_mut() {
-                h = l
-                    .forward(h, &cos, &sin, mask.as_ref())
-                    .expect("quant layer forward");
+        #[cfg(not(feature = "fusion"))]
+        {
+            if let Some(q) = self.layers_quant.as_mut() {
+                for l in q.layers.iter_mut() {
+                    h = l
+                        .forward(h, &cos, &sin, mask.as_ref())
+                        .expect("quant layer forward");
+                }
+            } else {
+                for l in self.layers.iter_mut() {
+                    h = l.forward(h, &cos, &sin, mask.as_ref());
+                }
             }
-        } else {
-            for l in self.layers.iter_mut() {
+        }
+        #[cfg(feature = "fusion")]
+        {
+            for (li, l) in self.layers.iter_mut().enumerate() {
                 h = l.forward(h, &cos, &sin, mask.as_ref());
+                if std::env::var("BURN_TTS_DEBUG").is_ok() && seqlen_offset == 0 {
+                    let v: Vec<f32> = h
+                        .clone()
+                        .narrow(1, seq_len - 1, 1)
+                        .cast(DType::F32)
+                        .to_data()
+                        .to_vec::<f32>()
+                        .unwrap();
+                    eprintln!("BURN_LAYER{li} {:?}", &v[..4]);
+                }
             }
         }
         let h = rms_norm(h, self.norm_w.clone(), self.cfg.rms_norm_eps);
@@ -494,6 +532,17 @@ impl Talker {
         let num_code_groups = self.cfg.num_code_groups;
         let mut offset = prompt.dims()[1];
         let (mut past_hidden, mut logits_gpu) = self.forward_step_gpu(prompt, 0);
+        if std::env::var("BURN_TTS_DEBUG").is_ok() {
+            let v: Vec<f32> = logits_gpu
+                .clone()
+                .cast(DType::F32)
+                .to_data()
+                .to_vec::<f32>()
+                .unwrap();
+            let mut top: Vec<(f32, u32)> = v.iter().enumerate().map(|(i, &x)| (x, i as u32)).collect();
+            top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            eprintln!("BURN_PREFILL_LOGITS top5 {:?}", &top[..5]);
+        }
         let n_trailing = match &trailing {
             Some(t) => t.dims()[1],
             None => 0,

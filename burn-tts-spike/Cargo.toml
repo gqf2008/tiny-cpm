@@ -9,6 +9,12 @@ edition = "2024"
 
 [workspace]
 
+[features]
+# burn's kernel-fusion engine (mlx-style graph fusion). The Q4_K custom-kernel
+# path is incompatible with fusion primitives (FusionTensor has no raw buffer
+# handle), so --talker-quant/--qmat-test are disabled under this feature.
+fusion = ["burn/fusion", "burn-wgpu/fusion"]
+
 [dependencies]
 anyhow = "1"
 burn = { path = "../../burn/crates/burn", default-features = false, features = ["metal", "std"] }
