@@ -237,10 +237,9 @@ async fn main() -> Result<()> {
     );
     // Engine-specific validation. `codec_dir` ends up `Some` only for MOSS.
     let codec_dir: Option<String> = match tts_choice {
-        TtsChoice::Moss => Some(
-            codec_dir
-                .ok_or_else(|| anyhow!("--tts moss needs --codec-dir. {usage}"))?,
-        ),
+        TtsChoice::Moss => {
+            Some(codec_dir.ok_or_else(|| anyhow!("--tts moss needs --codec-dir. {usage}"))?)
+        }
         TtsChoice::Qwen3 => {
             if codec_dir.is_some() {
                 bail!("--codec-dir is MOSS-only; qwen3-tts bundles its codec. {usage}");
@@ -255,7 +254,9 @@ async fn main() -> Result<()> {
         }
     };
     if matches!(tts_choice, TtsChoice::Moss) && ref_text.is_some() {
-        eprintln!("warning: --ref-text is ignored for --tts moss (it clones from --ref audio alone)");
+        eprintln!(
+            "warning: --ref-text is ignored for --tts moss (it clones from --ref audio alone)"
+        );
     }
     if matches!(tts_choice, TtsChoice::Moss) && talker_quant_cli.is_some() {
         eprintln!("warning: --talker-quant is ignored for --tts moss");
@@ -597,10 +598,10 @@ async fn apply_session_update(
                         silence_ms,
                     };
                     // Map to FireRedVAD params: threshold→speech_threshold,
-                    // silence_duration_ms→min_silence_frame (frame_shift ~10ms).
+                    // silence_duration_ms→min_silence_frame (frame_shift ~25ms).
                     let _ = param_tx.try_send(VadOverrides {
                         speech_threshold: Some(threshold),
-                        min_silence_frame: Some((silence_ms / 10).max(1) as usize),
+                        min_silence_frame: Some((silence_ms / 25).max(1) as usize),
                         ..Default::default()
                     });
                 }
@@ -1068,9 +1069,14 @@ fn synth_sentence(
                 ));
             };
             let abort = || barge.load(Ordering::Relaxed);
-            if let Err(e) =
-                e.synthesize_pcm_batched_with_abort(text, "auto", rv, QWEN3_MAX_FRAMES, &mut on_audio, Some(&abort))
-            {
+            if let Err(e) = e.synthesize_pcm_batched_with_abort(
+                text,
+                "auto",
+                rv,
+                QWEN3_MAX_FRAMES,
+                &mut on_audio,
+                Some(&abort),
+            ) {
                 eprintln!("tts error: {e}");
             }
         }

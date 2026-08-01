@@ -9,7 +9,11 @@
 //! command encoder, so ordering with surrounding ops is automatic.
 //!
 //! Fallback: on a non-Metal device (or any unexpected shape), we fall back to
-//! the composite `apply_rotary_pos_emb` so the CPU test path keeps working.
+//! the composite `apply_rotary_pos_emb_composite` directly — NOT the public
+//! `apply_rotary_pos_emb` hook, which would re-test `fusible` (still true for
+//! Metal 4-D F32/BF16, e.g. b>1) and re-enter this kernel forever (stack
+//! overflow). Calling the composite keeps the CPU test path working and can
+//! never recurse.
 
 use anyhow::{Result, bail};
 use candle_core::metal_backend::buffer_o;
@@ -20,7 +24,7 @@ use candle_metal_kernels::{Output, set_params};
 use objc2_metal::MTLSize;
 use std::sync::OnceLock;
 
-use crate::position_embed::rope::apply_rotary_pos_emb;
+use crate::position_embed::rope::apply_rotary_pos_emb_composite;
 
 const MSL: &str = include_str!("rope_fused.metal");
 
@@ -41,7 +45,10 @@ fn compile_kernel(device: &candle_core::MetalDevice, name: &str) -> Result<Compu
         .map_err(|e| anyhow::anyhow!("rope_fused pipeline {name}: {e}"))
 }
 
-fn pipeline_for(device: &candle_core::MetalDevice, dtype: DType) -> Result<&'static ComputePipeline> {
+fn pipeline_for(
+    device: &candle_core::MetalDevice,
+    dtype: DType,
+) -> Result<&'static ComputePipeline> {
     match dtype {
         DType::F32 => Ok(PIPELINE_F32.get_or_init(|| {
             compile_kernel(device, "rope_fused_f32").expect("compile rope_fused_f32")
@@ -64,29 +71,34 @@ fn pipeline_for(device: &candle_core::MetalDevice, dtype: DType) -> Result<&'sta
 /// canonical (b, heads, seq, head_dim) layout — at m=1 that copy is 1–2 kernels,
 /// far cheaper than the ~12 the composite path issues, and it lets the kernel use
 /// a simple contiguous row*head_dim offset (no stride plumbing).
-pub fn apply_rope_fused(q: &Tensor, k: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<(Tensor, Tensor)> {
+pub fn apply_rope_fused(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+) -> Result<(Tensor, Tensor)> {
     // Only handle the Metal + 4D + F32/BF16 case; anything else uses the
     // well-tested composite path.
     let device = match q.device() {
         Device::Metal(_) => q.device(),
-        _ => return apply_rotary_pos_emb(q, k, cos, sin, false).map_err(Into::into),
+        _ => return apply_rotary_pos_emb_composite(q, k, cos, sin, false).map_err(Into::into),
     };
     let dtype = q.dtype();
     if dtype != k.dtype() || (dtype != DType::F32 && dtype != DType::BF16) {
-        return apply_rotary_pos_emb(q, k, cos, sin, false).map_err(Into::into);
+        return apply_rotary_pos_emb_composite(q, k, cos, sin, false).map_err(Into::into);
     }
 
     // Normalize q/k to 4D (b, heads, seq, head_dim). A 3D (b, seq, hidden) input
     // can't be split into heads without knowing head_dim, so only 4D is fused.
     if q.rank() != 4 || k.rank() != 4 {
-        return apply_rotary_pos_emb(q, k, cos, sin, false).map_err(Into::into);
+        return apply_rotary_pos_emb_composite(q, k, cos, sin, false).map_err(Into::into);
     }
     let (b, q_heads, seq_len, head_dim) = q.dims4()?;
     let k_dims = k.dims4()?;
     let kv_heads = k_dims.1;
     if k_dims.0 != b || k_dims.2 != seq_len || k_dims.3 != head_dim || b != 1 {
         // b>1 shares one stride set in the kernel — only b==1 is exact there.
-        return apply_rotary_pos_emb(q, k, cos, sin, false).map_err(Into::into);
+        return apply_rotary_pos_emb_composite(q, k, cos, sin, false).map_err(Into::into);
     }
 
     // Canonicalize to contiguous (b, heads, seq, head_dim). This collapses the
@@ -99,8 +111,14 @@ pub fn apply_rope_fused(q: &Tensor, k: &Tensor, cos: &Tensor, sin: &Tensor) -> R
 
     // cos/sin: reduce any leading broadcast dims to a plain (seq_len, head_dim)
     // F32 buffer. At m=1 they arrive as (1,128) or unsqueezed variants.
-    let cos = cos.to_dtype(DType::F32)?.reshape((seq_len, head_dim))?.contiguous()?;
-    let sin = sin.to_dtype(DType::F32)?.reshape((seq_len, head_dim))?.contiguous()?;
+    let cos = cos
+        .to_dtype(DType::F32)?
+        .reshape((seq_len, head_dim))?
+        .contiguous()?;
+    let sin = sin
+        .to_dtype(DType::F32)?
+        .reshape((seq_len, head_dim))?
+        .contiguous()?;
 
     let q_rows = (b * q_heads * seq_len) as i64;
     let k_rows = (b * kv_heads * seq_len) as i64;
@@ -119,19 +137,17 @@ pub fn apply_rope_fused(q: &Tensor, k: &Tensor, cos: &Tensor, sin: &Tensor) -> R
 
     let st = q_layout.stride();
     if st.len() != 4 || k_layout.stride() != st {
-        return apply_rotary_pos_emb(&q, &k, &cos, &sin, false).map_err(Into::into);
+        return apply_rotary_pos_emb_composite(&q, &k, &cos, &sin, false).map_err(Into::into);
     }
     let (sb, sh, ss, sd) = (st[0] as i64, st[1] as i64, st[2] as i64, st[3] as i64);
 
-    let (q_ms, k_ms, cos_ms, sin_ms) = match (
-        &*q_storage,
-        &*k_storage,
-        &*cos_storage,
-        &*sin_storage,
-    ) {
-        (Storage::Metal(a), Storage::Metal(b), Storage::Metal(c), Storage::Metal(d)) => (a, b, c, d),
-        _ => bail!("rope_fused: non-metal input storage"),
-    };
+    let (q_ms, k_ms, cos_ms, sin_ms) =
+        match (&*q_storage, &*k_storage, &*cos_storage, &*sin_storage) {
+            (Storage::Metal(a), Storage::Metal(b), Storage::Metal(c), Storage::Metal(d)) => {
+                (a, b, c, d)
+            }
+            _ => bail!("rope_fused: non-metal input storage"),
+        };
 
     let q_out_buf = metal_dev.new_buffer(q_el, dtype, "rope_q_out")?;
     let k_out_buf = metal_dev.new_buffer(k_el, dtype, "rope_k_out")?;

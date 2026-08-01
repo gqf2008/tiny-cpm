@@ -305,11 +305,37 @@ impl SpeakerEncoder {
                 Block::SeRes2(b) => b.forward(&h)?,
             };
             feats.push(h.clone());
+            if std::env::var("QWEN3_TTS_DUMP_MEL").is_ok() {
+                let s = h.flatten_all()?.to_vec1::<f32>()?;
+                let (mn, mx) = (
+                    s.iter().copied().fold(f32::INFINITY, f32::min),
+                    s.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+                );
+                let mean = s.iter().sum::<f32>() / s.len() as f32;
+                eprintln!(
+                    "CANDLE_BLK{} mean={mean:.4} max={mx:.4} min={mn:.4}",
+                    feats.len() - 1
+                );
+            }
         }
         // multi-layer feature aggregation: concat blocks 1..=3, then mfa.
         let agg = Tensor::cat(&feats[1..], 1)?;
         let h = self.mfa.forward(&agg)?;
+        if std::env::var("QWEN3_TTS_DUMP_MEL").is_ok() {
+            let s = h.flatten_all()?.to_vec1::<f32>()?;
+            let mean = s.iter().sum::<f32>() / s.len() as f32;
+            eprintln!("CANDLE_BLK4_mfa mean={mean:.4}");
+        }
         let h = self.asp.forward(&h)?; // (1, 2C, 1)
+        if std::env::var("QWEN3_TTS_DUMP_MEL").is_ok() {
+            let s = h.flatten_all()?.to_vec1::<f32>()?;
+            let (mn, mx) = (
+                s.iter().copied().fold(f32::INFINITY, f32::min),
+                s.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+            );
+            let mean = s.iter().sum::<f32>() / s.len() as f32;
+            eprintln!("CANDLE_BLK5_asp mean={mean:.4} max={mx:.4} min={mn:.4}");
+        }
         let h = self.fc.forward(&h)?; // (1, enc_dim, 1)
         Ok(h.squeeze(0)?.squeeze(D::Minus1)?) // (enc_dim,)
     }
@@ -332,6 +358,10 @@ impl SpeakerEncoder {
         let mag = (power + 1e-9)?.sqrt()?;
         let mel = mag.broadcast_matmul(&self.mel_filters)?; // (1, T, mel_dim)
         let mel = mel.clamp(1e-5f32, f32::INFINITY)?.log()?;
+        if std::env::var("QWEN3_TTS_DUMP_MEL").is_ok() {
+            let m: Vec<f32> = mel.flatten_all()?.to_vec1::<f32>()?;
+            eprintln!("CANDLE_MEL {:?}", m);
+        }
         Ok(mel.squeeze(0)?)
     }
 }

@@ -39,7 +39,7 @@ xcodebuild -downloadComponent MetalToolchain   # one-time
 ## Build, run, and test commands
 
 ```bash
-cargo run --release -- chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens]
+cargo run --release -- chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens] [--quant <name>]
 cargo run --release -- asr funasr <model-dir> <audio-file> [max_tokens]
 cargo run --release -- asr qwen3  <model-dir> <audio-file> [max_tokens]
 cargo run --release -- tts voxcpm <model-dir> "<text>" <out.wav> [--ref ref.wav] [--max-len N]
@@ -61,19 +61,19 @@ cargo test    # CPU-only unit tests
 
 - **`src/main.rs`** — subcommand dispatch only (`chat` / `asr` / `tts` / `dialogue` / `vad` / `live`).
 - **`src/exec/`** — per-model CLI drivers (`chat.rs`, `fun_asr_nano.rs`, `qwen3_asr.rs`, `voxcpm.rs`, `moss_tts.rs`, `qwen3_tts.rs`, `dialogue.rs`, `live.rs`). Thin: parse args → load weights → run inference → emit. All model math lives in `src/models/`. Reusable engines also live here: `FunAsrEngine`, `Qwen3AsrEngine` (file + in-memory `transcribe_samples`), `MossEngine` (`synthesize` to wav, `synthesize_pcm` to memory), `Qwen3TtsEngine` (`synthesize_pcm`, `encode_ref` for a reusable `RefVoice`).
-- **`src/quantized_minicpm5.rs`** + **`src/token_output_stream.rs`** — the MiniCPM5 chat path (vendored from candle, see "two patches" below). Kept a minimal diff from upstream.
+- **`src/quantized_minicpm5.rs`** + **`src/token_output_stream.rs`** — the MiniCPM5 chat path (vendored from candle, see "three patches" below). Kept a minimal diff from upstream.
 - **`src/models/`** — aha ports: `fun_asr_nano/`, `qwen3_asr/`, `voxcpm/`, `moss_tts_nano/`, `moss_audio_tokenizer_nano/`; **`qwen3_tts/`** (ported from QwenLM/Qwen3-TTS, not aha): `config.rs` (serde configs), `talker.rs` (LM + code predictor, reuses `qwen3::Qwen3DecoderLayer`), `quantized_talker.rs` (QMatMul Qwen3 backbone mirror, opt-in), `codec.rs` (Mimi encoder + custom decoder), `speaker_encoder.rs` (ECAPA-TDNN); plus shared backbones `qwen3/`, `gpt2/`, `feature_extractor/` (whisper mel frontend).
 - **`src/common/`** — `modules.rs` (attention/MLP/conv builders), `sample.rs` (temp/top-k/top-p/repetition penalty), `InferenceModel` trait + `MultiModalData`.
 - **`src/utils/`** — `audio_utils.rs` (load/resample/mel/kaldi-fbank/LFR/STFT/WAV), `live_audio.rs` (cpal mic capture → 16kHz/400-sample frames, speaker playback queue), `tensor_utils.rs` (masks, scatter, linspace).
 - **`src/position_embed/`** — RoPE variants, sinusoidal PE. **`src/tokenizer/`** — tokenizers + sentencepiece wrappers.
 
-### The two MiniCPM5 patches (why `quantized_minicpm5` is vendored)
+### The three MiniCPM5 patches (why `quantized_minicpm5` is vendored)
 
-Upstream `quantized_llama` assumes `head_dim == hidden_size / num_heads` and `num_heads * head_dim == hidden_size`. MiniCPM5: `head_dim = 128`, `hidden = 1536`, `heads = 16` → `16*128 = 2048 ≠ 1536`. The vendored module (1) reads `head_dim` from GGUF `llama.rope.dimension_count` / `config.json`, (2) reshapes attention output to `num_heads * head_dim` before the output projection (2048 → 1536). RoPE convention from `general.architecture` (MiniCPM5 = NORM).
+Upstream `quantized_llama` assumes `head_dim == hidden_size / num_heads` and `num_heads * head_dim == hidden_size`. MiniCPM5: `head_dim = 128`, `hidden = 1536`, `heads = 16` → `16*128 = 2048 ≠ 1536`. The vendored module (1) reads `head_dim` from GGUF `llama.rope.dimension_count` / `config.json`, (2) reshapes attention output to `num_heads * head_dim` before the output projection (2048 → 1536), (3) always uses NEOX (non-interleaved / half-split) RoPE — real MiniCPM5-1B GGUFs declare `general.architecture = "llama"`, but the HF `LlamaForCausalLM` reference uses `rotate_half` (NEOX), so the arch string would select the wrong convention; the loader hardcodes NEOX and prints the arch at load for diagnostics. The bf16 loader (`from_safetensors_dir` → `from_vb`) shares the same RoPE; its quant level defaults to Q8_0 (`--quant <name>` / `TINY_CPM_QUANT`).
 
 ## Testing strategy
 
-- `cargo test` runs CPU-only unit tests: causal-mask tests in `quantized_minicpm5.rs`, plus config-parsing / feature-length / splice-shape tests added during the aha ports.
+- `cargo test` runs CPU-only unit tests: causal-mask tests in `quantized_minicpm5.rs`, `is_repeating`/`after_think` boundary tests in `exec/chat.rs`, plus config-parsing / feature-length / splice-shape tests added during the aha ports.
 - No CI. Real verification is empirical: run the binary against actual weights in `./models/` and check output quality.
 
 ## Code conventions
