@@ -3,155 +3,363 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>tiny-cpm voice</title>
+<title>tiny-cpm · voice</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  :root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e;
-         --accent: #2f81f7; --bubble-user: #1f6feb; --bubble-ai: #21262d; --green: #3fb950; --red: #f85149; }
-  body { font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text);
-         height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+  :root {
+    --bg0:#0a0a10; --bg1:#0f1220; --panel:rgba(255,255,255,.05); --panel2:rgba(255,255,255,.08);
+    --border:rgba(255,255,255,.09); --border2:rgba(255,255,255,.14);
+    --text:#e9edf5; --muted:#8a93a6; --muted2:#6b7288;
+    --accent:#6d8dff; --accent2:#8a5cff; --user1:#4f6ef7; --user2:#7a5cff;
+    --green:#34d399; --red:#fb7185; --amber:#fbbf24;
+    --shadow:0 8px 30px rgba(0,0,0,.45);
+    --r-lg:20px; --r-md:14px;
+  }
+  html,body{height:100%}
+  body {
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    color:var(--text); overflow:hidden;
+    background:
+      radial-gradient(1200px 700px at 15% -10%, rgba(122,92,255,.22), transparent 60%),
+      radial-gradient(1000px 600px at 90% 0%, rgba(79,110,247,.20), transparent 55%),
+      radial-gradient(900px 700px at 50% 110%, rgba(52,211,153,.10), transparent 55%),
+      linear-gradient(180deg,var(--bg1),var(--bg0));
+    background-attachment:fixed;
+    display:flex; flex-direction:column; align-items:center;
+  }
+  ::selection{background:rgba(109,141,255,.35)}
 
-  /* top bar */
-  .topbar { display: flex; align-items: center; gap: 10px; padding: 10px 16px; background: var(--panel);
-            border-bottom: 1px solid var(--border); flex-shrink: 0; }
-  .topbar .logo { font-weight: 700; font-size: 15px; white-space: nowrap; }
-  .topbar .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; transition: background .3s; }
-  .topbar .dot.live { background: var(--green); box-shadow: 0 0 6px var(--green); }
-  .topbar .dot.reconnect { background: var(--accent); animation: pulse 1s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
-  .topbar .status { font-size: 12px; color: var(--muted); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .topbar button { background: var(--border); color: var(--text); border: none; padding: 5px 14px;
-                   border-radius: 6px; cursor: pointer; font-size: 13px; }
-  .topbar button:hover { background: #3d444d; }
-  .topbar .gear { background: transparent; font-size: 18px; padding: 2px 6px; border-radius: 4px; }
+  /* ── shell ── */
+  .shell{width:min(880px,100%);height:100%;display:flex;flex-direction:column;position:relative}
 
-  /* mic button (floating, right side) */
-  .mic-btn { position: fixed; right: 20px; bottom: 72px; width: 56px; height: 56px; border-radius: 50%;
-             border: none; cursor: pointer; font-size: 22px; z-index: 100;
-             background: var(--border); color: var(--text); display: flex; align-items: center; justify-content: center;
-             transition: all .2s; box-shadow: 0 2px 8px rgba(0,0,0,.4); }
-  .mic-btn:hover { background: #3d444d; transform: scale(1.05); }
-  .mic-btn.on { background: var(--red); color: #fff; }
-  .mic-btn.on::after { content: ''; position: absolute; inset: -4px; border-radius: 50%;
-                        border: 2px solid var(--red); opacity: 0; animation: ring 1.5s infinite; }
-  @keyframes ring { 0%{opacity:.6;transform:scale(1)} 100%{opacity:0;transform:scale(1.6)} }
-  .mic-btn .lvl { position: absolute; bottom: -6px; left: 50%; transform: translateX(-50%);
-                  width: 40px; height: 3px; border-radius: 2px; background: var(--border); overflow: hidden; }
-  .mic-btn .lvl > div { height: 100%; width: 0; background: var(--green); transition: width .05s; }
+  /* ── header ── */
+  header{
+    display:flex;align-items:center;gap:12px;padding:14px 18px;margin:12px 12px 0;
+    background:var(--panel);border:1px solid var(--border);border-radius:var(--r-lg);
+    backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);box-shadow:var(--shadow);
+  }
+  .brand{display:flex;align-items:center;gap:11px;min-width:0}
+  .logo{width:38px;height:38px;border-radius:12px;flex-shrink:0;display:grid;place-items:center;
+        background:linear-gradient(135deg,var(--user1),var(--accent2));box-shadow:0 4px 16px rgba(109,141,255,.4);position:relative}
+  .logo svg{width:20px;height:20px}
+  .brand h1{font-size:15px;font-weight:700;letter-spacing:.2px}
+  .brand p{font-size:11.5px;color:var(--muted);margin-top:-1px}
+  .spacer{flex:1}
+  .pill{display:flex;align-items:center;gap:7px;padding:6px 12px;border-radius:999px;font-size:12px;
+        background:var(--panel2);border:1px solid var(--border);color:var(--muted);white-space:nowrap}
+  .pill .dot{width:7px;height:7px;border-radius:50%;background:var(--muted2);transition:background .3s}
+  .pill.live{color:var(--green)} .pill.live .dot{background:var(--green);box-shadow:0 0 8px var(--green)}
+  .pill.busy{color:var(--amber)} .pill.busy .dot{background:var(--amber);box-shadow:0 0 8px var(--amber);animation:pulse 1s infinite}
+  .pill.down{color:var(--red)} .pill.down .dot{background:var(--red);animation:pulse 1.2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .icon-btn{width:38px;height:38px;border-radius:12px;border:1px solid var(--border);background:var(--panel2);
+            color:var(--muted);cursor:pointer;display:grid;place-items:center;transition:.15s;flex-shrink:0}
+  .icon-btn:hover{color:var(--text);background:rgba(255,255,255,.13);transform:translateY(-1px)}
+  .icon-btn svg{width:18px;height:18px}
 
-  /* settings drawer */
-  .drawer { background: var(--panel); border-bottom: 1px solid var(--border); padding: 0 16px;
-            max-height: 0; overflow: hidden; transition: max-height .3s ease; flex-shrink: 0; }
-  .drawer.open { max-height: 500px; padding: 12px 16px; overflow-y: auto; }
-  .drawer h3 { font-size: 11px; color: var(--muted); margin: 8px 0 4px; text-transform: uppercase; letter-spacing: .5px; }
-  .drawer .row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-  .drawer label { font-size: 12px; color: var(--muted); width: 140px; font-family: ui-monospace, monospace; }
-  .drawer input[type=range] { flex: 1; }
-  .drawer .val { font-size: 12px; color: var(--accent); width: 44px; text-align: right; font-family: ui-monospace, monospace; }
-  .drawer textarea { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border);
-                     border-radius: 6px; padding: 8px; font: inherit; resize: vertical; }
-  .drawer .hint { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  /* ── chat ── */
+  .chat{flex:1;overflow-y:auto;padding:22px 20px 8px;display:flex;flex-direction:column;gap:14px;scroll-behavior:smooth}
+  .chat::-webkit-scrollbar{width:8px}
+  .chat::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:8px;border:2px solid transparent;background-clip:content-box}
+  .chat::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.22);background-clip:content-box}
 
-  /* chat */
-  .chat { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 6px; }
-  .chat::-webkit-scrollbar { width: 6px; } .chat::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-  .msg { max-width: 75%; padding: 10px 14px; border-radius: 16px; word-wrap: break-word; white-space: pre-wrap; line-height: 1.45; }
-  .msg.user { align-self: flex-end; background: var(--bubble-user); color: #fff; border-bottom-right-radius: 4px; }
-  .msg.ai { align-self: flex-start; background: var(--bubble-ai); border-bottom-left-radius: 4px; }
-  .msg.sys { align-self: center; font-size: 12px; color: var(--muted); background: none; padding: 2px; }
-  .msg.ai.streaming::after { content: '▌'; opacity: .5; animation: blink .8s infinite; }
-  @keyframes blink { 50%{opacity:0} }
+  .empty{margin:auto;text-align:center;color:var(--muted);padding:30px;animation:fadeUp .5s ease}
+  .empty .orb{width:74px;height:74px;margin:0 auto 18px;border-radius:50%;display:grid;place-items:center;
+      background:radial-gradient(circle at 30% 30%,rgba(138,92,255,.5),rgba(79,110,247,.25) 70%);
+      box-shadow:0 0 40px rgba(109,141,255,.35),inset 0 0 24px rgba(255,255,255,.12);animation:float 4s ease-in-out infinite}
+  .empty .orb svg{width:32px;height:32px}
+  .empty h2{font-size:19px;font-weight:700;color:var(--text);margin-bottom:6px}
+  .empty p{font-size:13.5px;max-width:320px;margin:0 auto}
+  @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
+  @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 
-  /* input */
-  .inputbar { display: flex; gap: 8px; padding: 10px 16px; background: var(--panel);
-              border-top: 1px solid var(--border); flex-shrink: 0; }
-  .inputbar input { flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--border);
-                     border-radius: 20px; padding: 9px 16px; font: inherit; outline: none; }
-  .inputbar input:focus { border-color: var(--accent); }
-  .inputbar button { background: var(--accent); color: #fff; border: none; padding: 9px 18px;
-                     border-radius: 20px; cursor: pointer; font: inherit; }
-  .inputbar button:disabled { opacity: .3; }
+  .row{display:flex;gap:10px;align-items:flex-end;animation:fadeUp .25s ease}
+  .row.user{flex-direction:row-reverse}
+  .avatar{width:30px;height:30px;border-radius:50%;flex-shrink:0;display:grid;place-items:center;font-size:12px;font-weight:700}
+  .row.ai .avatar{background:linear-gradient(135deg,var(--user1),var(--accent2));color:#fff;box-shadow:0 3px 10px rgba(109,141,255,.35)}
+  .row.user .avatar{background:var(--panel2);border:1px solid var(--border2);color:var(--muted)}
+  .avatar svg{width:15px;height:15px}
+  .bubble-col{display:flex;flex-direction:column;gap:3px;max-width:76%;min-width:0}
+  .row.user .bubble-col{align-items:flex-end}
+  .bubble{padding:11px 15px;border-radius:18px;line-height:1.5;word-wrap:break-word;white-space:pre-wrap;
+          font-size:14.5px;box-shadow:0 2px 10px rgba(0,0,0,.18)}
+  .row.ai .bubble{background:var(--panel2);border:1px solid var(--border);border-bottom-left-radius:5px;backdrop-filter:blur(8px)}
+  .row.user .bubble{background:linear-gradient(135deg,var(--user1),var(--user2));color:#fff;border-bottom-right-radius:5px}
+  .meta{font-size:10.5px;color:var(--muted2);padding:0 4px}
+  .bubble.streaming::after{content:'▍';margin-left:2px;color:var(--accent);animation:blink .9s infinite}
+  @keyframes blink{50%{opacity:0}}
+
+  .typing{display:inline-flex;gap:5px;align-items:center;padding:13px 16px}
+  .typing i{width:7px;height:7px;border-radius:50%;background:var(--muted);animation:tp 1.2s infinite}
+  .typing i:nth-child(2){animation-delay:.15s}.typing i:nth-child(3){animation-delay:.3s}
+  @keyframes tp{0%,60%,100%{transform:translateY(0);opacity:.4}30%{transform:translateY(-5px);opacity:1}}
+
+  .sys{align-self:center;font-size:11.5px;color:var(--muted);background:var(--panel);border:1px solid var(--border);
+       padding:5px 13px;border-radius:999px}
+
+  /* ── composer ── */
+  .composer{padding:12px 14px 16px;display:flex;flex-direction:column;gap:10px}
+  .micbar{display:flex;justify-content:center;align-items:center;gap:14px;min-height:8px}
+  .state{font-size:12px;color:var(--muted);letter-spacing:.3px;transition:.2s}
+  .state.on{color:var(--green)}
+
+  .inputwrap{display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--border);
+     border-radius:999px;padding:8px 8px 8px 18px;backdrop-filter:blur(14px);box-shadow:var(--shadow);transition:border-color .2s}
+  .inputwrap:focus-within{border-color:rgba(109,141,255,.5)}
+  .inputwrap input{flex:1;background:none;border:none;outline:none;color:var(--text);font:inherit;font-size:14.5px;min-width:0}
+  .inputwrap input::placeholder{color:var(--muted2)}
+  .inputwrap input:disabled{opacity:.4}
+
+  .fab{position:relative;width:46px;height:46px;border-radius:50%;border:none;cursor:pointer;flex-shrink:0;
+       display:grid;place-items:center;color:var(--muted);background:var(--panel2);border:1px solid var(--border2);transition:.18s}
+  .fab:hover{transform:scale(1.06);color:var(--text)}
+  .fab svg{width:20px;height:20px;position:relative;z-index:2}
+  .fab.send{background:linear-gradient(135deg,var(--user1),var(--user2));color:#fff;border:none;box-shadow:0 4px 16px rgba(109,141,255,.4)}
+  .fab.send:disabled{opacity:.35;transform:none;cursor:default}
+  .fab.mic.on{background:linear-gradient(135deg,#fb7185,#f43f5e);color:#fff;border:none;box-shadow:0 4px 20px rgba(251,113,133,.45)}
+  .fab.mic.on::before{content:'';position:absolute;inset:-3px;border-radius:50%;border:2px solid rgba(251,113,133,.7);animation:ring 1.6s infinite}
+  @keyframes ring{0%{opacity:.8;transform:scale(1)}100%{opacity:0;transform:scale(1.55)}}
+  /* waveform */
+  .wave{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:2.5px;z-index:1}
+  .wave i{width:2.5px;height:5px;border-radius:3px;background:rgba(255,255,255,.85);transition:height .06s}
+
+  /* ── settings panel (slide over) ── */
+  .scrim{position:fixed;inset:0;background:rgba(4,6,12,.55);backdrop-filter:blur(3px);opacity:0;pointer-events:none;transition:.25s;z-index:200}
+  .scrim.open{opacity:1;pointer-events:auto}
+  .panel{position:fixed;top:0;right:0;bottom:0;width:min(360px,88vw);z-index:201;display:flex;flex-direction:column;
+     background:rgba(18,20,32,.92);border-left:1px solid var(--border2);backdrop-filter:blur(20px);
+     transform:translateX(102%);transition:transform .3s cubic-bezier(.2,.8,.25,1);box-shadow:-20px 0 60px rgba(0,0,0,.5)}
+  .panel.open{transform:none}
+  .panel header{margin:0;border:none;border-bottom:1px solid var(--border);border-radius:0;background:transparent;box-shadow:none;padding:16px 18px}
+  .panel header h2{font-size:15px;font-weight:700}
+  .panel .body{flex:1;overflow-y:auto;padding:18px}
+  .panel .body::-webkit-scrollbar{width:6px}
+  .panel .body::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:6px}
+  .grp{margin-bottom:22px}
+  .grp h3{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+  .grp h3::after{content:'';flex:1;height:1px;background:var(--border)}
+  .fld{margin-bottom:14px}
+  .fld .lab{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px}
+  .fld label{font-size:12.5px;color:var(--text);font-weight:600}
+  .fld .val{font-size:12px;color:var(--accent);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .fld .hint{font-size:11px;color:var(--muted2);margin-top:4px}
+  textarea{width:100%;background:rgba(0,0,0,.25);color:var(--text);border:1px solid var(--border);border-radius:12px;
+           padding:10px 12px;font:inherit;font-size:13.5px;resize:vertical;outline:none;transition:border-color .2s}
+  textarea:focus{border-color:rgba(109,141,255,.5)}
+  input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:22px;background:transparent;cursor:pointer}
+  input[type=range]::-webkit-slider-runnable-track{height:5px;border-radius:3px;background:linear-gradient(90deg,var(--accent) var(--p,50%),rgba(255,255,255,.13) var(--p,50%))}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:#fff;margin-top:-5.5px;box-shadow:0 2px 8px rgba(0,0,0,.5);border:none}
+  input[type=range]::-moz-range-track{height:5px;border-radius:3px;background:rgba(255,255,255,.13)}
+  input[type=range]::-moz-range-progress{height:5px;border-radius:3px;background:var(--accent)}
+  input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:#fff;border:none;box-shadow:0 2px 8px rgba(0,0,0,.5)}
+  .meter{height:6px;border-radius:4px;background:rgba(255,255,255,.1);overflow:hidden;margin-top:6px}
+  .meter>div{height:100%;width:0;background:linear-gradient(90deg,var(--green),var(--amber),var(--red));transition:width .06s}
+
+  @media(max-width:640px){
+    header{margin:10px 10px 0;padding:12px 14px}
+    .brand p{display:none}
+    .bubble-col{max-width:84%}
+  }
 </style>
 </head>
 <body>
+<div class="shell">
 
-<div class="topbar">
-  <span class="logo">🔊 tiny-cpm</span>
-  <div class="dot" id="dot"></div>
-  <span class="status" id="status">连接中…</span>
-  <button class="gear" id="gear" title="设置">⚙</button>
+  <header>
+    <div class="brand">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/>
+        </svg>
+      </div>
+      <div>
+        <h1>tiny-cpm</h1>
+        <p>on-device voice · Metal</p>
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <div class="pill" id="pill"><span class="dot"></span><span id="status">连接中…</span></div>
+    <button class="icon-btn" id="gear" title="设置">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+      </svg>
+    </button>
+  </header>
+
+  <div class="chat" id="chat">
+    <div class="empty" id="empty">
+      <div class="orb">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/>
+        </svg>
+      </div>
+      <h2>开始对话</h2>
+      <p>点右下角麦克风说话，或直接打字。全程本地推理，不出这台机器。</p>
+    </div>
+  </div>
+
+  <div class="composer">
+    <div class="micbar"><span class="state" id="micState"></span></div>
+    <div class="inputwrap">
+      <input id="textInput" placeholder="输入消息…" disabled autocomplete="off">
+      <button class="fab mic" id="micBtn" title="语音">
+        <svg id="micIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>
+        </svg>
+        <span class="wave" id="wave" hidden><i></i><i></i><i></i><i></i><i></i></span>
+      </button>
+      <button class="fab send" id="sendText" title="发送" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+        </svg>
+      </button>
+    </div>
+  </div>
 </div>
 
-<div class="drawer" id="drawer">
-  <h3>人设 / Persona</h3>
-  <textarea id="persona" placeholder="留空=默认助手。例：你是毒舌但热心的技术顾问" rows="2"></textarea>
-  <h3>麦克风</h3>
-  <div class="row"><label>mic gain</label><input type="range" id="micGain" min="1" max="16" step="0.5" value="1"><span class="val" id="micGainV">1.0</span></div>
-  <div class="row"><label>rms gate</label><input type="range" id="rmsGateSlider" min="0" max="0.1" step="0.002" value="0.012"><span class="val" id="rmsGateV">0.012</span></div>
-  <div class="hint">RMS: <span id="rmsVal">0.0000</span></div>
-  <h3>server_vad</h3>
-  <div class="row"><label>threshold</label><input type="range" id="threshold" min="0.1" max="0.9" step="0.05" value="0.5"><span class="val" id="threshold_v">0.5</span></div>
-  <div class="row"><label>silence_ms</label><input type="range" id="silence" min="200" max="6000" step="100" value="800"><span class="val" id="silence_v">800</span></div>
-  <div class="row"><label>max_history</label><input type="range" id="hist" min="1" max="50" step="1" value="20"><span class="val" id="hist_v">20</span></div>
-</div>
-
-<div class="chat" id="chat"></div>
-
-<button class="mic-btn" id="micBtn" title="点击开关麦克风">🎤<div class="lvl"><div></div></div></button>
-
-<div class="inputbar">
-  <input id="textInput" placeholder="打字回车发送…（语音点右下麦克风）" disabled>
-  <button id="sendText" disabled>发送</button>
-</div>
+<!-- settings -->
+<div class="scrim" id="scrim"></div>
+<aside class="panel" id="panel">
+  <header>
+    <h2>设置</h2>
+    <div class="spacer"></div>
+    <button class="icon-btn" id="closePanel" title="关闭">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </header>
+  <div class="body">
+    <div class="grp">
+      <h3>人设</h3>
+      <div class="fld">
+        <textarea id="persona" rows="3" placeholder="留空 = 默认助手。例：你是毒舌但热心的技术顾问"></textarea>
+        <div class="hint">作为 system 指令发给模型，改完即生效。</div>
+      </div>
+    </div>
+    <div class="grp">
+      <h3>麦克风</h3>
+      <div class="fld">
+        <div class="lab"><label>增益 mic gain</label><span class="val" id="micGainV">1.0×</span></div>
+        <input type="range" id="micGain" min="1" max="16" step="0.5" value="1">
+      </div>
+      <div class="fld">
+        <div class="lab"><label>拾音门限 rms gate</label><span class="val" id="rmsGateV">0.012</span></div>
+        <input type="range" id="rmsGate" min="0" max="0.1" step="0.002" value="0.012">
+        <div class="meter"><div id="rmsMeter"></div></div>
+        <div class="hint">当前响度 <span id="rmsVal">0.0000</span> · 低于门限的声音被丢弃（挡远处人声）。</div>
+      </div>
+    </div>
+    <div class="grp">
+      <h3>语音检测 server_vad</h3>
+      <div class="fld">
+        <div class="lab"><label>触发阈值 threshold</label><span class="val" id="thresholdV">0.50</span></div>
+        <input type="range" id="threshold" min="0.1" max="0.9" step="0.05" value="0.5">
+      </div>
+      <div class="fld">
+        <div class="lab"><label>静音收尾 silence</label><span class="val" id="silenceV">800 ms</span></div>
+        <input type="range" id="silence" min="200" max="6000" step="100" value="800">
+      </div>
+      <div class="fld">
+        <div class="lab"><label>记忆轮数 max history</label><span class="val" id="histV">20</span></div>
+        <input type="range" id="hist" min="1" max="50" step="1" value="20">
+      </div>
+    </div>
+  </div>
+</aside>
 
 <script>
 const wsUrl = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws';
 const IN_SR = 16000, OUT_SR = 24000;
 let ws = null, ctx = null, micStream = null, recNode = null, playNode = null;
 let micOn = false, micGain = 1.0, rmsGate = 0.012;
-let responding = false, replyBuf = '', replyEl = null, playbackStarted = false;
-const playBuf = [];
-let reconnectDelay = 1000;  // exponential backoff
+let responding = false, replyBuf = '', replyEl = null;
+let reconnectDelay = 1000;
 let reconnectTimer = null;
 
 const $ = id => document.getElementById(id);
-const setStatus = (s, cls) => { $('status').textContent = s; const dot = $('dot'); dot.className = 'dot' + (cls ? ' '+cls : ''); };
-const addMsg = (cls, txt) => { const d = document.createElement('div'); d.className = 'msg '+cls; d.textContent = txt; $('chat').appendChild(d); $('chat').scrollTop = $('chat').scrollHeight; return d; };
+const scrollDown = () => { const c = $('chat'); c.scrollTop = c.scrollHeight; };
 
-// ── WebSocket connect with auto-reconnect ──
-function connect() {
-  setStatus('连接中…', 'reconnect');
+function setStatus(s, mode) {
+  $('status').textContent = s;
+  $('pill').className = 'pill' + (mode ? ' ' + mode : '');
+}
+function hideEmpty(){ const e=$('empty'); if(e) e.remove(); }
+function nowTime(){ const d=new Date(); return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'); }
+
+const AI_AV = '<div class="avatar"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/></svg></div>';
+const USER_AV = '<div class="avatar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></div>';
+
+function addMsg(role, txt) {
+  hideEmpty();
+  const row = document.createElement('div');
+  row.className = 'row ' + role;
+  row.innerHTML = (role === 'ai' ? AI_AV : USER_AV) +
+    '<div class="bubble-col"><div class="bubble"></div><div class="meta">' + nowTime() + '</div></div>';
+  row.querySelector('.bubble').textContent = txt;
+  $('chat').appendChild(row); scrollDown();
+  return row.querySelector('.bubble');
+}
+function addSys(txt){ hideEmpty(); const d=document.createElement('div'); d.className='sys'; d.textContent=txt; $('chat').appendChild(d); scrollDown(); }
+
+let typingRow = null;
+function showTyping(){
+  hideTyping(); hideEmpty();
+  typingRow = document.createElement('div');
+  typingRow.className = 'row ai';
+  typingRow.innerHTML = AI_AV + '<div class="bubble-col"><div class="bubble typing"><i></i><i></i><i></i></div></div>';
+  $('chat').appendChild(typingRow); scrollDown();
+}
+function hideTyping(){ if (typingRow){ typingRow.remove(); typingRow=null; } }
+
+// ── Playback (AudioWorklet on its own audio thread) ──
+async function ensurePlayback(){
+  if (!ctx) {
+    // Native sample rate; the worklet resamples 24k -> ctx rate with linear interp.
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    await ctx.audioWorklet.addModule('worklets/audio-playback.js');
+    playNode = new AudioWorkletNode(ctx, 'audio-playback', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1] });
+    playNode.port.onmessage = e => {
+      // worklet -> main: stats / underrun / buffering (kept for metering)
+    };
+    // prebufferMs: cushion the worklet accumulates before (re)starting playback.
+    // MOSS produces ~0.7-1.1x realtime, so we hold a backlog to hide its bursts.
+    playNode.port.postMessage({ kind: 'config', inputRate: OUT_SR, prebufferMs: 700 });
+    playNode.connect(ctx.destination);
+  }
+  if (ctx.state === 'suspended') await ctx.resume();
+}
+function pushPcm(f32){
+  if (!playNode) return;
+  playNode.port.postMessage({ kind: 'audio', samples: f32 }, [f32.buffer]);
+}
+function clearPlayback(){
+  if (playNode) playNode.port.postMessage({ kind: 'clear' });
+}
+function flushPlayback(){
+  if (playNode) playNode.port.postMessage({ kind: 'flush' });
+}
+
+// ── WebSocket ──
+async function connect() {
+  setStatus('连接中…', 'down');
   ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
   ws.onopen = async () => {
     reconnectDelay = 1000;
-    // Create AudioContext + playback immediately (TTS works without mic).
-    if (!ctx) {
-      ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: OUT_SR });
-      playNode = ctx.createScriptProcessor(8192, 0, 1);
-      playNode.onaudioprocess = e => {
-        const L = e.outputBuffer.getChannelData(0);
-        const total = playBuf.reduce((n,c)=>n+c.length,0);
-        if (!playbackStarted && total < OUT_SR*0.3) { L.fill(0); return; }
-        playbackStarted = true;
-        for (let i = 0; i < L.length; i++) L[i] = shiftOne();
-      };
-      playNode.connect(ctx.destination);
-    }
-    setStatus('已连接', 'live'); ws.send(JSON.stringify(buildSession())); enableInput(true);
+    try { await ensurePlayback(); } catch (e) { console.warn('audio init failed', e); }
+    setStatus('已连接', 'live');
+    ws.send(JSON.stringify(buildSession()));
+    enableInput(true);
   };
   ws.onmessage = onMessage;
-  ws.onclose = () => { setStatus('断开，重连中…', 'reconnect'); enableInput(false); micOff(); scheduleReconnect(); };
+  ws.onclose = () => { setStatus('重连中…', 'down'); enableInput(false); micOff(); hideTyping(); scheduleReconnect(); };
   ws.onerror = () => { ws.close(); };
 }
 function scheduleReconnect() {
   clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(() => { connect(); }, reconnectDelay);
-  reconnectDelay = Math.min(reconnectDelay * 2, 10000);  // backoff up to 10s
+  reconnectTimer = setTimeout(connect, reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 2, 10000);
 }
-function enableInput(on) {
-  $('textInput').disabled = !on; $('sendText').disabled = !on;
-}
+function enableInput(on){ $('textInput').disabled = !on; $('sendText').disabled = !on; }
 
 // ── Server events ──
 function onMessage(ev) {
@@ -159,78 +367,103 @@ function onMessage(ev) {
   switch (m.type) {
     case 'session.created': case 'session.updated': break;
     case 'input_audio_buffer.speech_started':
-      if (responding) { playBuf.length = 0; playbackStarted = false; } break;
+      if (responding) clearPlayback(); break;
     case 'input_audio_buffer.speech_stopped': break;
     case 'conversation.item.input_audio_transcription.completed':
       addMsg('user', m.transcript); break;
-    case 'response.created': responding = true; setStatus('思考中…', 'live'); break;
+    case 'response.created':
+      responding = true; setStatus('思考中…', 'busy'); showTyping(); break;
     case 'response.audio_transcript.delta':
-      if (m.delta) { replyBuf += m.delta;
+      if (m.delta) {
+        hideTyping();
+        replyBuf += m.delta;
         if (!replyEl) { replyEl = addMsg('ai', replyBuf); replyEl.classList.add('streaming'); }
-        else { replyEl.textContent = replyBuf; }
-        $('chat').scrollTop = $('chat').scrollHeight; setStatus('回复中…', 'live'); }
+        else replyEl.textContent = replyBuf;
+        scrollDown(); setStatus('回复中…', 'busy');
+      }
       break;
     case 'response.audio.delta':
-      if (m.delta) { const raw = atob(m.delta); const a = new Uint8Array(raw.length); for (let i=0;i<raw.length;i++) a[i]=raw.charCodeAt(i); const i16 = new Int16Array(a.buffer); const f = new Float32Array(i16.length); for (let i=0;i<i16.length;i++) f[i]=i16[i]/32768; playBuf.push(f); }
+      if (m.delta) {
+        const raw = atob(m.delta); const a = new Uint8Array(raw.length);
+        for (let i=0;i<raw.length;i++) a[i]=raw.charCodeAt(i);
+        const i16 = new Int16Array(a.buffer); const f = new Float32Array(i16.length);
+        for (let i=0;i<i16.length;i++) f[i]=i16[i]/32768;
+        pushPcm(f);
+      }
       break;
     case 'response.done':
+      hideTyping();
       if (replyEl) replyEl.classList.remove('streaming');
-      responding = false; replyBuf = ''; replyEl = null; playbackStarted = false;
+      responding = false; replyBuf = ''; replyEl = null;
+      flushPlayback(); // play out any buffered tail without waiting for the prebuffer
       setStatus(micOn ? '监听中' : '已连接', 'live'); break;
-    case 'error': addMsg('sys', '⚠ ' + (m.error?.message || '')); break;
+    case 'error': hideTyping(); addSys('⚠ ' + (m.error?.message || '出错了')); break;
   }
 }
 
-// ── Audio: mic capture + TTS playback ──
+// ── Mic capture (AudioWorklet forwards frames; main thread does DSP + WS) ──
+const waveBars = () => Array.from($('wave').children);
+function handleMicFrame(in0){
+  let s = 0; for (let i = 0; i < in0.length; i++) s += in0[i]*in0[i];
+  const r = Math.sqrt(s / in0.length);
+  // waveform + meter
+  const lv = Math.min(1, r*8);
+  waveBars().forEach((b,i)=>{ b.style.height = (4 + lv*16*(0.5+0.5*Math.sin(Date.now()/90+i))) + 'px'; });
+  $('rmsMeter').style.width = Math.min(100, r*400)+'%';
+  $('rmsVal').textContent = r.toFixed(4);
+  if (!ws || ws.readyState !== 1) return;
+  if (r < rmsGate) return;
+  const ratio = ctx.sampleRate / IN_SR;
+  const outLen = Math.floor(in0.length / ratio);
+  const out = new Int16Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const idx = i*ratio, i0 = Math.floor(idx), i1 = Math.min(i0+1, in0.length-1);
+    const v = (in0[i0]*(1-(idx-i0)) + in0[i1]*(idx-i0)) * micGain;
+    out[i] = Math.max(-32768, Math.min(32767, v*32767));
+  }
+  const bytes = new Uint8Array(out.buffer);
+  let bin = ''; for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  ws.send(JSON.stringify({ type:'input_audio_buffer.append', audio: btoa(bin) }));
+}
 async function micOn_() {
   if (micOn) return;
   try {
     micStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }, video: false
     });
-    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: OUT_SR });
+    await ensurePlayback();
+    await ctx.audioWorklet.addModule('worklets/mic-capture.js');
     const src = ctx.createMediaStreamSource(micStream);
-    const meter = $('micBtn').querySelector('.lvl > div');
-    recNode.onaudioprocess = e => {
-      e.outputBuffer.getChannelData(0).fill(0);
-      const in0 = e.inputBuffer.getChannelData(0);
-      let s = 0; for (let i = 0; i < in0.length; i++) s += in0[i]*in0[i];
-      const r = Math.sqrt(s / in0.length);
-      meter.style.width = Math.min(100, r*300)+'%'; $('rmsVal').textContent = r.toFixed(4);
-      if (!ws || ws.readyState !== 1) return;
-      if (r < rmsGate) return;
-      const ratio = ctx.sampleRate / IN_SR;
-      const outLen = Math.floor(in0.length / ratio);
-      const out = new Int16Array(outLen);
-      for (let i = 0; i < outLen; i++) {
-        const idx = i*ratio, i0 = Math.floor(idx), i1 = Math.min(i0+1, in0.length-1);
-        const v = (in0[i0]*(1-(idx-i0)) + in0[i1]*(idx-i0)) * micGain;
-        out[i] = Math.max(-32768, Math.min(32767, v*32767));
-      }
-      const bytes = new Uint8Array(out.buffer);
-      let bin = ''; for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-      ws.send(JSON.stringify({ type:'input_audio_buffer.append', audio: btoa(bin) }));
-    };
+    recNode = new AudioWorkletNode(ctx, 'mic-capture', { numberOfInputs: 1, numberOfOutputs: 1 });
+    recNode.port.onmessage = e => { if (e.data && e.data.kind === 'frame') handleMicFrame(e.data.samples); };
     src.connect(recNode); recNode.connect(ctx.destination);
-    recNode = ctx.createScriptProcessor(4096, 1, 1);
     micOn = true;
     $('micBtn').classList.add('on');
+    $('wave').hidden = false; $('micIcon').style.display = 'none';
+    $('micState').textContent = '正在聆听 · 再点一次停止'; $('micState').classList.add('on');
     setStatus('监听中', 'live');
-  } catch (e) { addMsg('sys', '⚠ 麦克风权限被拒绝'); }
+  } catch (e) { addSys('⚠ 麦克风权限被拒绝'); }
 }
 function micOff() {
   if (!micOn) return;
   micOn = false;
   $('micBtn').classList.remove('on');
-  if (recNode) { recNode.disconnect(); recNode = null; }
+  $('wave').hidden = true; $('micIcon').style.display = '';
+  $('micState').textContent = ''; $('micState').classList.remove('on');
+  if (recNode) { try { recNode.port.postMessage({ kind: 'stop' }); } catch(_){} recNode.disconnect(); recNode = null; }
   if (micStream) { micStream.getTracks().forEach(t=>t.stop()); micStream = null; }
-  $('micBtn').querySelector('.lvl > div').style.width = '0';
+  $('rmsMeter').style.width = '0';
   if (ws && ws.readyState === 1) setStatus('已连接', 'live');
 }
 $('micBtn').onclick = () => micOn ? micOff() : micOn_();
 
 // ── Settings ──
-$('gear').onclick = () => $('drawer').classList.toggle('open');
+const openPanel = o => { $('panel').classList.toggle('open', o); $('scrim').classList.toggle('open', o); };
+$('gear').onclick = () => openPanel(true);
+$('closePanel').onclick = () => openPanel(false);
+$('scrim').onclick = () => openPanel(false);
+
+function paintRange(el){ const p = (el.value-el.min)/(el.max-el.min)*100; el.style.setProperty('--p', p+'%'); }
 function buildSession() {
   return { type:'session.update', session: {
     instructions: $('persona').value || null,
@@ -239,15 +472,23 @@ function buildSession() {
     max_history_turns: parseInt($('hist').value),
   }};
 }
-$('micGain').oninput = e => { micGain = parseFloat(e.target.value); $('micGainV').textContent = micGain.toFixed(1); };
-$('rmsGateSlider').oninput = e => { rmsGate = parseFloat(e.target.value); $('rmsGateV').textContent = rmsGate.toFixed(3); };
-for (const [id, lab] of [['threshold','threshold_v'],['silence','silence_v'],['hist','hist_v']]) {
-  $(id).oninput = e => { $(lab).textContent = e.target.value; };
-  $(id).onchange = () => ws && ws.readyState === 1 && ws.send(JSON.stringify(buildSession()));
-}
-$('persona').onchange = () => ws && ws.readyState === 1 && ws.send(JSON.stringify(buildSession()));
+function sendSession(){ if (ws && ws.readyState === 1) ws.send(JSON.stringify(buildSession())); }
 
-// ── Text input ──
+function bindRange(id, lab, fmt, onval){
+  const el = $(id);
+  const paint = () => { paintRange(el); $(lab).textContent = fmt(parseFloat(el.value)); };
+  el.oninput = () => { paint(); onval && onval(parseFloat(el.value)); };
+  el.onchange = sendSession;
+  paint();
+}
+bindRange('micGain','micGainV', v=>v.toFixed(1)+'×', v=>micGain=v);
+bindRange('rmsGate','rmsGateV', v=>v.toFixed(3), v=>rmsGate=v);
+bindRange('threshold','thresholdV', v=>v.toFixed(2));
+bindRange('silence','silenceV', v=>v+' ms');
+bindRange('hist','histV', v=>String(v|0));
+$('persona').onchange = sendSession;
+
+// ── Text send ──
 function sendText() {
   const v = $('textInput').value.trim();
   if (!v || !ws || ws.readyState !== 1) return;
@@ -259,15 +500,6 @@ function sendText() {
 $('sendText').onclick = sendText;
 $('textInput').onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(); } };
 
-function shiftOne() {
-  while (playBuf.length && playBuf[0].length === 0) playBuf.shift();
-  if (!playBuf.length) return 0;
-  const c = playBuf[0]; const v = c[0];
-  if (c.length > 1) playBuf[0] = c.subarray(1); else playBuf.shift();
-  return v;
-}
-
-// ── Boot: auto-connect on page load ──
 connect();
 </script>
 </body>
