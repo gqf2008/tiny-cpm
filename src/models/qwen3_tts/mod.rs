@@ -11,6 +11,7 @@
 //! - `speaker_encoder` — ECAPA-TDNN producing a raw 2048-d speaker embedding for cloning.
 pub mod codec;
 pub mod config;
+pub mod qknorm_rope_fused;
 pub mod quantized_talker;
 pub mod rope_fused;
 pub mod sdpa_fused;

@@ -542,6 +542,51 @@ impl QKNormAttention {
         })
     }
 
+    /// q/k projection → per-head QK-RMSNorm → RoPE, returning the (b, heads, seq,
+    /// head_dim) tensors ready for KV-cache + attention. On Metal decode this fuses
+    /// the per-head RMSNorm and RoPE into ONE kernel (`qknorm_rope_fused`); any
+    /// non-Metal / unexpected input falls back to the separate norm + RoPE ops.
+    fn qk_norm_rope(
+        &self,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        tof32: bool,
+        b_sz: usize,
+        q_len: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let q = self
+            .q_proj
+            .forward(xs)?
+            .reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
+        let k = self
+            .k_proj
+            .forward(xs)?
+            .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
+        // Fused path only when no F32-upcast is requested (the fused kernel applies
+        // the norm weight in the input dtype's precision; tof32=true callers want
+        // the explicit F32 round-trip the composite path does).
+        if !tof32 {
+            if let Some((qn, kn)) =
+                crate::models::qwen3_tts::qknorm_rope_fused::qknorm_rope_fused(
+                    &q,
+                    &k,
+                    self.q_norm.weight(),
+                    self.k_norm.weight(),
+                    self.q_norm.eps(),
+                    cos,
+                    sin,
+                )?
+            {
+                return Ok((qn.transpose(1, 2)?, kn.transpose(1, 2)?));
+            }
+        }
+        // Composite fallback: separate per-head norm, transpose, then RoPE.
+        let q = self.q_norm.forward(&q)?.transpose(1, 2)?;
+        let k = self.k_norm.forward(&k)?.transpose(1, 2)?;
+        apply_rotary_pos_emb(&q, &k, cos, sin, tof32)
+    }
+
     pub fn forward(
         &mut self,
         xs: &Tensor,
@@ -550,26 +595,11 @@ impl QKNormAttention {
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
-        let query_states = self.q_proj.forward(xs)?.reshape((
-            b_sz,
-            q_len,
-            self.num_attention_heads,
-            self.head_dim,
-        ))?;
-        let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?;
-        let key_states = self.k_proj.forward(xs)?.reshape((
-            b_sz,
-            q_len,
-            self.num_key_value_heads,
-            self.head_dim,
-        ))?;
-        let key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?;
+        let (query_states, key_states) = self.qk_norm_rope(xs, cos, sin, false, b_sz, q_len)?;
         let value_states = self.v_proj.forward(xs)?;
         let value_states = value_states
             .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let (query_states, key_states) =
-            apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
