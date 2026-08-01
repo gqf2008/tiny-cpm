@@ -851,10 +851,21 @@ impl Talker {
         let greedy = std::env::var("QWEN3_TTS_GREEDY").is_ok();
         // QWEN3_TTS_PROF=1: per-stage wall-clock accumulation, printed at end of gen.
         let prof = std::env::var("QWEN3_TTS_PROF").is_ok();
+        // QWEN3_TTS_PROF_SYNC=1: drain the GPU after each stage so each timer measures
+        // that stage's true GPU completion time (not just CPU enqueue). Diagnostic only —
+        // serializes the pipeline, so totals are pessimistic.
+        let prof_sync = std::env::var("QWEN3_TTS_PROF_SYNC").is_ok();
+        let drain = |dev: &Device| {
+            if prof_sync {
+                let _ = dev.synchronize();
+            }
+        };
         let mut t_sample0 = std::time::Duration::ZERO;
         let mut t_predictor = std::time::Duration::ZERO;
         let mut t_embed = std::time::Duration::ZERO;
         let mut t_fwd = std::time::Duration::ZERO;
+        let mut t_cat = std::time::Duration::ZERO;
+        let mut t_readback = std::time::Duration::ZERO;
         let t_gen = std::time::Instant::now();
 
         #[allow(clippy::explicit_counter_loop)]
@@ -880,6 +891,7 @@ impl Talker {
                 gen_cfg.top_p,
                 rep,
             )?; // (1,) u32 on device
+            drain(&self.device);
             if prof {
                 t_sample0 += tt.elapsed();
             }
@@ -893,6 +905,7 @@ impl Talker {
             // code predictor fills codebooks 1..=15 (on-device tokens, no readback).
             let tt = std::time::Instant::now();
             let rest_t = self.code_predictor_predict(&past_hidden, &code0_t, gen_cfg)?;
+            drain(&self.device);
             if prof {
                 t_predictor += tt.elapsed();
             }
@@ -905,6 +918,7 @@ impl Talker {
                 _ => tts_pad_embed.clone(),
             };
             next = (next + text_row)?;
+            drain(&self.device);
             if prof {
                 t_embed += tt.elapsed();
             }
@@ -912,9 +926,18 @@ impl Talker {
             // SINGLE per-frame readback: cat [code0, rest..] into one (16,) tensor and
             // read it back once — for EOS check, gen_history, the streaming callback and
             // the returned codes tensor. (mlx-audio does the same: one mx.eval per frame.)
+            let tt = std::time::Instant::now();
             let mut all_t = vec![code0_t.reshape((1,))?];
             all_t.extend(rest_t.iter().map(|t| t.reshape((1,)).unwrap()));
-            let flat_frame = Tensor::cat(&all_t, 0)?.to_vec1::<u32>()?;
+            let flat_c = Tensor::cat(&all_t, 0)?;
+            if prof {
+                t_cat += tt.elapsed();
+            }
+            let tt = std::time::Instant::now();
+            let flat_frame = flat_c.to_vec1::<u32>()?;
+            if prof {
+                t_readback += tt.elapsed();
+            }
             let code0 = flat_frame[0];
             let frame = flat_frame;
 
@@ -940,6 +963,7 @@ impl Talker {
 
             let tt = std::time::Instant::now();
             let (h, l) = self.forward_step_gpu(&next, offset)?;
+            drain(&self.device);
             if prof {
                 t_fwd += tt.elapsed();
             }
@@ -951,17 +975,21 @@ impl Talker {
         if prof {
             let total = t_gen.elapsed();
             eprintln!(
-                "qwen3-tts PROF: frames={} total={:.2?} | sample0={:.2?} predictor={:.2?} embed={:.2?} fwd={:.2?} | per-frame: sample0={:.2?} predictor={:.2?} embed={:.2?} fwd={:.2?}",
+                "qwen3-tts PROF: frames={} total={:.2?} | sample0={:.2?} predictor={:.2?} embed={:.2?} fwd={:.2?} cat={:.2?} readback={:.2?} | per-frame: sample0={:.2?} predictor={:.2?} embed={:.2?} fwd={:.2?} cat={:.2?} readback={:.2?}",
                 frames.len(),
                 total,
                 t_sample0,
                 t_predictor,
                 t_embed,
                 t_fwd,
+                t_cat,
+                t_readback,
                 t_sample0 / frames.len().max(1) as u32,
                 t_predictor / frames.len().max(1) as u32,
                 t_embed / frames.len().max(1) as u32,
                 t_fwd / frames.len().max(1) as u32,
+                t_cat / frames.len().max(1) as u32,
+                t_readback / frames.len().max(1) as u32,
             );
         }
 
