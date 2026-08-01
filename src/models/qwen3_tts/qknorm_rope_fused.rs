@@ -36,7 +36,10 @@ fn compile_kernel(device: &candle_core::MetalDevice, name: &str) -> Result<Compu
         .map_err(|e| anyhow::anyhow!("qknorm_rope pipeline {name}: {e}"))
 }
 
-fn pipeline_for(device: &candle_core::MetalDevice, dtype: DType) -> Option<&'static ComputePipeline> {
+fn pipeline_for(
+    device: &candle_core::MetalDevice,
+    dtype: DType,
+) -> Option<&'static ComputePipeline> {
     // Compile once and cache the OUTCOME; on any compile error cache None so a
     // model/shape we didn't expect falls back to the composite path instead of
     // panicking the whole run (QKNormAttention is shared with Qwen3-ASR, whose
@@ -97,8 +100,14 @@ pub fn qknorm_rope_fused(
     let k = k.contiguous()?;
     let qn_w = qn_w.to_dtype(DType::F32)?.reshape(head_dim)?.contiguous()?;
     let kn_w = kn_w.to_dtype(DType::F32)?.reshape(head_dim)?.contiguous()?;
-    let cos = cos.to_dtype(DType::F32)?.reshape((seq_len, head_dim))?.contiguous()?;
-    let sin = sin.to_dtype(DType::F32)?.reshape((seq_len, head_dim))?.contiguous()?;
+    let cos = cos
+        .to_dtype(DType::F32)?
+        .reshape((seq_len, head_dim))?
+        .contiguous()?;
+    let sin = sin
+        .to_dtype(DType::F32)?
+        .reshape((seq_len, head_dim))?
+        .contiguous()?;
 
     let q_rows = (b * seq_len * q_heads) as i64;
     let k_rows = (b * seq_len * kv_heads) as i64;
@@ -162,8 +171,16 @@ pub fn qknorm_rope_fused(
         );
         // One threadgroup per row, head_dim threads per group.
         let total_rows = (q_rows + k_rows) as usize;
-        let tgs = MTLSize { width: head_dim.min(1024), height: 1, depth: 1 };
-        let tgc = MTLSize { width: total_rows, height: 1, depth: 1 };
+        let tgs = MTLSize {
+            width: head_dim.min(1024),
+            height: 1,
+            depth: 1,
+        };
+        let tgc = MTLSize {
+            width: total_rows,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatch_thread_groups(tgc, tgs);
     }
 

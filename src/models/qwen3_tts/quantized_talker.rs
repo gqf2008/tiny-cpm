@@ -83,8 +83,7 @@ impl QuantizedTalkerLayer {
         let q = qkv.narrow(2, 0, self.q_rows)?;
         let k = qkv.narrow(2, self.q_rows, self.kv_rows)?;
         let v = qkv.narrow(2, self.q_rows + self.kv_rows, self.kv_rows)?;
-        let q = q
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?;
+        let q = q.reshape((b_sz, q_len, self.num_heads, self.head_dim))?;
         let q = self.q_norm.forward(&q)?.transpose(1, 2)?;
         let k = k.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?;
         let k = self.k_norm.forward(&k)?.transpose(1, 2)?;

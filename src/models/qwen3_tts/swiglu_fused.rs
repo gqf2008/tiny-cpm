@@ -33,7 +33,10 @@ fn compile_kernel(device: &candle_core::MetalDevice, name: &str) -> Result<Compu
         .map_err(|e| anyhow::anyhow!("swiglu_fused pipeline {name}: {e}"))
 }
 
-fn pipeline_for(device: &candle_core::MetalDevice, dtype: DType) -> Result<&'static ComputePipeline> {
+fn pipeline_for(
+    device: &candle_core::MetalDevice,
+    dtype: DType,
+) -> Result<&'static ComputePipeline> {
     match dtype {
         DType::F32 => Ok(PIPELINE_F32.get_or_init(|| {
             compile_kernel(device, "swiglu_fused_f32").expect("compile swiglu_fused_f32")
@@ -95,8 +98,16 @@ fn swiglu_fused_inner(gate: &Tensor, up: &Tensor, device: &Device, dtype: DType)
                 numel_i
             )
         );
-        let tgs = MTLSize { width: numel.min(256), height: 1, depth: 1 };
-        let tgc = MTLSize { width: numel.div_ceil(tgs.width), height: 1, depth: 1 };
+        let tgs = MTLSize {
+            width: numel.min(256),
+            height: 1,
+            depth: 1,
+        };
+        let tgc = MTLSize {
+            width: numel.div_ceil(tgs.width),
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatch_thread_groups(tgc, tgs);
     }
 
