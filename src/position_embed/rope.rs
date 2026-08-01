@@ -124,7 +124,10 @@ pub fn apply_rotary_pos_emb(
 
 /// The original ~12-op composite RoPE (broadcast_mul / rotate_half / add). Kept
 /// as the fallback for non-Metal devices and any shape the fused kernel skips.
-fn apply_rotary_pos_emb_composite(
+/// `pub(crate)`: the fused kernels' fallbacks call this DIRECTLY (never the
+/// `apply_rotary_pos_emb` hook) so a rejected fused input can't re-enter the
+/// fused path and recurse forever.
+pub(crate) fn apply_rotary_pos_emb_composite(
     q: &Tensor,
     k: &Tensor,
     cos: &Tensor,

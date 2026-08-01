@@ -229,10 +229,12 @@ impl Qwen3TtsEngine {
     pub fn encode_ref(&self, ref_wav: &str, ref_text: &str) -> Result<RefVoice> {
         let wav = load_audio_with_resample(ref_wav, &self.device, Some(self.sample_rate), Some(1))?; // (1, T)
         let pcm: Vec<f32> = wav.squeeze(0)?.to_vec1::<f32>()?;
-        let spk_embed = self
-            .speaker_encoder
-            .embed(&pcm)?
-            .to_dtype(self.talker_dtype)?; // (enc_dim,)
+        let spk_embed_f32 = self.speaker_encoder.embed(&pcm)?; // f32 (enc_dim,)
+        if std::env::var("QWEN3_TTS_DUMP_REF").is_ok() {
+            let se: Vec<f32> = spk_embed_f32.flatten_all()?.to_vec1::<f32>()?;
+            eprintln!("CANDLE_REF_SPK {:?}", se);
+        }
+        let spk_embed = spk_embed_f32.to_dtype(self.talker_dtype)?; // (enc_dim,)
         // codec encode expects (B, 1, T).
         let ref_code = self
             .codec
@@ -241,6 +243,10 @@ impl Qwen3TtsEngine {
             .ok_or_else(|| anyhow!("codec encoder not loaded"))?
             .encode(&wav.unsqueeze(1)?)?; // (1, 16, T_ref)
         let ref_code = ref_code.squeeze(0)?; // (16, T_ref)
+        if std::env::var("QWEN3_TTS_DUMP_REF").is_ok() {
+            let rc: Vec<u32> = ref_code.flatten_all()?.to_vec1::<u32>()?;
+            eprintln!("CANDLE_REF_CODE {} {:?}", rc.len() / 16, rc);
+        }
         let ref_text_ids = self.encode_text(ref_text)?;
         Ok(RefVoice {
             spk_embed,
