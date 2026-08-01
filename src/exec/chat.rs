@@ -32,22 +32,63 @@ pub struct ChatGenStats {
 }
 
 /// Load MiniCPM5 from a `.gguf` file or a bf16 safetensors directory
-/// (auto-quantized to Q8_0 in-memory) onto `device`.
+/// (auto-quantized in-memory) onto `device`. Quant level comes from
+/// `TINY_CPM_QUANT` (default Q8_0). See [`load_model_with_quant`].
 pub fn load_model(model_path: &str, device: &Device) -> Result<ModelWeights> {
+    load_model_with_quant(model_path, None, device)
+}
+
+/// `load_model` with an explicit quant level (`quant_name`: e.g. "q4_k_m",
+/// "q8_0"). Priority: `quant_name` > `TINY_CPM_QUANT` env > Q8_0. A `.gguf`
+/// path ignores the quant level (the file is already quantized).
+pub fn load_model_with_quant(
+    model_path: &str,
+    quant_name: Option<&str>,
+    device: &Device,
+) -> Result<ModelWeights> {
     let model = if model_path.ends_with(".gguf") {
         let mut file = std::fs::File::open(model_path)?;
         let content =
             gguf_file::Content::read(&mut file).map_err(|e| anyhow::anyhow!("gguf: {e:?}"))?;
         ModelWeights::from_gguf(content, &mut file, device)?
     } else {
-        eprintln!("quantizing bf16 safetensors in {model_path} to Q8_0 in-memory...");
-        ModelWeights::from_safetensors_dir(
-            model_path,
-            candle_core::quantized::GgmlDType::Q8_0,
-            device,
-        )?
+        // Runtime quantization of the bf16 safetensors. Default Q8_0; override
+        // via `quant_name` or TINY_CPM_QUANT (q8_0, q4_k_m, q5_k_m, q6_k, ...).
+        // K-quants map to candle's `GgmlDType::QnK` block formats.
+        let dtype = match quant_name {
+            Some(q) => parse_quant(Some(q)),
+            None => parse_quant(std::env::var("TINY_CPM_QUANT").ok().as_deref()),
+        };
+        eprintln!("quantizing bf16 safetensors in {model_path} to {dtype:?} in-memory...");
+        ModelWeights::from_safetensors_dir(model_path, dtype, device)?
     };
     Ok(model)
+}
+
+/// Map a `--`/env quant name to a `GgmlDType` (default Q8_0).
+pub fn parse_quant(name: Option<&str>) -> candle_core::quantized::GgmlDType {
+    use candle_core::quantized::GgmlDType::*;
+    match name.map(|s| s.to_ascii_lowercase()) {
+        None => Q8_0,
+        Some(s) => match s.as_str() {
+            "q8_0" | "q8" => Q8_0,
+            "q4_0" => Q4_0,
+            "q4_1" => Q4_1,
+            "q5_0" => Q5_0,
+            "q5_1" => Q5_1,
+            "q4_k" | "q4_k_m" | "q4k" => Q4K,
+            "q5_k" | "q5_k_m" | "q5k" => Q5K,
+            "q6_k" | "q6k" => Q6K,
+            "q3_k" | "q3_k_m" | "q3k" => Q3K,
+            "q2_k" | "q2k" => Q2K,
+            "f16" => F16,
+            "f32" => F32,
+            other => {
+                eprintln!("unknown TINY_CPM_QUANT '{other}', defaulting to Q8_0");
+                Q8_0
+            }
+        },
+    }
 }
 
 /// Generate one chat reply for `prompt` (ChatML single-turn, optional system
@@ -84,7 +125,18 @@ pub fn generate_reply_with_system(
     sink: &mut dyn FnMut(&str),
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<ChatGenStats> {
-    generate_reply_with_history(model, tokenizer, device, system, &[], prompt, no_think, max_tokens, sink, cancel)
+    generate_reply_with_history(
+        model,
+        tokenizer,
+        device,
+        system,
+        &[],
+        prompt,
+        no_think,
+        max_tokens,
+        sink,
+        cancel,
+    )
 }
 
 /// Multi-turn ChatML: renders [optional system +] prior `history` turns
@@ -124,7 +176,10 @@ pub fn generate_reply_with_history(
     } else {
         format!("{chat}<think>\n")
     };
-    eprintln!("=== ChatML ({} chars) ===\n{chat}\n=== end ChatML ===", chat.len());
+    eprintln!(
+        "=== ChatML ({} chars) ===\n{chat}\n=== end ChatML ===",
+        chat.len()
+    );
     let enc = tokenizer
         .encode(chat, true)
         .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
@@ -181,6 +236,15 @@ pub fn generate_reply_with_history(
         if EOS_TOKEN_IDS.contains(&next) {
             break;
         }
+        // Repetition guard: small models (1B) sometimes fall into an exact
+        // repeat loop ("星期五，星期五，…") on questions they can't answer and
+        // would otherwise spew it until max_tokens — and the TTS then reads the
+        // whole loop aloud. Break as soon as a short trailing phrase repeats
+        // back-to-back several times.
+        if generated % 8 == 0 && is_repeating(&full) {
+            eprintln!("llm: repetition loop detected, stopping at {generated} tokens");
+            break;
+        }
     }
     if let Some(rest) = tos.decode_rest()? {
         stream_clean(&mut full, &mut printed, &rest, sink);
@@ -218,13 +282,45 @@ fn stream_clean(full: &mut String, printed: &mut usize, s: &str, sink: &mut dyn 
     // Suppress think block: emit only text AFTER </think> (the actual response).
     // Before </think> is reasoning content — never displayed or spoken.
     let clean = match full.find("</think>") {
-        Some(idx) => full[idx + 8..].to_string(),  // 8 = len("</think>")
-        None => String::new(),  // still thinking — suppress
+        Some(idx) => full[idx + 8..].to_string(), // 8 = len("</think>")
+        None => String::new(),                    // still thinking — suppress
     };
     if clean.len() > *printed {
         sink(&clean[*printed..]);
         *printed = clean.len();
     }
+}
+
+/// Detect an exact back-to-back repeat loop at the tail of `text`. Tries short
+/// phrase lengths (in chars) and returns true if the same phrase repeats ≥4
+/// times consecutively at the end. Cheap: only inspects the tail.
+fn is_repeating(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    if n < 16 {
+        return false;
+    }
+    for plen in [4usize, 6, 8, 12] {
+        if n < plen * 4 {
+            continue;
+        }
+        let tail = &chars[n - plen..];
+        let mut count = 1;
+        let mut i = n - plen;
+        while i >= plen {
+            let prev = &chars[i - plen..i];
+            if prev == tail {
+                count += 1;
+                i -= plen;
+            } else {
+                break;
+            }
+        }
+        if count >= 4 {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn run(args: &[String]) -> Result<()> {
