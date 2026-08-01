@@ -360,7 +360,7 @@ impl ModelWeights {
                 n_head: ct.hparams.n_head as usize,
                 n_kv_head: ct.hparams.n_head as usize / gqa,
                 head_dim: (ct.hparams.n_embd / ct.hparams.n_head) as usize,
-                rope_is_neox: false, // GGML format = standard Llama = interleaved
+                rope_is_neox: true, // MiniCPM5 uses NEOX RoPE (see from_vb note)
                 cos: cos.clone(),
                 sin: sin.clone(),
                 neg_inf: neg_inf.clone(),
@@ -424,7 +424,10 @@ impl ModelWeights {
             .unwrap_or_default();
         let rope_is_neox = matches!(
             arch.as_str(),
-            "qwen"
+            "minicpm"
+                | "minicpm3"
+                | "minicpm5"
+                | "qwen"
                 | "qwen2"
                 | "qwen2moe"
                 | "qwen3"
@@ -586,7 +589,12 @@ impl ModelWeights {
         let inter = cfg.intermediate_size;
         let rms_norm_eps = cfg.rms_norm_eps;
         let rope_freq_base = cfg.rope_theta;
-        let rope_is_neox = false; // MiniCPM5/LLaMA = NORM (interleaved pairs)
+        // MiniCPM5 uses NEOX-style (non-interleaved) RoPE — confirmed against the
+        // reference implementation (aha `apply_rotary_pos_emb` → `rotate_half`,
+        // the NEOX half-split rotation). Using interleaved (NORM) RoPE here
+        // corrupts the position encoding and causes the repetition / missing-EOS
+        // failure mode regardless of quantization.
+        let rope_is_neox = true;
 
         let (cos, sin) = precomput_freqs_cis(rope_dim, rope_freq_base, device)?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
