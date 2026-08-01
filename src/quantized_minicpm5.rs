@@ -7,14 +7,24 @@
 //! assumes `head_dim == hidden/heads` and `num_heads*head_dim == hidden`, both
 //! of which break on MiniCPM5.
 //!
-//! This module is a vendored copy of `quantized_llama` with two patches:
-//! 1. `head_dim` is read from the GGUF (`llama.rope.dimension_count`) instead
-//!    of `embedding_length / head_count`.
+//! This module is a vendored copy of `quantized_llama` with these patches:
+//! 1. `head_dim` is read from the GGUF (`llama.rope.dimension_count`) / config
+//!    instead of `embedding_length / head_count`.
 //! 2. The attention output is reshaped to `num_heads * head_dim` (not `hidden`)
 //!    before the output projection maps it back to `hidden`.
+//! 3. RoPE is always NEOX (non-interleaved / half-split), matching the HF
+//!    `LlamaForCausalLM` reference (`rotate_half`). Real MiniCPM5-1B GGUFs
+//!    declare `general.architecture = "llama"`, which would select NORM
+//!    (interleaved) RoPE from the arch string and silently corrupt attention.
+//!
+//! Also adds a bf16 safetensors loader (`from_safetensors_dir` → `from_vb`)
+//! that quantizes HF-layout weights in memory — `QTensor::quantize_onto`
+//! requires a CPU-mapped VarBuilder source, so the safetensors are mmapped on
+//! CPU first.
 //!
 //! Supports 2/3/4/8-bit GGUF quantization (Q8_0, Q4_K_M, ...). Load weights
-//! from a `.gguf` file via `ModelWeights::from_gguf`.
+//! from a `.gguf` file via `ModelWeights::from_gguf` or from a bf16
+//! safetensors directory via `ModelWeights::from_safetensors_dir`.
 //!
 
 use std::collections::HashMap;
@@ -412,42 +422,21 @@ impl ModelWeights {
             .and_then(|m| m.to_f32())
             .unwrap_or(10000f32);
 
-        // Determine RoPE convention from model architecture (matching llama.cpp).
-        // NEOX (non-interleaved): pairs (i, i+d/2) — Qwen, Qwen2, Falcon, Phi, etc.
-        // NORM (interleaved): pairs (2i, 2i+1) — Llama, Mistral, DeepSeek, etc.
-        // See llama_model_rope_type() in llama.cpp for the authoritative mapping.
+        // RoPE convention: always NEOX (non-interleaved, pairs i with i+d/2)
+        // for this MiniCPM5-only module, consistent with `from_vb`/`from_ggml`
+        // and the HF reference (`LlamaForCausalLM` → `rotate_half`). Real
+        // MiniCPM5-1B GGUFs declare `general.architecture = "llama"`, which
+        // would select NORM (interleaved) RoPE here and silently corrupt
+        // attention. Keep the arch read for a load-time diagnostic so a
+        // mismatch is visible instead of silent babble.
         let arch = ct
             .metadata
             .get("general.architecture")
             .and_then(|v| v.to_string().ok())
             .cloned()
             .unwrap_or_default();
-        let rope_is_neox = matches!(
-            arch.as_str(),
-            "minicpm"
-                | "minicpm3"
-                | "minicpm5"
-                | "qwen"
-                | "qwen2"
-                | "qwen2moe"
-                | "qwen3"
-                | "qwen3moe"
-                | "falcon"
-                | "grok"
-                | "dbrx"
-                | "phi2"
-                | "phi3"
-                | "phimoe"
-                | "stablelm"
-                | "starcoder2"
-                | "bert"
-                | "nomic-bert"
-                | "jina-bert-v2"
-                | "olmo2"
-                | "olmoe"
-                | "codeshell"
-                | "plamo"
-        );
+        eprintln!("gguf arch {arch:?}, using NEOX (non-interleaved) RoPE");
+        let rope_is_neox = true;
 
         let (cos, sin) = precomput_freqs_cis(rope_dim, rope_freq_base, device)?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;

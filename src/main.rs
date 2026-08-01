@@ -9,7 +9,7 @@
 //!   live   realtime voice dialogue: mic -> VAD -> Qwen3-ASR -> MiniCPM5 -> TTS (moss|qwen3) -> speaker
 //!
 //! Usage:
-//!     tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens]
+//!     tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens] [--quant <name>]
 //!     tiny-cpm asr <funasr|qwen3> <model-dir> <audio-file> [max_tokens]
 //!     tiny-cpm tts <voxcpm|moss> <model-dir> "<text>" <out.wav> [--codec <codec-dir>] [--ref <ref.wav>] [--max-len N]
 //!     tiny-cpm tts cosyvoice3 <model-dir> "<text>" <out.wav> [--voice <name>] [--ref <ref.wav> --ref-text "<text>"] [--steps N] [--max-tokens N]

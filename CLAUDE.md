@@ -22,7 +22,7 @@ The four speech models are **ported from [`aha`](https://github.com/jhqxxx/aha)*
 ## Commands
 
 ```bash
-cargo run --release -- chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens]
+cargo run --release -- chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens] [--quant <name>]
 cargo run --release -- asr funasr <model-dir> <audio-file> [max_tokens]
 cargo run --release -- asr qwen3  <model-dir> <audio-file> [max_tokens]
 cargo run --release -- tts voxcpm <model-dir> "<text>" <out.wav> [--ref ref.wav] [--max-len N]
@@ -34,7 +34,7 @@ cargo build --release
 cargo check
 cargo fmt
 cargo clippy
-cargo test    # CPU-only unit tests (masks, feature-length math, config parsing)
+cargo test    # CPU-only unit tests (masks, feature-length math, config parsing, chat repeat-guard)
 ```
 
 Output contract: payload (chat/transcript) → **stdout**; diagnostics → **stderr**; TTS writes WAV to the given path.
@@ -51,8 +51,8 @@ Model weights are not in the repo — download into `./models/` (gitignored). MO
 
 ## Non-obvious things that bite
 
-- **`from_gguf` vs `from_safetensors_dir`** (chat): `.gguf` → pre-quantized fast load; a directory → bf16 safetensors quantized to Q8_0 in memory at load. **`quantize_onto` needs a CPU source** — mmap on CPU, then quantize onto Metal.
-- **Why vendored `quantized_minicpm5`**: upstream `quantized_llama` hardcodes `head_dim = hidden/heads` (96 for MiniCPM5); MiniCPM5 has `head_dim=128`, `16*128=2048 ≠ 1536`. Patches: read `head_dim` from GGUF metadata / config.json; reshape attention output to `n_head*head_dim` before o_proj.
+- **`from_gguf` vs `from_safetensors_dir`** (chat): `.gguf` → pre-quantized fast load; a directory → bf16 safetensors quantized in memory at load (default Q8_0; `--quant <name>` or `TINY_CPM_QUANT` to override: q8_0/q4_0/q4_1/q5_0/q5_1/q4_k/q5_k/q6_k/q3_k/q2_k/f16/f32). **`quantize_onto` needs a CPU source** — mmap on CPU, then quantize onto Metal.
+- **Why vendored `quantized_minicpm5`**: upstream `quantized_llama` hardcodes `head_dim = hidden/heads` (96 for MiniCPM5); MiniCPM5 has `head_dim=128`, `16*128=2048 ≠ 1536`. Patches: read `head_dim` from GGUF metadata / config.json; reshape attention output to `n_head*head_dim` before o_proj; always use NEOX (non-interleaved / half-split) RoPE — real MiniCPM5-1B GGUFs report arch `"llama"`, which would select the wrong (NORM) convention; the loader prints the arch at load for diagnostics.
 - **Greedy (`ArgMax`) loops forever** on MiniCPM5 — `chat` uses `TopP { p: 0.9, temperature: 0.7 }`, seed `299792458`, EOS `[1, 130073]`.
 - **Weight formats differ per model**: Fun-ASR = `.pt` pickles + bundled `Qwen3-0.6B/` subdir; Qwen3-ASR = mmaped safetensors (bf16); VoxCPM2 = safetensors LM + `.pth` AudioVAE (F32); MOSS = `.bin` pickles (loaded at **F32** — F16 visibly degraded quality vs the official F32 Python reference) + safetensors codec + sentencepiece `tokenizer.model`.
 - **MOSS**: `--codec` defaults to `<model-dir>/../MOSS-Audio-Tokenizer-Nano`; `--max-len` default 100 frames (~8 s at 12.5 fps — the codec's true rate); output WAV is stereo.

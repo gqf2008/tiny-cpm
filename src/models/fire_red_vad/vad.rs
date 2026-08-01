@@ -63,7 +63,7 @@ pub struct FireRedVad {
     // else-branch below cut on a SINGLE non-speech frame, so any mid-utterance
     // breath/pause/word-search fragmented one utterance into many short turns
     // ("ASR only hears the first phrase"). This is what the web `silence_ms`
-    // slider actually maps onto (silence_ms / 10ms per frame).
+    // slider actually maps onto (silence_ms / 25ms per frame).
     trailing_silence_frames: usize,
     silence_run: usize,
     // Per-frame neural speech flag from the last `detect_frame` call — set from
@@ -130,10 +130,10 @@ impl FireRedVad {
             ov.min_speech_frame,
             cfg.min_speech_frame,
         );
-        // Default min_silence_frame 45 (raised from upstream 20) for realtime
-        // dialogue: a longer minimum trailing silence before endpointing, so
-        // mid-sentence pauses don't cut the user off. The `vad` subcommand
-        // processes whole files so this doesn't affect it.
+        // Default min_silence_frame 45 (raised from upstream 20) for the
+        // whole-file postprocessor path (detect_file; `vad` subcommand). The
+        // streaming detect_frame path reads trailing_silence_frames instead —
+        // the same env/CLI chain feeds both (see below).
         cfg.min_silence_frame = envu("VAD_MIN_SILENCE_FRAME", ov.min_silence_frame, 45);
         let vad_postprocessor = VadPostprocessor::new(&cfg);
         // Streaming segment logic in detect_frame.
@@ -147,11 +147,20 @@ impl FireRedVad {
         // Default look_back_frames 50: a longer window needs sustained silence,
         // so inter-phrase dips don't endpoint.
         let look_back_frames = envu("VAD_LOOK_BACK_FRAMES", ov.look_back_frames, 50);
+        // Default 32 frames (~800ms at the 25ms frame shift): the streaming
+        // detect_frame endpoint only cuts after this many consecutive non-speech
+        // frames, matching the web `silence_ms=800` default so mid-utterance
+        // pauses up to ~0.8s don't cut the user off. Shares the min_silence_frame
+        // env/CLI chain (--vad-min-silence / VAD_MIN_SILENCE_FRAME, in frames),
+        // so those knobs now control the streaming path too; update_params keeps
+        // it in sync at runtime.
+        let trailing_silence_frames = envu("VAD_MIN_SILENCE_FRAME", ov.min_silence_frame, 32);
         eprintln!(
-            "vad params: speech_threshold={} min_speech_frame={} min_silence_frame={} | min_speach_ratio={} end_silence_ratio={} min_speach_frames={} look_back_frames={}",
+            "vad params: speech_threshold={} min_speech_frame={} min_silence_frame={} trailing_silence_frames={} | min_speach_ratio={} end_silence_ratio={} min_speach_frames={} look_back_frames={}",
             cfg.speech_threshold,
             cfg.min_speech_frame,
             cfg.min_silence_frame,
+            trailing_silence_frames,
             min_speach_ratio,
             end_silence_ratio,
             min_speach_frames,
@@ -168,14 +177,13 @@ impl FireRedVad {
             frame_length_sample: 400,
             speech_cache: vec![],
             pred_cache: vec![],
-            min_speach_frames, // 约 250ms
-            look_back_frames,  // 约 80ms
+            min_speach_frames, // ~750ms at 25ms/frame
+            look_back_frames,  // ~1.25s at 25ms/frame
             min_speach_ratio,
             end_silence_ratio,
-            // Default 80 frames (~800ms at the 10ms frame shift): match the web
-            // `silence_ms=800` default so mid-utterance pauses up to ~0.8s don't
-            // cut the user off. Tunable via VadOverrides / silence_ms.
-            trailing_silence_frames: 80,
+            // Streaming trailing-silence endpoint; default 32 frames (~800ms at
+            // the 25ms frame shift), from the min_silence_frame chain above.
+            trailing_silence_frames,
             silence_run: 0,
             last_frame_speech: false,
         })
@@ -206,7 +214,7 @@ impl FireRedVad {
         let frame_is_speech = preds_sum as f32 > probs_len as f32 * self.min_speach_ratio;
         self.last_frame_speech = frame_is_speech;
         let final_data = if frame_is_speech {
-            // 有人声：重置连续静音计数，累积人声帧。
+            // Speech: reset the consecutive-silence counter and accumulate speech frames.
             self.silence_run = 0;
             self.speech_cache.push(audio_frame.clone());
             let preds = binary_preds.to_vec1::<u32>()?;
@@ -235,9 +243,11 @@ impl FireRedVad {
                 }
             }
         } else {
-            // 这帧被判为非人声。不立即切——累计连续静音帧，只有持续静音达到
-            // trailing_silence_frames 才结束这一段。这样句中换气/停顿/想词
-            // （短暂的非人声帧）不会把一整句话切成好几段。
+            // This frame is non-speech. Don't cut immediately — accumulate
+            // consecutive silence and only end the segment once it reaches
+            // trailing_silence_frames. That way mid-utterance breaths/pauses/
+            // word-searches (brief non-speech frames) don't fragment one
+            // utterance into several turns.
             self.silence_run += 1;
             if self.pred_cache.len() >= self.min_speach_frames
                 && self.silence_run >= self.trailing_silence_frames
@@ -248,13 +258,15 @@ impl FireRedVad {
                 self.silence_run = 0;
                 Some(data)
             } else if self.silence_run >= self.trailing_silence_frames {
-                // 静音够长但人声缓存太短（不足 min_speach_frames，多为噪声段），丢弃。
+                // Silence long enough but the speech cache is too short (under
+                // min_speach_frames, usually noise): discard.
                 self.speech_cache.clear();
                 self.pred_cache.clear();
                 self.silence_run = 0;
                 None
             } else {
-                // 还在尾部静音窗口内，继续等（保留缓存，人声可能恢复）。
+                // Still inside the trailing-silence window: keep waiting (cache
+                // retained — speech may resume).
                 None
             }
         };
@@ -335,6 +347,11 @@ impl FireRedVad {
 
     pub fn reset(&mut self) {
         self.caches = None;
+        // Clear per-utterance streaming state too, so a reused instance starts a
+        // fresh segment (speech/pred caches + the trailing-silence counter).
+        self.speech_cache.clear();
+        self.pred_cache.clear();
+        self.silence_run = 0;
     }
 
     /// Runtime-update the streaming + postprocessor params (used by the web
@@ -352,7 +369,7 @@ impl FireRedVad {
         if let Some(v) = o.min_silence_frame {
             self.vad_postprocessor.min_silence_frame = v;
             // Also drive the streaming trailing-silence endpoint: the web
-            // `silence_ms` slider is converted to frames (silence_ms/10) by the
+            // `silence_ms` slider is converted to frames (silence_ms/25) by the
             // caller and arrives here as min_silence_frame, so keep the two in
             // sync — this is the value the streaming path actually uses.
             self.trailing_silence_frames = v;

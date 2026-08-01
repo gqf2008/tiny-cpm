@@ -271,6 +271,7 @@ const wsUrl = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location
 const IN_SR = 16000, OUT_SR = 24000;
 let ws = null, ctx = null, micStream = null, recNode = null, playNode = null;
 let micOn = false, micGain = 1.0, rmsGate = 0.012;
+let micSeq = 0, micPending = false; // mic on/off generation counter; bails stale micOn_ awaits
 let responding = false, replyBuf = '', replyEl = null;
 let reconnectDelay = 1000;
 let reconnectTimer = null;
@@ -337,6 +338,15 @@ function clearPlayback(){
 function flushPlayback(){
   if (playNode) playNode.port.postMessage({ kind: 'flush' });
 }
+// Chrome autoplay policy: an AudioContext created in ws.onopen without a user gesture
+// can stay suspended. Resume (or lazily create) it on the first click/touch.
+function unlockAudio() {
+  ensurePlayback().catch(e => console.warn('audio unlock failed', e));
+  document.removeEventListener('click', unlockAudio);
+  document.removeEventListener('touchstart', unlockAudio);
+}
+document.addEventListener('click', unlockAudio);
+document.addEventListener('touchstart', unlockAudio);
 
 // ── WebSocket ──
 async function connect() {
@@ -363,7 +373,9 @@ function enableInput(on){ $('textInput').disabled = !on; $('sendText').disabled 
 
 // ── Server events ──
 function onMessage(ev) {
-  const m = JSON.parse(ev.data);
+  let m;
+  try { m = JSON.parse(ev.data); }
+  catch (e) { console.warn('bad frame from server, skipping:', ev.data, e); return; }
   switch (m.type) {
     case 'session.created': case 'session.updated': break;
     case 'input_audio_buffer.speech_started':
@@ -403,6 +415,10 @@ function onMessage(ev) {
 
 // ── Mic capture (AudioWorklet forwards frames; main thread does DSP + WS) ──
 const waveBars = () => Array.from($('wave').children);
+// One-pole IIR low-pass before the 48k->16k decimation: plain linear interpolation
+// would alias >8 kHz content into the voice band. Cutoff ~= 8 kHz (16 kHz output
+// Nyquist); state persists across frames so the filter stays continuous.
+let micLpState = 0;
 function handleMicFrame(in0){
   let s = 0; for (let i = 0; i < in0.length; i++) s += in0[i]*in0[i];
   const r = Math.sqrt(s / in0.length);
@@ -413,6 +429,9 @@ function handleMicFrame(in0){
   $('rmsVal').textContent = r.toFixed(4);
   if (!ws || ws.readyState !== 1) return;
   if (r < rmsGate) return;
+  // Anti-aliasing low-pass (in-place; the raw frame is no longer needed).
+  const lpA = 1 - Math.exp(-2 * Math.PI * 8000 / ctx.sampleRate);
+  for (let i = 0; i < in0.length; i++) { micLpState += lpA * (in0[i] - micLpState); in0[i] = micLpState; }
   const ratio = ctx.sampleRate / IN_SR;
   const outLen = Math.floor(in0.length / ratio);
   const out = new Int16Array(outLen);
@@ -427,25 +446,43 @@ function handleMicFrame(in0){
 }
 async function micOn_() {
   if (micOn) return;
+  micSeq++;                 // invalidate any earlier in-flight attempt
+  const seq = micSeq;       // this attempt's generation
+  micPending = true;
   try {
-    micStream = await navigator.mediaDevices.getUserMedia({
+    const stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }, video: false
     });
+    // Bail at every await if the user toggled while we were pending.
+    if (seq !== micSeq) { stream.getTracks().forEach(t => t.stop()); return; }
     await ensurePlayback();
+    if (seq !== micSeq) { stream.getTracks().forEach(t => t.stop()); return; }
     await ctx.audioWorklet.addModule('worklets/mic-capture.js');
+    if (seq !== micSeq) { stream.getTracks().forEach(t => t.stop()); return; }
+    micStream = stream; // commit: this attempt is now the live one
     const src = ctx.createMediaStreamSource(micStream);
-    recNode = new AudioWorkletNode(ctx, 'mic-capture', { numberOfInputs: 1, numberOfOutputs: 1 });
+    // The worklet posts frames over its port and never writes audio output, so
+    // it needs no output connection (and no output count).
+    recNode = new AudioWorkletNode(ctx, 'mic-capture', { numberOfInputs: 1 });
     recNode.port.onmessage = e => { if (e.data && e.data.kind === 'frame') handleMicFrame(e.data.samples); };
-    src.connect(recNode); recNode.connect(ctx.destination);
+    src.connect(recNode);
+    micPending = false;
     micOn = true;
     $('micBtn').classList.add('on');
     $('wave').hidden = false; $('micIcon').style.display = 'none';
     $('micState').textContent = '正在聆听 · 再点一次停止'; $('micState').classList.add('on');
     setStatus('监听中', 'live');
-  } catch (e) { addSys('⚠ 麦克风权限被拒绝'); }
+  } catch (e) {
+    if (seq === micSeq) {
+      micPending = false;
+      addSys('⚠ 麦克风权限被拒绝');
+    }
+  }
 }
 function micOff() {
-  if (!micOn) return;
+  micSeq++;                 // cancel any in-flight micOn_ (it bails at its next await)
+  if (!micOn && !micPending) return;
+  micPending = false;
   micOn = false;
   $('micBtn').classList.remove('on');
   $('wave').hidden = true; $('micIcon').style.display = '';
@@ -455,7 +492,7 @@ function micOff() {
   $('rmsMeter').style.width = '0';
   if (ws && ws.readyState === 1) setStatus('已连接', 'live');
 }
-$('micBtn').onclick = () => micOn ? micOff() : micOn_();
+$('micBtn').onclick = () => (micOn || micPending) ? micOff() : micOn_();
 
 // ── Settings ──
 const openPanel = o => { $('panel').classList.toggle('open', o); $('scrim').classList.toggle('open', o); };

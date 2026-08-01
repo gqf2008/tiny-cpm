@@ -7,6 +7,7 @@ use candle_nn::{
     RmsNorm, VarBuilder, batch_norm, conv1d, conv1d_no_bias, conv2d, conv2d_no_bias, layer_norm,
     linear_b, ops::sigmoid, rms_norm,
 };
+use std::cell::Cell;
 
 use crate::{
     position_embed::rope::{apply_rotary_pos_emb, apply_rotary_pos_emb_roformer},
@@ -87,8 +88,7 @@ impl Module for GateUpDownMLP {
         if matches!(self.act_fn, Activation::Silu) {
             let gate = xs.apply(&self.gate_proj)?;
             let up = xs.apply(&self.up_proj)?;
-            if let Some(fused) = crate::models::qwen3_tts::swiglu_fused::swiglu_fused(&gate, &up)
-            {
+            if let Some(fused) = crate::models::qwen3_tts::swiglu_fused::swiglu_fused(&gate, &up) {
                 let gated = fused.map_err(|e| candle_core::Error::Msg(e.to_string()))?;
                 return gated.apply(&self.down_proj);
             }
@@ -555,29 +555,31 @@ impl QKNormAttention {
         b_sz: usize,
         q_len: usize,
     ) -> Result<(Tensor, Tensor)> {
-        let q = self
-            .q_proj
-            .forward(xs)?
-            .reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
-        let k = self
-            .k_proj
-            .forward(xs)?
-            .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
+        let q = self.q_proj.forward(xs)?.reshape((
+            b_sz,
+            q_len,
+            self.num_attention_heads,
+            self.head_dim,
+        ))?;
+        let k = self.k_proj.forward(xs)?.reshape((
+            b_sz,
+            q_len,
+            self.num_key_value_heads,
+            self.head_dim,
+        ))?;
         // Fused path only when no F32-upcast is requested (the fused kernel applies
         // the norm weight in the input dtype's precision; tof32=true callers want
         // the explicit F32 round-trip the composite path does).
         if !tof32 {
-            if let Some((qn, kn)) =
-                crate::models::qwen3_tts::qknorm_rope_fused::qknorm_rope_fused(
-                    &q,
-                    &k,
-                    self.q_norm.weight(),
-                    self.k_norm.weight(),
-                    self.q_norm.eps(),
-                    cos,
-                    sin,
-                )?
-            {
+            if let Some((qn, kn)) = crate::models::qwen3_tts::qknorm_rope_fused::qknorm_rope_fused(
+                &q,
+                &k,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                self.q_norm.eps(),
+                cos,
+                sin,
+            )? {
                 return Ok((qn.transpose(1, 2)?, kn.transpose(1, 2)?));
             }
         }
@@ -799,6 +801,47 @@ impl NaiveAttnGateUpDownMLPBlock {
     }
 }
 
+/// Opt-in flag for the fused SDPA decode fast path (`sdpa_vector_attention`).
+///
+/// The fused kernel uses `simd_sum` + `fast::exp` and is NOT bit-identical to the
+/// eager matmul→softmax→matmul path, so it must only run for the qwen3-tts
+/// talker/predictor (where it is a deliberate perf trade). Shared attention
+/// users (cosyvoice3 LM/s3tok/flow, MOSS-TTS gpt2, fun_asr, and qwen3-ASR via
+/// `Qwen3DecoderLayer`) keep the eager path. Default OFF; the qwen3-tts talker
+/// wraps its decode forwards in [`sdpa_fast_guard`]. Module-scoped rather than a
+/// per-layer flag on `QKNormAttention`: the talker builds its layers through the
+/// shared `Qwen3DecoderLayer` (`src/models/qwen3/model.rs`, whose `self_attn` is
+/// private), so the talker cannot flip a flag on the attention instances it does
+/// not own; a scoped guard covers both the Full and Quant backbones instead.
+thread_local! {
+    static USE_SDPA_FAST: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard enabling the fused SDPA decode fast path while alive. Nested
+/// guards save/restore the previous value, so they compose.
+pub struct SdpaFastGuard {
+    prev: bool,
+}
+
+impl SdpaFastGuard {
+    fn new() -> Self {
+        let prev = USE_SDPA_FAST.with(Cell::get);
+        USE_SDPA_FAST.with(|f| f.set(true));
+        SdpaFastGuard { prev }
+    }
+}
+
+impl Drop for SdpaFastGuard {
+    fn drop(&mut self) {
+        USE_SDPA_FAST.with(|f| f.set(self.prev));
+    }
+}
+
+/// Create an [`SdpaFastGuard`] for the duration of a qwen3-tts decode forward.
+pub fn sdpa_fast_guard() -> SdpaFastGuard {
+    SdpaFastGuard::new()
+}
+
 pub fn eager_attention_forward(
     query_states: &Tensor,
     key_states: &Tensor,
@@ -810,11 +853,14 @@ pub fn eager_attention_forward(
     // input q shape:(b, num_head, seq_len, dim)
     // input k/v shape:(b, num_kv_head, seq_len, dim)
     //
-    // Decode fast path (single query position, no mask, Metal): the fused SDPA
-    // vector kernel handles GQA internally via gqa_factor, so we hand it the RAW
-    // kv_heads k/v — skipping the repeat_kv expansion (2 kernels) AND its
-    // contiguous copies entirely. Only q needs to be contiguous for the kernel.
-    let is_decode = attention_mask.is_none()
+    // Decode fast path (qwen3-tts ONLY, single query position, no mask, Metal):
+    // the fused SDPA vector kernel handles GQA internally via gqa_factor, so we
+    // hand it the RAW kv_heads k/v — skipping the repeat_kv expansion (2 kernels)
+    // AND its contiguous copies entirely. Only q needs to be contiguous. The
+    // opt-in guard keeps shared models (cosyvoice3, MOSS, fun_asr, qwen3-ASR) on
+    // the eager path: the fused kernel's simd_sum/fast::exp differ in numerics.
+    let is_decode = USE_SDPA_FAST.with(Cell::get)
+        && attention_mask.is_none()
         && query_states.rank() == 4
         && matches!(query_states.dim(2), Ok(1));
     if is_decode {

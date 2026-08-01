@@ -69,7 +69,8 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
             if (this._buffering && this._queuedSamples() >= this._prebufferFrames) {
               this._buffering = false;
               this._playing = true;
-              this._fadeIn = 0;
+              // Playback start after a stop/drain: ramp in to avoid a click.
+              this._fadeIn = FADE_FRAMES;
               this._fadeOut = 0;
             }
           }
@@ -87,7 +88,8 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
           if (this._buffering && this._queue.length > 0) {
             this._buffering = false;
             this._playing = true;
-            this._fadeIn = 0;
+            // Flush starts playback immediately: ramp in to avoid a click.
+            this._fadeIn = FADE_FRAMES;
             this._fadeOut = 0;
           }
           break;

@@ -42,8 +42,10 @@ hf download OpenBMB/VoxCPM2 --local-dir models/VoxCPM2
 ## Build and run
 
 ```bash
-# MiniCPM5-1B chat — GGUF (fast load) or bf16 safetensors dir (quantized to Q8_0 in memory)
+# MiniCPM5-1B chat — GGUF (fast load) or bf16 safetensors dir (quantized in memory: default Q8_0; override with `TINY_CPM_QUANT` or `--quant <name>` — q8_0, q4_0, q4_1, q5_0, q5_1, q4_k, q5_k, q6_k, q3_k, q2_k, f16, f32)
 cargo run --release -- chat ./models/MiniCPM5-1B-Q8_0.gguf ./models/tokenizer.json "What is AI?" 512
+# bf16 dir, custom in-memory quant level (default Q8_0):
+cargo run --release -- chat ./models/MiniCPM5-1B ./models/tokenizer.json "What is AI?" 512 --quant q4_k
 
 # ASR — transcript goes to stdout
 cargo run --release -- asr funasr ./models/Fun-ASR-Nano-2512 ./audio.wav
@@ -58,7 +60,7 @@ cargo run --release -- tts cosyvoice3 ./models/Fun-CosyVoice3-0.5B-2512 "你好�
 Full CLI contract (parsed in `src/main.rs`):
 
 ```
-tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens]
+tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens] [--quant <name>]
 tiny-cpm asr <funasr|qwen3> <model-dir> <audio-file> [max_tokens]
 tiny-cpm tts <voxcpm|moss> <model-dir> "<text>" <out.wav> [--codec <codec-dir>] [--ref <ref.wav>] [--max-len N]
 tiny-cpm tts cosyvoice3 <model-dir> "<text>" <out.wav> [--voice <name>] [--ref <ref.wav> --ref-text "<text>"] [--steps N] [--max-tokens N] [--stream]
@@ -72,7 +74,7 @@ cosyvoice3 `--stream`: chunked streaming synthesis — first audio ~1.1 s warm (
 
 `live --barge-in`: keeps the mic live during TTS playback and cancels the in-flight reply (LLM decode loop + TTS stream) on speech onset, then processes the interrupting utterance. **Headphones required** — there's no AEC, so speaker echo would false-trigger barge-in. Default (no flag) is half-duplex (mic ducked during playback). Tune onset with `--barge-onset-frames` (default 3).
 
-VAD/tuning flags (priority: flag > env var > default). VAD: `--vad-speech-threshold` (0.5, neural speech-prob threshold), `--vad-min-speech-frame` (8, shortest speech segment), `--vad-min-silence` (45, min trailing silence before endpoint), `--vad-min-speach-ratio` (0.1, per-frame speech fraction), `--vad-min-speach-frames` (30, min speech before endpointing), `--vad-end-silence-ratio` (0.9, silence fraction in look-back to endpoint), `--vad-look-back-frames` (50, endpoint silence window). Live: `--min-segment-samples` (8000 = 0.5s, drop shorter segments), `--min-seg-peak` (0.0 = off, drop distant/bystander speech below this peak), `--barge-onset-frames` (3, consecutive neural-speech frames to barge), `--min-barge-rms` (0.015, mic RMS floor for barge), `--mic-gain` (1.0, linear gain for low-gain mics). All have matching `VAD_*` / `LIVE_*` env vars as fallback.
+VAD/tuning flags (priority: flag > env var > default). VAD: `--vad-speech-threshold` (0.5, neural speech-prob threshold), `--vad-min-speech-frame` (8, shortest speech segment), `--vad-min-silence` (45 postprocessor / 32 streaming-endpoint, min trailing silence before endpoint), `--vad-min-speach-ratio` (0.1, per-frame speech fraction), `--vad-min-speach-frames` (30, min speech before endpointing), `--vad-end-silence-ratio` (0.9, silence fraction in look-back to endpoint), `--vad-look-back-frames` (50, endpoint silence window). Live: `--min-segment-samples` (8000 = 0.5s, drop shorter segments), `--min-seg-peak` (0.0 = off, drop distant/bystander speech below this peak), `--barge-onset-frames` (3, consecutive neural-speech frames to barge), `--min-barge-rms` (0.015, mic RMS floor for barge), `--mic-gain` (1.0, linear gain for low-gain mics). All have matching `VAD_*` / `LIVE_*` env vars as fallback.
 
 MOSS `--ref` voice cloning: the codec encode (encoder + RVQ) runs on **CPU + f32**, not Metal — Metal f32 drifted on reference audio longer than ~16 s (async-kernel races in the projected-transformer attention + RVQ residual accumulation), producing garbage conditioning codes; a 22 s ref round-trips to noise on Metal but clean on CPU. The decoder stays on Metal (it only decodes short generated sequences). `codec-rt` round-trips a WAV through encode→decode to verify the codec reproduces the input.
 
@@ -98,19 +100,19 @@ cargo build --release
 cargo check
 cargo fmt
 cargo clippy
-cargo test    # CPU-only unit tests (masks, feature-length math, config parsing)
+cargo test    # CPU-only unit tests (masks, feature-length math, config parsing, chat repeat-guard)
 ```
 
 ## How it works
 
 - **`src/main.rs`** — subcommand dispatch only. Drivers live in **`src/exec/`** (`chat.rs`, `fun_asr_nano.rs`, `qwen3_asr.rs`, `voxcpm.rs`, `moss_tts.rs`, `dialogue.rs`, `vad.rs`, `live.rs`): parse args → load weights → run inference → emit payload/diagnostics. Live audio IO (mic/speaker via cpal) is in **`src/utils/live_audio.rs`**.
-- **`src/quantized_minicpm5.rs`** + **`src/token_output_stream.rs`** — the original MiniCPM5 path: a vendored copy of `candle_transformers::models::quantized_llama` (0.11) with two patches for MiniCPM5's non-standard attention geometry (see below). `MAX_SEQ_LEN = 4096`.
+- **`src/quantized_minicpm5.rs`** + **`src/token_output_stream.rs`** — the original MiniCPM5 path: a vendored copy of `candle_transformers::models::quantized_llama` (0.11) with patches for MiniCPM5's non-standard attention geometry and RoPE convention (see below). `MAX_SEQ_LEN = 4096`.
 - **`src/models/`** — the aha ports: `fun_asr_nano/` (SANM encoder + adaptor + Qwen3-0.6B decoder), `qwen3_asr/` (Whisper-style audio encoder + Qwen3 decoder), `voxcpm/` (MiniCPM4 LM + residual LM + locDiT flow matching + AudioVAE), `moss_tts_nano/` (GPT-2-style codec-LM) + `moss_audio_tokenizer_nano/` (LFQ codec), plus shared backbones `qwen3/`, `gpt2/`, `feature_extractor/` (whisper mel frontend).
 - **`src/common/`** (`modules.rs`, `sample.rs`, `InferenceModel`/`MultiModalData`), **`src/utils/`** (`audio_utils.rs` — load/resample/mel/fbank/STFT/WAV; `tensor_utils.rs`), **`src/position_embed/`** (RoPE, sinusoidal), **`src/tokenizer/`** — shared infrastructure ported from aha with names/signatures kept identical, so re-porting future aha updates stays mechanical.
 
-### The two MiniCPM5 patches (why `quantized_minicpm5` is vendored)
+### The three MiniCPM5 patches (why `quantized_minicpm5` is vendored)
 
-Upstream `quantized_llama` assumes `head_dim == hidden_size / num_heads` and `num_heads * head_dim == hidden_size`. MiniCPM5 has `head_dim = 128`, `hidden_size = 1536`, `num_heads = 16`, so `num_heads * head_dim = 2048 ≠ 1536`. The vendored module reads `head_dim` from GGUF metadata (`llama.rope.dimension_count`) / `config.json`, and reshapes the attention output to `num_heads * head_dim` (2048) before the output projection maps 2048 → 1536. RoPE convention is detected from `general.architecture` (MiniCPM5 uses NORM/interleaved).
+Upstream `quantized_llama` assumes `head_dim == hidden_size / num_heads` and `num_heads * head_dim == hidden_size`. MiniCPM5 has `head_dim = 128`, `hidden_size = 1536`, `num_heads = 16`, so `num_heads * head_dim = 2048 ≠ 1536`. The vendored module reads `head_dim` from GGUF metadata (`llama.rope.dimension_count`) / `config.json`, and reshapes the attention output to `num_heads * head_dim` (2048) before the output projection maps 2048 → 1536. RoPE is always NEOX (non-interleaved / half-split): real MiniCPM5-1B GGUFs declare `general.architecture = "llama"`, but the HF `LlamaForCausalLM` reference uses `rotate_half` (NEOX), so the arch string would select the wrong convention — the loader hardcodes NEOX and prints the arch at load for diagnostics. The bf16 safetensors loader (`from_safetensors_dir`) quantizes HF-layout weights in memory (default Q8_0; `--quant <name>` or `TINY_CPM_QUANT` to override).
 
 ### Chat sampling note
 

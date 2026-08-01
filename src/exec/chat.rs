@@ -1,13 +1,14 @@
 //! MiniCPM5-1B chat: accepts a pre-quantized `.gguf` (Q8_0) or a bf16
-//! safetensors directory (auto-quantized to Q8_0 in-memory). Streams tokens to
-//! stdout as they generate.
+//! safetensors directory (auto-quantized in-memory, default Q8_0; override
+//! with `TINY_CPM_QUANT` or `--quant <name>`). Streams tokens to stdout as
+//! they generate.
 //!
-//! Uses a vendored, patched `quantized_minicpm5` module — `quantized_llama` with
-//! two fixes so MiniCPM5's non-standard head_dim (128 != hidden/heads = 96) works:
-//! head_dim read from the GGUF, attention output reshaped to n_head*head_dim.
+//! Uses a vendored, patched `quantized_minicpm5` module — `quantized_llama`
+//! with fixes for MiniCPM5's non-standard head_dim (128 != hidden/heads = 96)
+//! and its NEOX (non-interleaved) RoPE convention.
 //!
 //! Usage:
-//!     tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens]
+//!     tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> "<prompt>" [max_tokens] [--quant <name>]
 
 use crate::quantized_minicpm5::ModelWeights;
 use crate::token_output_stream::TokenOutputStream;
@@ -56,8 +57,11 @@ pub fn load_model_with_quant(
         // via `quant_name` or TINY_CPM_QUANT (q8_0, q4_k_m, q5_k_m, q6_k, ...).
         // K-quants map to candle's `GgmlDType::QnK` block formats.
         let dtype = match quant_name {
-            Some(q) => parse_quant(Some(q)),
-            None => parse_quant(std::env::var("TINY_CPM_QUANT").ok().as_deref()),
+            Some(q) => parse_quant_source(Some(q), "--quant"),
+            None => parse_quant_source(
+                std::env::var("TINY_CPM_QUANT").ok().as_deref(),
+                "TINY_CPM_QUANT",
+            ),
         };
         eprintln!("quantizing bf16 safetensors in {model_path} to {dtype:?} in-memory...");
         ModelWeights::from_safetensors_dir(model_path, dtype, device)?
@@ -65,10 +69,18 @@ pub fn load_model_with_quant(
     Ok(model)
 }
 
-/// Map a `--`/env quant name to a `GgmlDType` (default Q8_0).
+/// Map a quant name to a `GgmlDType` (default Q8_0), reporting the value as
+/// coming from `--quant`. See [`parse_quant_source`].
 pub fn parse_quant(name: Option<&str>) -> candle_core::quantized::GgmlDType {
+    parse_quant_source(name, "--quant")
+}
+
+/// `parse_quant` with a `source` label for the unknown-name warning. Accepted
+/// names: q8_0/q4_0/q4_1/q5_0/q5_1/q4_k/q5_k/q6_k/q3_k/q2_k/f16/f32 (plus
+/// aliases such as `q8`, `q4_k_m`, `q4k`).
+fn parse_quant_source(name: Option<&str>, source: &str) -> candle_core::quantized::GgmlDType {
     use candle_core::quantized::GgmlDType::*;
-    match name.map(|s| s.to_ascii_lowercase()) {
+    match name.map(|s| s.trim().to_ascii_lowercase()) {
         None => Q8_0,
         Some(s) => match s.as_str() {
             "q8_0" | "q8" => Q8_0,
@@ -84,7 +96,7 @@ pub fn parse_quant(name: Option<&str>) -> candle_core::quantized::GgmlDType {
             "f16" => F16,
             "f32" => F32,
             other => {
-                eprintln!("unknown TINY_CPM_QUANT '{other}', defaulting to Q8_0");
+                eprintln!("unknown quant '{other}' (from {source}), defaulting to Q8_0");
                 Q8_0
             }
         },
@@ -218,6 +230,11 @@ pub fn generate_reply_with_history(
     // Decode loop: stream each token (tags stripped) until EOS or max_tokens.
     let t_dec = std::time::Instant::now();
     let mut generated = 0usize;
+    // Repetition-guard kill-switch: TINY_CPM_REPEAT_GUARD=0 disables it.
+    let repeat_guard = match std::env::var("TINY_CPM_REPEAT_GUARD") {
+        Ok(v) => v.trim() != "0",
+        Err(_) => true,
+    };
     for index in 0..max_tokens {
         if let Some(c) = cancel
             && c.load(std::sync::atomic::Ordering::Relaxed)
@@ -240,8 +257,13 @@ pub fn generate_reply_with_history(
         // repeat loop ("星期五，星期五，…") on questions they can't answer and
         // would otherwise spew it until max_tokens — and the TTS then reads the
         // whole loop aloud. Break as soon as a short trailing phrase repeats
-        // back-to-back several times.
-        if generated % 8 == 0 && is_repeating(&full) {
+        // back-to-back several times. Only the visible reply text is checked:
+        // in think mode that is everything after `</think>`, so a loop inside
+        // the reasoning block cannot kill the reply before the answer appears.
+        // (In `no_think` mode the think block is pre-closed in the prompt, so
+        // the whole generated text is the reply.)
+        let reply = if no_think { &full } else { after_think(&full) };
+        if generated % 8 == 0 && repeat_guard && is_repeating(reply) {
             eprintln!("llm: repetition loop detected, stopping at {generated} tokens");
             break;
         }
@@ -273,6 +295,16 @@ pub fn generate_reply_with_history(
     })
 }
 
+/// The visible reply text: everything after the first `</think>` — the same
+/// text `stream_clean` emits. Before the think block closes there is no reply
+/// yet, so this is empty.
+fn after_think(full: &str) -> &str {
+    match full.find("</think>") {
+        Some(idx) => &full[idx + 8..], // 8 = len("</think>")
+        None => "",
+    }
+}
+
 /// Append `s` to `full`, strip `<think>`/`</think>` tags, and pass any newly
 /// available clean text to `sink`. `printed` tracks bytes already emitted
 /// (always at a UTF-8 char boundary, since clean grows only by complete
@@ -281,10 +313,7 @@ fn stream_clean(full: &mut String, printed: &mut usize, s: &str, sink: &mut dyn 
     full.push_str(s);
     // Suppress think block: emit only text AFTER </think> (the actual response).
     // Before </think> is reasoning content — never displayed or spoken.
-    let clean = match full.find("</think>") {
-        Some(idx) => full[idx + 8..].to_string(), // 8 = len("</think>")
-        None => String::new(),                    // still thinking — suppress
-    };
+    let clean = after_think(full);
     if clean.len() > *printed {
         sink(&clean[*printed..]);
         *printed = clean.len();
@@ -293,9 +322,14 @@ fn stream_clean(full: &mut String, printed: &mut usize, s: &str, sink: &mut dyn 
 
 /// Detect an exact back-to-back repeat loop at the tail of `text`. Tries short
 /// phrase lengths (in chars) and returns true if the same phrase repeats ≥4
-/// times consecutively at the end. Cheap: only inspects the tail.
+/// times consecutively at the end. Cheap: only inspects the tail (at most the
+/// last 48 chars — the longest window that can hold 4 repeats of the longest
+/// tested phrase length, 12 × 4).
 fn is_repeating(text: &str) -> bool {
-    let chars: Vec<char> = text.chars().collect();
+    // Collect only the tail instead of the whole text: `rev().take(48)` is
+    // O(48) per call (the guard runs every 8 tokens during decode).
+    let mut chars: Vec<char> = text.chars().rev().take(48).collect();
+    chars.reverse();
     let n = chars.len();
     if n < 16 {
         return false;
@@ -324,20 +358,55 @@ fn is_repeating(text: &str) -> bool {
 }
 
 pub fn run(args: &[String]) -> Result<()> {
-    if args.len() < 3 {
+    // `--quant <name>` / `--quant=<name>` may appear anywhere in args;
+    // everything else is a positional: <model.gguf | bf16-dir> <tokenizer.json>
+    // <prompt> [max_tokens].
+    let mut quant: Option<String> = None;
+    let mut positional: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--quant" {
+            i += 1;
+            let value = args
+                .get(i)
+                .ok_or_else(|| anyhow::anyhow!("--quant requires a value, e.g. --quant q8_0"))?;
+            quant = Some(value.clone());
+        } else if let Some(value) = args[i].strip_prefix("--quant=") {
+            quant = Some(value.to_string());
+        } else {
+            positional.push(args[i].as_str());
+        }
+        i += 1;
+    }
+    if positional.len() < 3 {
         eprintln!(
-            "usage: tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> <prompt> [max_tokens]"
+            "usage: tiny-cpm chat <model.gguf | bf16-dir> <tokenizer.json> <prompt> [max_tokens] [--quant <name>]"
         );
         std::process::exit(1);
     }
-    let model_path = &args[0];
-    let tok_path = &args[1];
-    let prompt = &args[2];
-    let max_tokens: usize = args.get(3).map(|s| s.parse().unwrap_or(512)).unwrap_or(512);
+    if positional.len() > 4 {
+        return Err(anyhow::anyhow!(
+            "too many positional arguments for chat (expected <model> <tokenizer> <prompt> [max_tokens], plus optional --quant)"
+        ));
+    }
+    let model_path = positional[0];
+    let tok_path = positional[1];
+    let prompt = positional[2];
+    // Strict max_tokens: a typo'd 4th argument must error instead of silently
+    // becoming 512.
+    let max_tokens = match positional.get(3) {
+        Some(s) => s.parse::<usize>().map_err(|e| {
+            anyhow::anyhow!("invalid max_tokens '{s}': {e} (expected a non-negative integer)")
+        })?,
+        None => 512,
+    };
+    if quant.is_some() && model_path.ends_with(".gguf") {
+        eprintln!("warning: --quant is ignored for .gguf files (the file is already quantized)");
+    }
 
     let t_load = std::time::Instant::now();
     let device = Device::new_metal(0)?;
-    let mut model = load_model(model_path, &device)?;
+    let mut model = load_model_with_quant(model_path, quant.as_deref(), &device)?;
     eprintln!("loaded model in {:.2}s", t_load.elapsed().as_secs_f64());
 
     let tokenizer =
@@ -352,4 +421,85 @@ pub fn run(args: &[String]) -> Result<()> {
     )?;
     std::io::stdout().flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{after_think, is_repeating};
+
+    // ── is_repeating boundaries ─────────────────────────────────────────────
+
+    /// Shorter than 16 chars → never flagged.
+    #[test]
+    fn too_short_text_is_not_repeating() {
+        assert!(!is_repeating("abcabcabcabc")); // 12 chars
+    }
+
+    /// Boundary n == plen*4 at the smallest phrase length (4 × 4 = 16 chars).
+    #[test]
+    fn exactly_four_repeats_at_n_equals_plen_times_4() {
+        assert!(is_repeating("abcdabcdabcdabcd"));
+    }
+
+    /// Exactly 3 back-to-back repeats (plen=8, 24 chars) stays below the ≥4
+    /// threshold; no shorter phrase length aligns on this text.
+    #[test]
+    fn exactly_three_repeats_is_not_repeating() {
+        assert!(!is_repeating("abcdefghabcdefghabcdefgh"));
+    }
+
+    /// Exactly 4 back-to-back repeats (plen=8, 32 chars = plen*4) → flagged.
+    #[test]
+    fn exactly_four_repeats_is_repeating() {
+        assert!(is_repeating("abcdefghabcdefghabcdefghabcdefgh"));
+    }
+
+    /// Longest tested phrase length (plen=12): 3 repeats false, 4 true.
+    #[test]
+    fn twelve_char_phrase_boundary() {
+        assert!(!is_repeating("abcdefghijklabcdefghijklabcdefghijkl")); // 36 chars
+        assert!(is_repeating(
+            "abcdefghijklabcdefghijklabcdefghijklabcdefghijkl"
+        )); // 48 chars
+    }
+
+    /// Multibyte (UTF-8) chars are counted as chars, not bytes.
+    #[test]
+    fn multibyte_repeats() {
+        // 4 repeats of a 6-char phrase (24 chars) → flagged.
+        assert!(is_repeating(
+            "我喜欢喝奶茶我喜欢喝奶茶我喜欢喝奶茶我喜欢喝奶茶"
+        ));
+        // Exactly 3 repeats of a 6-char phrase (18 chars) → not flagged.
+        assert!(!is_repeating("今天天气很好今天天气很好今天天气很好"));
+        // Long, non-repeating multibyte text → not flagged.
+        assert!(!is_repeating(
+            "这是一个很长的句子，用来确认多字节字符不会误触发重复检测逻辑。"
+        ));
+    }
+
+    // ── after_think (post-think-only scope) ─────────────────────────────────
+
+    /// Only text after the first `</think>` counts as the reply.
+    #[test]
+    fn after_think_returns_only_post_think_text() {
+        assert_eq!(after_think("<think>思考过程</think>最终答案"), "最终答案");
+        assert_eq!(after_think("还没有关闭的思考块"), "");
+        assert_eq!(after_think(""), "");
+    }
+
+    /// A repeat loop inside `<think>` must not trip the guard: the call site
+    /// feeds `after_think(&full)`, so the reasoning block is invisible to it.
+    #[test]
+    fn repetition_inside_think_block_is_ignored() {
+        let full = format!("<think>{}</think>这是一个简短的回答。", "ab".repeat(40));
+        assert!(!is_repeating(after_think(&full)));
+    }
+
+    /// ...while a repeat in the post-think reply is still caught.
+    #[test]
+    fn repetition_after_think_block_is_caught() {
+        let full = format!("<think>推理</think>{}", "abcd".repeat(4));
+        assert!(is_repeating(after_think(&full)));
+    }
 }

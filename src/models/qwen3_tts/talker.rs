@@ -24,6 +24,7 @@ use candle_nn::{
     rms_norm,
 };
 
+use crate::common::modules::sdpa_fast_guard;
 use crate::common::sample::sample_from_logits_vec;
 use crate::models::qwen3::config::Qwen3Config;
 use crate::models::qwen3::model::Qwen3DecoderLayer;
@@ -78,6 +79,20 @@ fn qwen3_cfg(
     }
 }
 
+/// Parse a boolean env knob: `=0`/`=off`/`=false`/`=no` (case-insensitive) disable,
+/// `=1`/`=true` (or any other non-empty value) enable; unset falls back to
+/// `default`. Replaces the old presence checks, where `QWEN3_TTS_CPU_SAMPLE=0`
+/// still enabled the knob (presence, not value).
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "off" | "false" | "no" => false,
+            _ => true,
+        },
+        Err(_) => default,
+    }
+}
+
 /// `Qwen3TTSTalkerResizeMLP`: Linear(text_hidden→text_hidden) → SiLU → Linear(→hidden).
 /// (Both matmuls are 2048→2048 for this checkpoint.)
 struct ResizeMlp {
@@ -105,6 +120,10 @@ struct CodePredictor {
     norm: RmsNorm,
     rotary: RoPE,
     lm_head: Vec<Linear>, // 15 × [hidden → vocab]
+    /// Weight dtype of the final norm / lm_head (BF16 in the checkpoint). The
+    /// Quant backbone emits F32; `forward_hidden` casts back to this dtype
+    /// (mirrors `Talker::dtype`, so a future full-F32 predictor works too).
+    dtype: DType,
     /// talker_hidden → predictor_hidden projection. `None` when the two hidden sizes
     /// are equal (e.g. 0.6B, whose code predictor runs at the talker's 1024 and so has
     /// no `small_to_mtp_projection` tensor in the checkpoint); 1.7B projects 2048→1024.
@@ -222,6 +241,10 @@ impl CodePredictor {
                 vb.pp("lm_head").pp(g),
             )?);
         }
+        // dtype of the norm/lm_head weights: the Quant backbone output is cast back
+        // to this in `forward_hidden` (mirrors how `Talker::forward_step_gpu` casts
+        // the quant talker output to `self.dtype`).
+        let dtype = norm.weight().dtype();
         // 1.7B (talker 2048 → predictor 1024) carries a small_to_mtp_projection tensor;
         // 0.6B (both 1024) does not — skip the projection when dims already match.
         let small_to_mtp = if talker_hidden == cfg.hidden_size {
@@ -240,6 +263,7 @@ impl CodePredictor {
             norm,
             rotary,
             lm_head,
+            dtype,
             small_to_mtp,
         })
     }
@@ -269,10 +293,11 @@ impl CodePredictor {
         };
         let (cos, sin) = self.rotary.forward(seqlen_offset, seq_len, xs.device())?;
         let h = self.layers.forward(&xs, &cos, &sin, mask.as_ref())?;
-        // The Quant backbone returns F32; the final norm + lm_head are BF16, so cast
-        // back (mirrors how Talker::forward_step casts the quant talker output).
+        // The Quant backbone returns F32; the final norm + lm_head run at
+        // `self.dtype` (BF16 in the checkpoint), so cast back (mirrors how
+        // Talker::forward_step_gpu casts the quant talker output to self.dtype).
         let h = if self.layers.is_quant() {
-            h.to_dtype(DType::BF16)?
+            h.to_dtype(self.dtype)?
         } else {
             h
         };
@@ -290,7 +315,10 @@ impl CodePredictor {
 /// way: `logit < 0 ? logit * mult : logit / mult`. The talker keeps one on the GPU and
 /// `scatter`s the penalty into the sampled column each frame, so codebook-0 history never
 /// leaves the device (the code predictor passes `None` — it applies no penalty).
-fn gpu_sample_token(
+/// `#[doc(hidden)]`: exposed only so `tests/gpu_sampling.rs` can exercise the REAL
+/// GPU sampling path (not a reimplementation); not part of the crate's API.
+#[doc(hidden)]
+pub fn gpu_sample_token(
     logits: &Tensor, // (1, vocab), any float dtype
     do_sample: bool,
     temperature: f64,
@@ -467,7 +495,7 @@ impl Talker {
         // launch-bound either. Default ON when the talker is quantized; opt out with
         // QWEN3_TTS_PREDICTOR_QUANT=0.
         let predictor_quant = match std::env::var("QWEN3_TTS_PREDICTOR_QUANT").as_deref() {
-            Ok("0") | Ok("off") | Ok("none") => None,
+            Ok("0") | Ok("off") | Ok("false") | Ok("no") | Ok("none") => None,
             _ => Some(quant),
         };
         Self::assemble(vb, tts, backbone, device, Some(&vb_cpu), predictor_quant)
@@ -596,8 +624,6 @@ impl Talker {
         Ok(acc)
     }
 
-    /// One decoder forward over `embeds` (1, T, hidden) → (last hidden (1,1,hidden),
-    /// codec_head logits (vocab,) f32).
     /// One decoder forward over `embeds` (1, T, hidden), returning the last hidden
     /// (1,1,hidden) and the codec_head logits as an **on-device** (1, vocab) tensor.
     /// Keeping the logits on the GPU lets `generate_inner` sample codebook 0 without a
@@ -816,6 +842,11 @@ impl Talker {
         max_new_tokens: usize,
         on_frame: &mut dyn FnMut(&[u32]) -> bool,
     ) -> Result<Tensor> {
+        // Fused SDPA decode fast path (`sdpa_vector_attention`) is opt-in: keep it
+        // ON for this talker's decode forwards (both the Full and Quant backbones,
+        // and the code predictor) and OFF everywhere else, so shared models
+        // (qwen3-ASR, cosyvoice3, MOSS, fun_asr) keep the eager attention path.
+        let _sdpa_fast = sdpa_fast_guard();
         // Copy config values out up front; `&mut self` methods are called in the loop.
         let vocab_size = self.cfg.vocab_size;
         let codec_eos = self.cfg.codec_eos_token_id;
@@ -828,7 +859,6 @@ impl Talker {
         };
 
         let mut frames: Vec<Vec<u32>> = Vec::new();
-        let mut gen_history: Vec<u32> = Vec::new(); // codebook-0 history for rep penalty
         let suppress_from = vocab_size - 1024; // suppress [2048, 3072) except codec_eos
         // GPU suppression mask: (1, vocab) f32, -inf in [suppress_from, vocab) except codec_eos.
         // Precomputed once; added to the logits each frame before sampling codebook 0.
@@ -842,6 +872,9 @@ impl Talker {
             })
             .collect();
         let suppress_bias = Tensor::from_vec(suppress_bias, (1, vocab_size), &self.device)?;
+        // Hoisted out of the frame loop: the logits dtype is stable across frames
+        // (it is `self.dtype`), so the cast only needs to happen once.
+        let suppress_bias = suppress_bias.to_dtype(logits_gpu.dtype())?;
         // GPU repetition-penalty multiplier (1, vocab), all-1 initially. After each frame
         // the sampled code0 column is scattered to `repetition_penalty`, so the penalty
         // compounds per distinct token exactly like the CPU path (HF applies it once per
@@ -849,15 +882,17 @@ impl Talker {
         let rep_penalty = gen_cfg.repetition_penalty;
         let apply_rep = (rep_penalty - 1.0).abs() > 1e-6;
         let mut rep_mult = Tensor::ones((1, vocab_size), DType::F32, &self.device)?;
+        // Scalar hoisted out of the frame loop (only used when apply_rep is true).
+        let rep_pen = Tensor::from_vec(vec![rep_penalty], (1, 1), &self.device)?;
         // Diagnostic: QWEN3_TTS_GREEDY=1 forces argmax (do_sample=false) to test
         // whether babbling is sampling-driven (temperature × numeric scale).
-        let greedy = std::env::var("QWEN3_TTS_GREEDY").is_ok();
+        let greedy = env_flag("QWEN3_TTS_GREEDY", false);
         // QWEN3_TTS_PROF=1: per-stage wall-clock accumulation, printed at end of gen.
-        let prof = std::env::var("QWEN3_TTS_PROF").is_ok();
+        let prof = env_flag("QWEN3_TTS_PROF", false);
         // QWEN3_TTS_PROF_SYNC=1: drain the GPU after each stage so each timer measures
         // that stage's true GPU completion time (not just CPU enqueue). Diagnostic only —
         // serializes the pipeline, so totals are pessimistic.
-        let prof_sync = std::env::var("QWEN3_TTS_PROF_SYNC").is_ok();
+        let prof_sync = env_flag("QWEN3_TTS_PROF_SYNC", false);
         let drain = |dev: &Device| {
             if prof_sync {
                 let _ = dev.synchronize();
@@ -880,7 +915,7 @@ impl Talker {
             // mlx-audio alignment: defer the GPU→CPU sync — code0 feeds the predictor
             // and next-frame embedding as a lazy tensor, and the EOS flag is computed
             // on the GPU; the ONLY per-frame readback is the single cat at frame end.
-            let lg = logits_gpu.broadcast_add(&suppress_bias.to_dtype(logits_gpu.dtype())?)?;
+            let lg = logits_gpu.broadcast_add(&suppress_bias)?;
             let rep = if apply_rep && step >= 2 {
                 Some(&rep_mult)
             } else {
@@ -901,8 +936,7 @@ impl Talker {
             // Scatter the penalty into this token's multiplier column (idempotent per
             // distinct token — HF applies the penalty once per distinct token).
             if apply_rep {
-                let pen = Tensor::from_vec(vec![rep_penalty], (1, 1), &self.device)?;
-                rep_mult = rep_mult.scatter(&code0_t.reshape((1, 1))?, &pen, 1)?;
+                rep_mult = rep_mult.scatter(&code0_t.reshape((1, 1))?, &rep_pen, 1)?;
             }
 
             // code predictor fills codebooks 1..=15 (on-device tokens, no readback).
@@ -927,8 +961,8 @@ impl Talker {
             }
 
             // SINGLE per-frame readback: cat [code0, rest..] into one (16,) tensor and
-            // read it back once — for EOS check, gen_history, the streaming callback and
-            // the returned codes tensor. (mlx-audio does the same: one mx.eval per frame.)
+            // read it back once — for the EOS check, the streaming callback and the
+            // returned codes tensor. (mlx-audio does the same: one mx.eval per frame.)
             let tt = std::time::Instant::now();
             let mut all_t = vec![code0_t.reshape((1,))?];
             all_t.extend(rest_t.iter().map(|t| t.reshape((1,)).unwrap()));
@@ -944,10 +978,10 @@ impl Talker {
             let code0 = flat_frame[0];
             let frame = flat_frame;
 
-            if std::env::var("QWEN3_TTS_DEBUG").is_ok() && step % 25 == 0 {
+            if env_flag("QWEN3_TTS_DEBUG", false) && step % 25 == 0 {
                 eprintln!("qwen3-tts: frame {step} code0={code0} (offset={offset})");
             }
-            if std::env::var("QWEN3_TTS_TRACE").is_ok() {
+            if env_flag("QWEN3_TTS_TRACE", false) {
                 eprintln!("trace frame {step} code0={code0}");
             }
 
@@ -956,7 +990,6 @@ impl Talker {
             if code0 == codec_eos && step >= 2 {
                 break;
             }
-            gen_history.push(code0);
             frames.push(frame.clone());
 
             // Streaming: emit this frame's codes; `false` aborts generation early.
@@ -998,6 +1031,9 @@ impl Talker {
 
         let flat: Vec<u32> = frames.into_iter().flatten().collect();
         let n = flat.len() / num_code_groups;
+        if std::env::var("QWEN3_TTS_DUMP_CODES").is_ok() {
+            eprintln!("CANDLE_CODES frames={n} {flat:?}");
+        }
         Ok(Tensor::from_vec(flat, (n, num_code_groups), &self.device)?)
     }
 
@@ -1029,7 +1065,7 @@ impl Talker {
         let mut hidden = cp.forward_hidden(&prefill, 0)?; // (1,1,hidden) from position 1
         let n_groups = cp.cfg.num_code_groups - 1;
         let mut offset = 2usize;
-        let cpu_sample = std::env::var("QWEN3_TTS_CPU_SAMPLE").is_ok();
+        let cpu_sample = env_flag("QWEN3_TTS_CPU_SAMPLE", false);
 
         if cpu_sample {
             // Reference path: per-step CPU sampling (one blocking sync per codebook).
@@ -1067,7 +1103,7 @@ impl Talker {
         // GPU path: keep the running token as an on-device (1,) u32 tensor; gather its
         // embedding without a readback. Collect the 15 token tensors; the caller does
         // the single end-of-frame readback (code0 + these + EOS) in generate_stream.
-        let spec_probe = std::env::var("QWEN3_TTS_SPEC_PROBE").is_ok();
+        let spec_probe = env_flag("QWEN3_TTS_SPEC_PROBE", false);
         let mut token_tensors: Vec<Tensor> = Vec::with_capacity(n_groups);
         for g in 0..n_groups {
             let logits = cp.lm_head[g].forward(&hidden)?.squeeze(0)?; // (1, vocab)
