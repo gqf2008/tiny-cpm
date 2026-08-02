@@ -81,6 +81,19 @@ async fn main() -> Result<()> {
     }
     eprintln!("audio sent in {:.2}s", t_start.elapsed().as_secs_f64());
 
+    // Send ~1.5s of silence so the server-side VAD can endpoint (it needs a run
+    // of non-speech frames after the utterance). Without this the segment is
+    // never finalized and no turn fires.
+    let sil = vec![0i16; 4000]; // 250 ms @ 16 kHz
+    for _ in 0..6 {
+        let bytes: Vec<u8> = sil.iter().flat_map(|s| s.to_le_bytes()).collect();
+        ws.send(Message::Text(
+            serde_json::json!({"type":"input_audio_buffer.append","audio":b64.encode(&bytes)}).to_string(),
+        ))
+        .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
     // Now read events until response.done.
     loop {
         match tokio::time::timeout(std::time::Duration::from_secs(60), ws.next()).await {

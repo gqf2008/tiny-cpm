@@ -225,7 +225,7 @@ pub fn generate_reply_with_history(
     let mut tokens = prompt_tokens.clone();
     tokens.push(next);
     if let Some(s) = tos.next_token(next)? {
-        stream_clean(&mut full, &mut printed, &s, sink);
+        stream_clean(&mut full, &mut printed, &s, sink, no_think);
     }
 
     // Decode loop: stream each token (tags stripped) until EOS or max_tokens.
@@ -253,7 +253,7 @@ pub fn generate_reply_with_history(
         tokens.push(next);
         generated += 1;
         if let Some(s) = tos.next_token(next)? {
-            stream_clean(&mut full, &mut printed, &s, sink);
+            stream_clean(&mut full, &mut printed, &s, sink, no_think);
         }
         if EOS_TOKEN_IDS.contains(&next) {
             break;
@@ -274,7 +274,7 @@ pub fn generate_reply_with_history(
         }
     }
     if let Some(rest) = tos.decode_rest()? {
-        stream_clean(&mut full, &mut printed, &rest, sink);
+        stream_clean(&mut full, &mut printed, &rest, sink, no_think);
     }
     // Fallback: if the think block never closed (model hit max_tokens or EOS
     // mid-think), emit the accumulated text stripped of tags so the user
@@ -314,11 +314,23 @@ fn after_think(full: &str) -> &str {
 /// available clean text to `sink`. `printed` tracks bytes already emitted
 /// (always at a UTF-8 char boundary, since clean grows only by complete
 /// decoded strings).
-fn stream_clean(full: &mut String, printed: &mut usize, s: &str, sink: &mut dyn FnMut(&str)) {
+///
+/// In `no_think` mode the think block is pre-closed in the PROMPT (the model
+/// never generates a `</think>`), so `after_think` would return `""` forever
+/// and nothing would stream. Pass `no_think=true` to emit the raw generated
+/// text directly (the whole reply is the visible answer).
+fn stream_clean(
+    full: &mut String,
+    printed: &mut usize,
+    s: &str,
+    sink: &mut dyn FnMut(&str),
+    no_think: bool,
+) {
     full.push_str(s);
     // Suppress think block: emit only text AFTER </think> (the actual response).
-    // Before </think> is reasoning content — never displayed or spoken.
-    let clean = after_think(full);
+    // Before </think> is reasoning content — never displayed or spoken. In no_think
+    // mode the generated text IS the reply (the empty think block is in the prompt).
+    let clean: &str = if no_think { full } else { after_think(full) };
     if clean.len() > *printed {
         sink(&clean[*printed..]);
         *printed = clean.len();
@@ -426,7 +438,7 @@ pub fn run(args: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{after_think, is_repeating};
+    use super::{after_think, is_repeating, stream_clean};
 
     // ── is_repeating boundaries ─────────────────────────────────────────────
 
@@ -502,5 +514,52 @@ mod tests {
     fn repetition_after_think_block_is_caught() {
         let full = format!("<think>推理</think>{}", "abcd".repeat(4));
         assert!(is_repeating(after_think(&full)));
+    }
+
+    // ── stream_clean (no_think streams; think suppresses pre-`</think>`) ─────
+
+    /// Helper: feed `s` token-by-token through stream_clean, collecting emitted deltas.
+    fn drain(s: &str, no_think: bool) -> Vec<String> {
+        let mut full = String::new();
+        let mut printed = 0usize;
+        let mut out = Vec::new();
+        let mut sink = |d: &str| out.push(d.to_string());
+        for tok in s.split_inclusive(|c: char| !c.is_ascii_alphanumeric()) {
+            // crude tokenization just to exercise incremental emission
+            if tok.is_empty() {
+                continue;
+            }
+            stream_clean(&mut full, &mut printed, tok, &mut sink, no_think);
+        }
+        out
+    }
+
+    /// no_think must stream incrementally: every token chunk reaches the sink as it
+    /// arrives (the whole generated text IS the reply; there is no `</think>` to wait
+    /// for). This is the bug fixed for the streaming-output requirement — previously
+    /// stream_clean used after_think() unconditionally, which returned "" in no_think
+    /// and the sink fired only once at the very end.
+    #[test]
+    fn no_think_streams_incrementally() {
+        let deltas = drain("你好！我是助手。", true);
+        assert!(deltas.len() >= 2, "no_think should emit multiple deltas, got {deltas:?}");
+        let joined: String = deltas.concat();
+        assert_eq!(joined, "你好！我是助手。");
+    }
+
+    /// think mode suppresses everything before `</think>`: feeding reasoning text
+    /// emits nothing until the close tag, then the answer streams.
+    #[test]
+    fn think_mode_suppresses_until_close_tag() {
+        let mut full = String::new();
+        let mut printed = 0usize;
+        let mut out = Vec::new();
+        let mut sink = |d: &str| out.push(d.to_string());
+        // reasoning emitted token-by-token → nothing reaches the sink
+        stream_clean(&mut full, &mut printed, "<think>用户在问", &mut sink, false);
+        stream_clean(&mut full, &mut printed, "身份", &mut sink, false);
+        stream_clean(&mut full, &mut printed, "</think>", &mut sink, false);
+        stream_clean(&mut full, &mut printed, "我是助手。", &mut sink, false);
+        assert_eq!(out.concat(), "我是助手。", "pre-think text must not emit");
     }
 }

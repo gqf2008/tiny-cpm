@@ -64,10 +64,24 @@ const VAD_FRAME_SAMPLES: usize = 400;
 const VAD_SAMPLE_RATE: usize = 16_000;
 const MIN_SEGMENT_SAMPLES: usize = 8000;
 const OUT_SR: usize = 24_000; // output sample rate (per doc)
-// 与 live.rs 的回复模块 prompt 对齐：明确"直接回答、禁止思考/复述/客套"，否则
-// 模型会在 no_think 的空 think 块里卡壳，然后复读上一句或瞎编。日期时间在
-// 每轮动态注入（见 turn 处理），所以这里不硬编码。
-const DEFAULT_PERSONA: &str = "你是一个语音助手。直接用一两句简短的口语回答用户，禁止输出思考过程、分析、复述用户问题或任何 markdown 格式。不知道时间日期就直接回答不知道，不要编造；不要重复上一句话，不要每句都加客套话或表情。";
+// Persona split by mode:
+// - FAST (no_think, default): a SHORT simple persona. The long complex persona
+//   (with date/time + many prohibitions) is what made no_think repeat the
+//   previous assistant turn — a 1B model treats the verbose prompt as a template
+//   to copy. Measured: this short persona + no_think gives 6-31 tokens/turn with
+//   ZERO repeats across 5 turns.
+// - THINK mode (TINY_CPM_CHAT_THINK=1): the verbose persona, where the extra
+//   guidance helps reasoning. Think is slower (~150 thinking tokens) but kept as
+//   an A/B + rollback path.
+const FAST_PERSONA: &str = "你是语音助手。每次针对用户当前这句话给出简短新回答，不要重复历史，不要加客套话或表情。";
+const THINK_PERSONA: &str = "你是一个语音助手。直接用一两句简短的口语回答用户，禁止输出思考过程、分析、复述用户问题或任何 markdown 格式。不知道时间日期就直接回答不知道，不要编造；不要重复上一句话，不要每句都加客套话或表情。";
+/// `true` = think mode (no_think=false, verbose persona). Env: TINY_CPM_CHAT_THINK.
+fn think_mode() -> bool {
+    matches!(
+        std::env::var("TINY_CPM_CHAT_THINK").ok().as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
 
 /// Selectable TTS engine, mirroring `live`'s `LiveTts`. The browser audio
 /// contract is 24 kHz mono pcm16 (see `OUT_SR`), so both engines emit that:
@@ -807,10 +821,18 @@ fn main_loop(
             let hist = build_history(&s);
             (s.instructions.clone(), hist)
         };
-        let base_persona = instructions.unwrap_or_else(|| DEFAULT_PERSONA.to_string());
-        // 每轮注入当前日期/星期/时间，否则模型遇到"今天几号/现在几点"只能瞎编
-        // （幻觉）或反复说"无法提供"。
-        let persona = format!("{base_persona}\n现在是：{}。", now_string());
+        // Persona + think mode: fast path uses a short simple persona (no date
+        // injection — the verbose prompt was what caused no_think to repeat). Think
+        // mode keeps the verbose persona + injected clock (helps reasoning; "几点"
+        // would otherwise hallucinate).
+        let think = think_mode();
+        let default_persona = if think { THINK_PERSONA } else { FAST_PERSONA };
+        let base_persona = instructions.unwrap_or_else(|| default_persona.to_string());
+        let persona = if think {
+            format!("{base_persona}\n现在是：{}。", now_string())
+        } else {
+            base_persona
+        };
         eprintln!(
             "turn {turn}: history={} items, prompt=\"{}\", persona=\"{}\"",
             history.len(),
@@ -876,15 +898,16 @@ fn main_loop(
                     let _ = sen_tx.blocking_send(sentence);
                 }
             };
-            // Think mode (no_think=false): MiniCPM5-1B needs its <think> block
-            // to answer properly. no_think (an empty pre-closed think block)
-            // was measurably broken on multi-turn turns: with history in the
-            // prompt, the 1B model repeated the previous assistant text
-            // verbatim (8 tokens: "你好！有什么我可以帮助你的吗？") for every new
-            // question instead of answering. In think mode it reasons inside
-            // <think>…</think> and stream_clean only forwards post-think text
-            // to the sink, so the reasoning is never displayed or spoken.
-            // 1024 tokens covers thinking + answer (~260 tokens measured).
+            // no_think (fast, default): MiniCPM5-1B answers directly in 6-31
+            // tokens with a SHORT simple persona (FAST_PERSONA). The earlier
+            // "no_think repeats the previous assistant turn" bug was caused by
+            // the long complex persona (a 1B model copies the verbose prompt as a
+            // template), NOT by no_think itself — verified: short persona + no_think
+            // across 5 turns = zero repeats. stream_clean in no_think mode emits the
+            // raw generated text (no think tags in the output). TINY_CPM_CHAT_THINK=1
+            // switches to think mode (verbose persona + <think>, ~150 tokens slower)
+            // for A/B comparison or rollback.
+            let no_think = !think;
             let _ = chat::generate_reply_with_history(
                 llm,
                 tokenizer,
@@ -892,7 +915,7 @@ fn main_loop(
                 Some(&persona),
                 &history,
                 &transcript,
-                false,
+                no_think,
                 DEFAULT_MAX_TOKENS,
                 &mut sink,
                 Some(&barge),
