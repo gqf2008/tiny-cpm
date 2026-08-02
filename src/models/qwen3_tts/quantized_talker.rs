@@ -112,6 +112,9 @@ impl QuantizedTalkerLayer {
         // composite `apply_rotary_pos_emb` internally on non-Metal / unexpected
         // shapes, keeping the CPU test path working). Returns strided k/v views
         // over the appended range — the fused SDPA consumes them without a copy.
+        // (A norm+rope+KV three-way fusion was tried and measured SLOWER at m=1:
+        // the saved ~3 launches/layer don't pay for the fused kernel's reduction
+        // + dual-write work — occupancy-bound, not launch-bound.)
         let (q, k, v) =
             apply_rope_fused_cache(&q, &k, &v, cos, sin, &self.kv_k, &self.kv_v, kv_pos)?;
         self.kv_pos = kv_pos + q_len;
