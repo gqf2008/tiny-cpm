@@ -17,7 +17,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 
 use crate::{
-    common::sample::get_logit_processor,
+    common::{modules::sdpa_fast_guard, sample::get_logit_processor},
     models::{
         feature_extractor::config::FeatureExtractor,
         qwen3_asr::{
@@ -144,10 +144,27 @@ impl Qwen3AsrEngine {
         mut on_partial: Option<&mut dyn FnMut(&str)>,
     ) -> Result<(String, usize, usize, usize, std::time::Duration)> {
         let seed = 34562u64;
+        let prof = std::env::var("ASR_PROF").is_ok();
         let mut logit_processor = get_logit_processor(Some(self.temperature), None, None, seed);
         let i_start = Instant::now();
+        // Opt ASR decode into the qwen3-tts fused SDPA path (simd_sum + fast::exp,
+        // skips repeat_kv and its contiguous copy — both O(KV) per token). Prefill
+        // (seq_len>1) auto-falls-back to eager inside eager_attention_forward's
+        // is_decode check, so the guard is safe across the whole loop. The fused
+        // kernel is not bit-identical to eager (why ASR was excluded by default),
+        // but ASR is greedy (do_sample=false) so the numeric drift is irrelevant.
+        let _sdpa_fast = sdpa_fast_guard();
         let mut generate: Vec<u32> = Vec::new();
         let mut prompt_tokens = 0usize;
+        let mut fwd_time = std::time::Duration::ZERO;
+        let mut smp_time = std::time::Duration::ZERO;
+        // Per-token timing: prefill (first token = audio encoder + prompt prefill) vs
+        // decode (each later token). Total-per-token (fwd + sample + any sync wait) is
+        // the honest cost — the fwd/sample split is muddied by Metal async kernel launch.
+        let mut prefill_tok = std::time::Duration::ZERO;
+        let mut rest_tok = std::time::Duration::ZERO;
+        let mut n_rest = 0usize;
+        let mut is_first = true;
         for data in audio_datas.iter() {
             let mut input_ids = data.input_ids.clone();
             let mut input_features = Some(data.input_features.clone().to_dtype(self.dtype)?);
@@ -155,11 +172,24 @@ impl Qwen3AsrEngine {
             prompt_tokens += seq_len;
             let mut seqlen_offset = 0;
             for _ in 0..max_tokens {
+                let t_tok = Instant::now();
+                let t_fwd = Instant::now();
                 let logits =
                     self.model
                         .forward(&input_ids, seqlen_offset, input_features.as_ref())?;
+                fwd_time += t_fwd.elapsed();
+                let t_smp = Instant::now();
                 let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
                 let next_token = logit_processor.sample(&logits)?;
+                smp_time += t_smp.elapsed();
+                let tok_dt = t_tok.elapsed();
+                if is_first {
+                    prefill_tok = tok_dt;
+                    is_first = false;
+                } else {
+                    rest_tok += tok_dt;
+                    n_rest += 1;
+                }
                 generate.push(next_token);
                 // Incremental transcript (Realtime input_audio_transcription.delta):
                 // every couple of tokens decode the prefix so far and hand the cleaned
@@ -190,6 +220,17 @@ impl Qwen3AsrEngine {
             self.model.clear_kv_cache();
         }
         let elapsed = i_start.elapsed();
+        if prof {
+            let rest_avg_ms = if n_rest > 0 {
+                rest_tok.as_secs_f64() / n_rest as f64 * 1000.0
+            } else {
+                0.0
+            };
+            eprintln!(
+                "asr prof: {} tokens | prefill {:?} | decode {}×{:.1}ms | fwd {:?} | sample {:?} | total {:?}",
+                generate.len(), prefill_tok, n_rest, rest_avg_ms, fwd_time, smp_time, elapsed
+            );
+        }
         let text = self.tokenizer.token_decode(generate.clone())?;
         let text = clean_asr_response(&text);
         Ok((
