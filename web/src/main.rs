@@ -41,7 +41,10 @@ use tiny_cpm::{
         chat,
         moss_tts::MossEngine,
         qwen3_asr::Qwen3AsrEngine,
-        qwen3_tts::{Qwen3TtsEngine, TalkerQuant},
+        qwen3_tts::{
+            CodecDevice, Qwen3TtsEngine, STREAM_CHUNK_FRAMES, STREAM_FIRST_FRAMES,
+            STREAM_LEFT_CONTEXT, TalkerQuant,
+        },
     },
     models::{
         fire_red_vad::vad::{FireRedVad, VadOverrides},
@@ -81,6 +84,15 @@ fn think_mode() -> bool {
         std::env::var("TINY_CPM_CHAT_THINK").ok().as_deref(),
         Some("1") | Some("on") | Some("true") | Some("yes")
     )
+}
+
+/// Read a positive usize env knob with a default (for the Qwen3-TTS streaming tunables).
+fn env_usize_or(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
 }
 
 /// Selectable TTS engine, mirroring `live`'s `LiveTts`. The browser audio
@@ -311,10 +323,16 @@ async fn main() -> Result<()> {
     };
     let tts = match tts_choice {
         TtsChoice::Moss => WebTts::Moss(MossEngine::load(&tts_dir, &codec_dir.unwrap(), &device)?),
-        TtsChoice::Qwen3 => WebTts::Qwen3(Qwen3TtsEngine::load_with_quant(
+        TtsChoice::Qwen3 => WebTts::Qwen3(Qwen3TtsEngine::load_with_quant_and_codec_device(
             &tts_dir,
             &device,
             talker_quant.unwrap(),
+            // Dedicated Metal device for the codec decoder so its streaming
+            // sliding-window decode is isolated from the talker's GPU pool — the
+            // multi-model babble fix (see CLAUDE.md "streaming decode corrupts in a
+            // multi-model Metal process"). Env-overridable: `cpu` = zero-code
+            // fallback (guaranteed isolation), `shared` = single-device (batched-only).
+            CodecDevice::from_env_default(CodecDevice::Dedicated),
         )?),
     };
     eprintln!(
@@ -395,14 +413,14 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
     let streaming = Arc::new(AtomicBool::new(false));
     let barge = Arc::new(AtomicBool::new(false));
 
-    // session.created
+    // session.created — echo the full Realtime session object. Build the payload under
+    // the lock, then drop the guard BEFORE the .await (MutexGuard is not Send).
+    let payload = session_payload(&session.lock().unwrap());
     let _ = out_tx
         .send(Out(json!({
             "type": "session.created",
-            "session": {
-                "output_audio_format": { "sample_rate": OUT_SR, "channels": 1, "encoding": "pcm16" },
-                "input_audio_format": { "sample_rate": VAD_SAMPLE_RATE, "channels": 1, "encoding": "pcm16" },
-            }
+            "event_id": "event_sess_created",
+            "session": payload,
         }).to_string()))
         .await;
 
@@ -435,8 +453,13 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
                 "session.update" => {
                     let s = ev.get("session").cloned().unwrap_or(json!({}));
                     apply_session_update(&session_r, &s, &param_tx).await;
+                    let payload = session_payload(&session_r.lock().unwrap());
                     let _ = out_tx_r
-                        .send(Out(json!({"type":"session.updated"}).to_string()))
+                        .send(Out(json!({
+                            "type": "session.updated",
+                            "event_id": "event_sess_updated",
+                            "session": payload,
+                        }).to_string()))
                         .await;
                 }
                 "input_audio_buffer.append" => {
@@ -633,6 +656,37 @@ async fn apply_session_update(
     }
 }
 
+/// Serialize the session into the OpenAI-Realtime `session` object (echoed in
+/// `session.created` / `session.updated`). Additive: the browser ignores the payload,
+/// a standard Realtime client reads these fields. Audio format kept as the structured
+/// object the browser already tolerates; `pcm16` strings are the Realtime form.
+fn session_payload(sess: &Session) -> Value {
+    let turn_detection = match &sess.turn_mode {
+        TurnMode::ServerVad { threshold, silence_ms } => json!({
+            "type": "server_vad",
+            "threshold": threshold,
+            "prefix_padding_ms": 300,
+            "silence_duration_ms": silence_ms,
+            // echo the React-style create-time fields if a client sets them
+            "eagerness": "auto",
+        }),
+        TurnMode::Manual => Value::Null,
+    };
+    json!({
+        "id": "sess_default",
+        "object": "realtime.session",
+        "modalities": ["text", "audio"],
+        "instructions": sess.instructions.clone().unwrap_or_default(),
+        "voice": "alloy",
+        "turn_detection": turn_detection,
+        "input_audio_format": { "sample_rate": VAD_SAMPLE_RATE, "channels": 1, "encoding": "pcm16" },
+        "output_audio_format": { "sample_rate": OUT_SR, "channels": 1, "encoding": "pcm16" },
+        "input_audio_transcription": { "model": "qwen3-asr-0.6b" },
+        "max_response_output_tokens": "inf",
+        "max_history_turns": sess.max_history_turns,
+    })
+}
+
 fn listener_loop(
     vad_dir: String,
     mut mic_rx: mpsc::Receiver<Vec<f32>>,
@@ -731,6 +785,23 @@ fn listener_loop(
     }
 }
 
+/// Emit a Realtime lifecycle event with a monotonic `event_id`. `out_tx` and `ev_seq`
+/// are the caller's (main_loop) locals, referenced texturally — so this is only invoked
+/// from main_loop where both are in scope. The high-frequency audio/transcript deltas
+/// build their own json (no event_id).
+macro_rules! emit {
+    ($tx:expr, $seq:expr, $($k:literal : $v:tt),+ $(,)?) => {
+        {
+            let seq: &mut u64 = $seq;
+            *seq += 1;
+            let _ = $tx.blocking_send(Out(json!({
+                "event_id": format!("event_{}", *seq),
+                $( $k: $v ),+
+            }).to_string()));
+        }
+    };
+}
+
 fn main_loop(
     eng: Arc<Mutex<Engines>>,
     mut seg_rx: mpsc::Receiver<TurnInput>,
@@ -753,11 +824,25 @@ fn main_loop(
         let resp_id = format!("resp_{turn}");
         let user_item_id = format!("item_u{turn}");
         let asst_item_id = format!("item_a{turn}");
+        // Monotonic event_id for the per-turn lifecycle events (Realtime clients key on
+        // this for ack/replay). The high-frequency audio/transcript deltas omit it.
+        let mut ev_seq = 0u64;
+        let prev_item_id = session
+            .lock()
+            .unwrap()
+            .items
+            .last()
+            .map(|i| i.id.clone());
 
-        let _ = out_tx.blocking_send(Out(json!({
-            "type":"response.created","response":{"id":resp_id}
-        })
-        .to_string()));
+        if matches!(input, TurnInput::Audio(_)) {
+            // server_vad committed the audio buffer at the VAD endpoint.
+            emit!(&out_tx, &mut ev_seq, "type": "input_audio_buffer.committed",
+                  "previous_item_id": prev_item_id,
+                  "item_id": user_item_id);
+        }
+        emit!(&out_tx, &mut ev_seq, "type": "response.created",
+              "response": { "id": resp_id, "object": "realtime.response",
+                            "status": "in_progress", "output": [] });
 
         // Voice → ASR + push a user item; Text → item already exists (client pushed it).
         let transcript = match input {
@@ -769,14 +854,40 @@ fn main_loop(
                 let t_asr = std::time::Instant::now();
                 let t = {
                     let mut e = eng.lock().unwrap();
-                    match e.asr.transcribe_samples(&samples, ASR_MAX_TOKENS) {
+                    // Streaming ASR: emit input_audio_transcription.delta (the new suffix)
+                    // as the transcript grows; .completed fires with the final text below.
+                    // The decoded prefix is monotonic (generate only grows, BPE decode is a
+                    // left-to-right concat), so the suffix = full[len(last)..].
+                    let mut last = String::new();
+                    let mut on_partial = |full: &str| {
+                        let delta = if full.starts_with(last.as_str()) {
+                            &full[last.len()..]
+                        } else {
+                            // Prefix refined (rare) — resend the whole transcript.
+                            full
+                        };
+                        if !delta.is_empty() {
+                            let _ = out_tx.blocking_send(Out(
+                                json!({
+                                    "type":"conversation.item.input_audio_transcription.delta",
+                                    "item_id": user_item_id, "delta": delta
+                                })
+                                .to_string(),
+                            ));
+                            last = full.to_string();
+                        }
+                    };
+                    match e
+                        .asr
+                        .transcribe_samples_streaming(&samples, ASR_MAX_TOKENS, &mut on_partial)
+                    {
                         Ok(t) => t,
                         Err(e) => {
                             eprintln!("turn {turn}: asr error: {e}");
-                            let _ = out_tx.blocking_send(Out(json!({
-                                "type":"response.done","response":{"id":resp_id,"status":"failed"}
-                            })
-                            .to_string()));
+                            emit!(&out_tx, &mut ev_seq, "type": "response.done",
+                                  "response": { "id": resp_id, "object": "realtime.response",
+                                                "status": "failed", "error": { "code":"asr_failed",
+                                                "message": format!("{e}") }, "output": [] });
                             speaking.store(false, Ordering::Relaxed);
                             streaming.store(false, Ordering::Relaxed);
                             continue;
@@ -789,24 +900,27 @@ fn main_loop(
                     t.trim().chars().take(60).collect::<String>()
                 );
                 if t.trim().is_empty() {
-                    let _ = out_tx.blocking_send(Out(json!({
-                        "type":"response.done","response":{"id":resp_id,"status":"completed"}
-                    })
-                    .to_string()));
+                    emit!(&out_tx, &mut ev_seq, "type": "response.done",
+                          "response": { "id": resp_id, "object": "realtime.response",
+                                        "status": "completed", "output": [] });
                     speaking.store(false, Ordering::Relaxed);
                     streaming.store(false, Ordering::Relaxed);
                     continue;
                 }
-                let _ = out_tx.blocking_send(Out(json!({
-                    "type":"conversation.item.input_audio_transcription.completed",
-                    "item_id": user_item_id, "transcript": t,
-                })
-                .to_string()));
+                emit!(&out_tx, &mut ev_seq, "type": "conversation.item.input_audio_transcription.completed",
+                      "item_id": user_item_id, "transcript": t);
                 session.lock().unwrap().items.push(ConvItem {
-                    id: user_item_id,
+                    id: user_item_id.clone(),
                     role: "user".into(),
                     text: t.clone(),
                 });
+                emit!(&out_tx, &mut ev_seq, "type": "conversation.item.created",
+                      "previous_item_id": prev_item_id,
+                      "item": {
+                          "id": user_item_id, "object": "realtime.item", "type": "message",
+                          "role": "user", "status": "completed",
+                          "content": [{ "type": "input_text", "text": t }]
+                      });
                 t
             }
             TurnInput::Text(t) => {
@@ -847,10 +961,20 @@ fn main_loop(
             );
         }
 
-        let _ = out_tx.blocking_send(Out(json!({
-            "type":"response.audio_transcript.delta","response_id":resp_id,"delta":""
-        })
-        .to_string()));
+        // Realtime response-item lifecycle: one assistant message output (output_index 0)
+        // carrying one audio content part (content_index 0). The transcript + audio deltas
+        // below stream into this part; audio.done / content_part.done / output_item.done
+        // close it after the TTS worker drains.
+        let out_index = 0u32;
+        let content_index = 0u32;
+        emit!(&out_tx, &mut ev_seq, "type": "response.output_item.added",
+              "response_id": resp_id, "output_index": out_index,
+              "item": { "id": asst_item_id, "object": "realtime.item", "type": "message",
+                        "role": "assistant", "status": "in_progress", "content": [] });
+        emit!(&out_tx, &mut ev_seq, "type": "response.content_part.added",
+              "response_id": resp_id, "item_id": asst_item_id,
+              "output_index": out_index, "content_index": content_index,
+              "part": { "type": "audio", "audio": "" });
 
         let mut e = eng.lock().unwrap();
         let eng_ref: &mut Engines = &mut *e;
@@ -872,13 +996,17 @@ fn main_loop(
         let (sen_tx, mut sen_rx) = mpsc::channel::<String>(8);
         let out_tts = out_tx.clone();
         let resp_tts = resp_id.to_string();
+        let item_tts = asst_item_id.clone();
         let barge_tts = Arc::clone(&barge);
         let tts_worker = move || {
             while let Some(sentence) = sen_rx.blocking_recv() {
                 if barge_tts.load(Ordering::Relaxed) {
                     continue;
                 }
-                synth_sentence(tts, ref_voice, &sentence, &barge_tts, &out_tts, &resp_tts);
+                synth_sentence(
+                    tts, ref_voice, &sentence, &barge_tts, &out_tts, &resp_tts,
+                    &item_tts, out_index, content_index,
+                );
             }
         };
 
@@ -891,7 +1019,9 @@ fn main_loop(
                 }
                 full_reply.push_str(delta);
                 let _ = out_ref.blocking_send(Out(json!({
-                    "type":"response.audio_transcript.delta","response_id":resp_id,"delta":delta
+                    "type":"response.audio_transcript.delta","response_id":resp_id,
+                    "item_id": asst_item_id, "output_index": out_index,
+                    "content_index": content_index, "delta": delta
                 })
                 .to_string()));
                 for sentence in splitter.push(delta) {
@@ -926,7 +1056,9 @@ fn main_loop(
                 if let Some(rest) = splitter.flush() {
                     full_reply.push_str(&rest);
                     let _ = out_tx.blocking_send(Out(json!({
-                        "type":"response.audio_transcript.delta","response_id":resp_id,"delta":rest
+                        "type":"response.audio_transcript.delta","response_id":resp_id,
+                        "item_id": asst_item_id, "output_index": out_index,
+                        "content_index": content_index, "delta": rest
                     })
                     .to_string()));
                     let _ = sen_tx.blocking_send(rest);
@@ -937,29 +1069,61 @@ fn main_loop(
             drop(sen_tx);
             let _ = handle.join();
         });
-        // transcript done
-        let _ = out_tx.blocking_send(Out(json!({
-            "type":"response.audio_transcript.done","response_id":resp_id,"transcript":full_reply
-        })
-        .to_string()));
-        // assistant item
-        {
-            let mut s = session.lock().unwrap();
-            s.items.push(ConvItem {
-                id: asst_item_id,
-                role: "assistant".into(),
-                text: full_reply,
-            });
-        }
+        // Realtime close lifecycle for the assistant audio part. On cancel (barge-in) we
+        // skip the audio/content_part/output_item done events but still surface the
+        // partial transcript + response.done{cancelled}.
         let status = if barge.load(Ordering::Relaxed) {
             "cancelled"
         } else {
             "completed"
         };
-        let _ = out_tx.blocking_send(Out(json!({
-            "type":"response.done","response":{"id":resp_id,"status":status}
-        })
-        .to_string()));
+        if status == "completed" {
+            emit!(&out_tx, &mut ev_seq, "type": "response.audio.done",
+                  "response_id": resp_id, "item_id": asst_item_id,
+                  "output_index": out_index, "content_index": content_index);
+            emit!(&out_tx, &mut ev_seq, "type": "response.audio_transcript.done",
+                  "response_id": resp_id, "item_id": asst_item_id,
+                  "output_index": out_index, "content_index": content_index,
+                  "transcript": full_reply);
+            emit!(&out_tx, &mut ev_seq, "type": "response.content_part.done",
+                  "response_id": resp_id, "item_id": asst_item_id,
+                  "output_index": out_index, "content_index": content_index,
+                  "part": { "type": "audio", "audio": "" });
+            emit!(&out_tx, &mut ev_seq, "type": "response.output_item.done",
+                  "response_id": resp_id, "output_index": out_index,
+                  "item": { "id": asst_item_id, "object": "realtime.item", "type": "message",
+                            "role": "assistant", "status": "completed",
+                            "content": [{ "type": "audio", "audio": "" }] });
+        } else {
+            emit!(&out_tx, &mut ev_seq, "type": "response.audio_transcript.done",
+                  "response_id": resp_id, "item_id": asst_item_id,
+                  "output_index": out_index, "content_index": content_index,
+                  "transcript": full_reply);
+        }
+        // Push the assistant conversation item (next turn's history includes it), then
+        // emit conversation.item.created with the previous item id.
+        let prev_for_asst = {
+            let mut s = session.lock().unwrap();
+            let prev = s.items.last().map(|i| i.id.clone());
+            s.items.push(ConvItem {
+                id: asst_item_id.clone(),
+                role: "assistant".into(),
+                text: full_reply.clone(),
+            });
+            prev
+        };
+        if status == "completed" {
+            emit!(&out_tx, &mut ev_seq, "type": "conversation.item.created",
+                  "previous_item_id": prev_for_asst,
+                  "item": {
+                      "id": asst_item_id, "object": "realtime.item", "type": "message",
+                      "role": "assistant", "status": "completed",
+                      "content": [{ "type": "text", "text": full_reply }]
+                  });
+        }
+        emit!(&out_tx, &mut ev_seq, "type": "response.done",
+              "response": { "id": resp_id, "object": "realtime.response",
+                            "status": status, "output": [] });
         speaking.store(false, Ordering::Relaxed);
         streaming.store(false, Ordering::Relaxed);
         eprintln!("turn {turn} {status}");
@@ -1052,8 +1216,12 @@ fn synth_sentence(
     barge: &AtomicBool,
     out_tx: &mpsc::Sender<Out>,
     resp_id: &str,
+    item_id: &str,
+    output_index: u32,
+    content_index: u32,
 ) {
     let resp_id = resp_id.to_string();
+    let item_id = item_id.to_string();
     match tts {
         WebTts::Moss(e) => {
             let ref_codes = match ref_voice {
@@ -1066,7 +1234,9 @@ fn synth_sentence(
                 }
                 let b64 = downmix_24k_mono_i16_b64(&pcm);
                 let _ = out_tx.blocking_send(Out(
-                    json!({"type":"response.audio.delta","response_id":resp_id,"delta":b64})
+                    json!({"type":"response.audio.delta","response_id":resp_id,
+                           "item_id":item_id,"output_index":output_index,
+                           "content_index":content_index,"delta":b64})
                         .to_string(),
                 ));
                 true
@@ -1091,33 +1261,42 @@ fn synth_sentence(
                 Some(WebRef::Qwen3(rv)) => Some(rv),
                 _ => None,
             };
-            // Batched decode (streaming GENERATION + one batch `chunked_decode`):
-            // the streaming sliding-window decode is corrupted by candle's Metal
-            // buffer pool in this multi-model process (Qwen3-ASR + MiniCPM5 +
-            // Qwen3-TTS on one `Device::new_metal(0)`) — same root cause as
-            // `live`; greedy codes are bit-identical standalone vs here yet the
-            // streamed audio babbles, while the batch decode of the same codes
-            // is clean (see CLAUDE.md "streaming decode corrupts in a
-            // multi-model Metal process"). Audio arrives as one chunk after
-            // generation — acceptable for short assistant sentences; the worklet
-            // does gapless queued playback. Barge-in still aborts via the
-            // per-frame `should_abort` predicate during generation.
+            // Streaming GENERATION + streaming DECODE: the talker emits frames one at
+            // a time (abortable via the per-frame `should_abort` predicate — barge-in
+            // still halts mid-sentence), and each window is codec-decoded on the
+            // DEDICATED Metal device (its own buffer pool, isolated from the talker's
+            // GPU workspace — the multi-model babble fix). First audio arrives after
+            // `first_frames` (~0.96 s @ 12 frames) instead of after the whole sentence.
+            // Tune via QWEN3_TTS_STREAM_FIRST/_CHUNK/_CTX; correctness self-check with
+            // QWEN3_TTS_STREAM_CHECK=1 (the engine re-decodes a batch reference and the
+            // CLI diffs them — the web path emits the streamed tail directly).
+            let first_frames = env_usize_or("QWEN3_TTS_STREAM_FIRST", STREAM_FIRST_FRAMES);
+            let chunk_frames = env_usize_or("QWEN3_TTS_STREAM_CHUNK", STREAM_CHUNK_FRAMES);
+            let left_ctx = env_usize_or("QWEN3_TTS_STREAM_CTX", STREAM_LEFT_CONTEXT);
             let mut on_audio = |pcm: &[f32]| {
                 if barge.load(Ordering::Relaxed) {
                     return;
                 }
                 let b64 = mono_24k_i16_b64(pcm);
                 let _ = out_tx.blocking_send(Out(
-                    json!({"type":"response.audio.delta","response_id":resp_id,"delta":b64})
+                    json!({"type":"response.audio.delta","response_id":resp_id,
+                           "item_id":item_id,"output_index":output_index,
+                           "content_index":content_index,"delta":b64})
                         .to_string(),
                 ));
             };
             let abort = || barge.load(Ordering::Relaxed);
-            if let Err(e) = e.synthesize_pcm_batched_with_abort(
+            if let Err(e) = e.synthesize_pcm_streaming_with_abort(
                 text,
                 "auto",
                 rv,
-                QWEN3_MAX_FRAMES,
+                // Cap (300 frames ≈ 24 s). The Base talker rarely emits codec_eos for
+                // Chinese, so this is also the hard stop. Lower for snappier replies via
+                // QWEN3_TTS_MAX_FRAMES (env).
+                env_usize_or("QWEN3_TTS_MAX_FRAMES", QWEN3_MAX_FRAMES),
+                first_frames,
+                chunk_frames,
+                left_ctx,
                 &mut on_audio,
                 Some(&abort),
             ) {

@@ -141,6 +141,7 @@ impl Qwen3AsrEngine {
         &mut self,
         audio_datas: &[AudioData],
         max_tokens: usize,
+        mut on_partial: Option<&mut dyn FnMut(&str)>,
     ) -> Result<(String, usize, usize, usize, std::time::Duration)> {
         let seed = 34562u64;
         let mut logit_processor = get_logit_processor(Some(self.temperature), None, None, seed);
@@ -160,6 +161,24 @@ impl Qwen3AsrEngine {
                 let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
                 let next_token = logit_processor.sample(&logits)?;
                 generate.push(next_token);
+                // Incremental transcript (Realtime input_audio_transcription.delta):
+                // every couple of tokens decode the prefix so far and hand the cleaned
+                // FULL transcript to the callback — the caller diffs it against the last
+                // delta it emitted. Cheap (BPE detokenize of a short prefix), and decoding
+                // the whole prefix (not just the new token) keeps multibyte boundaries sane.
+                if let Some(cb) = on_partial.as_deref_mut() {
+                    let emit = generate.len() % 2 == 0
+                        || next_token == self.eos_token_id1
+                        || next_token == self.eos_token_id2;
+                    if emit
+                        && let Ok(t) = self.tokenizer.token_decode(generate.clone())
+                    {
+                        let t = clean_asr_response(&t);
+                        if !t.is_empty() {
+                            cb(&t);
+                        }
+                    }
+                }
                 if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
                     break;
                 }
@@ -189,7 +208,7 @@ impl Qwen3AsrEngine {
             self.processor
                 .process_audio_path(DEFAULT_TEMPLATE, audio_file, &self.tokenizer)?;
         let (text, chunks, prompt_tokens, generated, elapsed) =
-            self.decode_audio_datas(&audio_datas, max_tokens)?;
+            self.decode_audio_datas(&audio_datas, max_tokens, None)?;
         eprintln!(
             "{} chunk(s), {} prompt tokens, {} generated tokens in {:?} ({:.2} tok/s)",
             chunks,
@@ -214,7 +233,25 @@ impl Qwen3AsrEngine {
         let data =
             self.processor
                 .process_audio_tensor(DEFAULT_TEMPLATE, &audio, &self.tokenizer)?;
-        let (text, _, _, _, _) = self.decode_audio_datas(&[data], max_tokens)?;
+        let (text, _, _, _, _) = self.decode_audio_datas(&[data], max_tokens, None)?;
+        Ok(text)
+    }
+
+    /// Streaming variant of `transcribe_samples`: fires `on_partial` with the cleaned
+    /// transcript-so-far every couple of generated tokens (the caller emits the suffix
+    /// as Realtime `input_audio_transcription.delta`). The final transcript is returned
+    /// as usual; `transcribe_samples` is this with `on_partial = None`.
+    pub fn transcribe_samples_streaming(
+        &mut self,
+        samples_16k_mono: &[f32],
+        max_tokens: usize,
+        on_partial: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let audio = Tensor::new(samples_16k_mono, &self.device)?;
+        let data =
+            self.processor
+                .process_audio_tensor(DEFAULT_TEMPLATE, &audio, &self.tokenizer)?;
+        let (text, _, _, _, _) = self.decode_audio_datas(&[data], max_tokens, Some(on_partial))?;
         Ok(text)
     }
 }

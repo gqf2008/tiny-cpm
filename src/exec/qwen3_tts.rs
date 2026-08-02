@@ -16,7 +16,7 @@ use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 
-use crate::models::qwen3_tts::codec::SpeechTokenizer;
+use crate::models::qwen3_tts::codec::{CodecDecoder, CodecEncoder, SpeechTokenizer};
 use crate::models::qwen3_tts::config::{
     Qwen3TTSConfig, Qwen3TTSGenerationConfig, SpeakerEncoderParams, SpeechTokenizerConfig,
 };
@@ -80,6 +80,67 @@ impl TalkerQuant {
     }
 }
 
+/// Which device the codec **decoder** runs on. The codec decoder's streaming
+/// sliding-window `decode` — small per-chunk windows interleaved with the talker's
+/// GPU forwards — babbles (wrong from frame 1) in a multi-model Metal process
+/// (e.g. `web`/`live`: Qwen3-ASR + MiniCPM5 already churned the shared pool)
+/// because candle 0.11's Metal buffer pool recycles stale buffers across the two
+/// workloads. Running the decoder on a SEPARATE `Device::new_metal(0)` (its own
+/// pool/command-queue/DeviceId) isolates it; codes are CPU `Vec<u32>` from the
+/// talker's per-frame callback, uploaded via `Tensor::from_vec` on the codec
+/// device's queue — a plain CPU→GPU upload, zero cross-device GPU traffic. Env
+/// `QWEN3_TTS_CODEC_DEVICE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecDevice {
+    /// Decoder on the same device as the talker (today's behavior). Fine for the
+    /// single-model `tts qwen3` CLI; in a multi-model process only batched decode
+    /// is clean here (streaming sliding-window decode babbles).
+    Shared,
+    /// Decoder on a fresh `Device::new_metal(0)` — independent buffer pool/queue.
+    /// Enables clean streaming decode alongside the talker in a multi-model process.
+    Dedicated,
+    /// Decoder on CPU. Guaranteed isolation, no Metal pool contention at all, but a
+    /// slower decode (the zero-code fallback if `Dedicated` ever misbehaves).
+    Cpu,
+}
+
+impl CodecDevice {
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "dedicated" | "separate" | "split" => Ok(Self::Dedicated),
+            "cpu" | "host" => Ok(Self::Cpu),
+            "shared" | "same" | "single" => Ok(Self::Shared),
+            other => Err(anyhow!(
+                "unknown codec-device `{other}` (expected dedicated | cpu | shared)"
+            )),
+        }
+    }
+    pub fn from_env_default(default: Self) -> Self {
+        std::env::var("QWEN3_TTS_CODEC_DEVICE")
+            .ok()
+            .and_then(|s| Self::parse(&s).ok())
+            .unwrap_or(default)
+    }
+}
+
+/// Build the `Device` the codec decoder runs on. Logs the choice.
+fn resolve_codec_device(device: &Device, codec_device: CodecDevice) -> Result<Device> {
+    Ok(match codec_device {
+        CodecDevice::Shared => device.clone(),
+        CodecDevice::Dedicated => {
+            let d = Device::new_metal(0)?;
+            eprintln!(
+                "qwen3-tts: codec decoder on a DEDICATED Metal device (isolated buffer pool)"
+            );
+            d
+        }
+        CodecDevice::Cpu => {
+            eprintln!("qwen3-tts: codec decoder on CPU (isolated, no Metal pool contention)");
+            Device::Cpu
+        }
+    })
+}
+
 /// aha src/utils/mod.rs `find_type_files` (same as exec/qwen3_asr.rs).
 fn find_type_files(path: &str, extension_type: &str) -> Result<Vec<String>> {
     let mut files = Vec::new();
@@ -107,6 +168,10 @@ fn env_usize(key: &str, default: usize) -> usize {
 
 pub struct Qwen3TtsEngine {
     device: Device,
+    /// Device the codec **decoder** runs on. Same as `device` for `CodecDevice::Shared`;
+    /// a dedicated Metal device (own pool) or CPU otherwise — so streaming decode is
+    /// isolated from the talker's GPU workspace in multi-model processes.
+    codec_device: Device,
     talker: Talker,
     codec: SpeechTokenizer,
     speaker_encoder: SpeakerEncoder,
@@ -123,6 +188,22 @@ impl Qwen3TtsEngine {
     }
 
     pub fn load_with_quant(model_dir: &str, device: &Device, quant: TalkerQuant) -> Result<Self> {
+        // Codec device defaults to Shared (single-device = today's behavior). The web/live
+        // multi-model path sets `QWEN3_TTS_CODEC_DEVICE=dedicated` (or calls the explicit
+        // ctor) so the decoder's streaming decode is isolated from the talker's GPU pool.
+        Self::load_with_quant_and_codec_device(model_dir, device, quant, CodecDevice::from_env_default(CodecDevice::Shared))
+    }
+
+    /// `load_with_quant` + explicit codec-device placement. The codec ENCODER is built on
+    /// the main `device` (startup `encode_ref` keeps the ref codes on the talker device for
+    /// the ICL prompt); the codec DECODER is built on `codec_device` so its streaming
+    /// sliding-window `decode` has an isolated Metal buffer pool separate from the talker.
+    pub fn load_with_quant_and_codec_device(
+        model_dir: &str,
+        device: &Device,
+        quant: TalkerQuant,
+        codec_device: CodecDevice,
+    ) -> Result<Self> {
         // --- main config + generation defaults ---
         let tts_cfg: Qwen3TTSConfig =
             serde_json::from_slice(&std::fs::read(format!("{model_dir}/config.json"))?)?;
@@ -189,14 +270,39 @@ impl Qwen3TtsEngine {
         if codec_list.is_empty() {
             return Err(anyhow!("no safetensors found in {codec_dir}"));
         }
-        let codec_vb =
+        // The codec ENCODER runs on the main `device` (encode_ref keeps ref codes on the
+        // talker device for the ICL prompt); the codec DECODER runs on `codec_dev` so its
+        // streaming sliding-window decode owns an isolated Metal buffer pool. We assemble
+        // the SpeechTokenizer directly from its pub halves rather than `SpeechTokenizer::new`
+        // (which builds both from one VarBuilder on one device) — codec.rs stays untouched.
+        let codec_dev = resolve_codec_device(device, codec_device)?;
+        let enc_vb =
             unsafe { VarBuilder::from_mmaped_safetensors(&codec_list, DType::F32, device)? };
+        // Shared mode: both halves from the one mmaped VarBuilder (== prior behavior). Any
+        // split: the decoder mmaps its own copy on the codec device.
+        let dec_vb = if matches!(codec_device, CodecDevice::Shared) {
+            enc_vb.clone()
+        } else {
+            unsafe { VarBuilder::from_mmaped_safetensors(&codec_list, DType::F32, &codec_dev)? }
+        };
+        let encoder = CodecEncoder::new(
+            enc_vb.pp("encoder"),
+            &codec_cfg.encoder_config,
+            codec_cfg.encoder_valid_num_quantizers,
+        )?;
+        let decoder = CodecDecoder::new(dec_vb.pp("decoder"), &codec_cfg.decoder_config)?;
+        let codec = SpeechTokenizer {
+            encoder: Some(encoder),
+            decoder,
+            output_sample_rate: codec_cfg.output_sample_rate,
+            frame_rate: codec_cfg.frame_rate(),
+        };
         let sample_rate = codec_cfg.output_sample_rate;
-        let codec = SpeechTokenizer::new(codec_vb, &codec_cfg, true)?;
 
         let tokenizer = TokenizerModel::init(model_dir)?;
         Ok(Self {
             device: device.clone(),
+            codec_device: codec_dev,
             talker,
             codec,
             speaker_encoder,
@@ -273,8 +379,8 @@ impl Qwen3TtsEngine {
             &self.gen_cfg,
             max_frames,
         )?; // (n_frames, 16)
-        // codec decode expects (B, 16, T).
-        let codes = codes.t()?.unsqueeze(0)?; // (1, 16, n_frames)
+        // codec decode expects (B, 16, T) on the codec device (decoder lives there).
+        let codes = codes.t()?.unsqueeze(0)?.to_device(&self.codec_device)?; // (1, 16, n_frames)
         let wav = self.codec.decoder.chunked_decode(&codes, 300, 25)?; // (1, 1, T*1920)
         Ok(wav.squeeze(0)?) // (1, T*1920)
     }
@@ -368,7 +474,7 @@ impl Qwen3TtsEngine {
         )?; // (n, 16)
         let first_secs = t0.elapsed().as_secs_f64();
         // Single batch decode — the clean path in multi-model processes.
-        let codes = codes.t()?.unsqueeze(0)?; // (1, 16, n)
+        let codes = codes.t()?.unsqueeze(0)?.to_device(&self.codec_device)?; // (1, 16, n)
         let wav = self.codec.decoder.chunked_decode(&codes, 300, 25)?; // (1, 1, n*1920)
         let pcm = wav.squeeze(0)?.squeeze(0)?.to_vec1::<f32>()?;
         on_audio(&pcm);
@@ -397,7 +503,7 @@ impl Qwen3TtsEngine {
         let text_ids = self.encode_text(text)?;
         let newline = self.newline_token()?;
         let frame_samples = self.codec.decoder.frame_samples(); // 1920 @ 24kHz
-        let device = self.device.clone();
+        let device = self.codec_device.clone(); // codec decoder lives here — upload codes on its queue
         let t0 = Instant::now();
 
         // All streaming state lives in one RefCell so the frame callback can borrow it
@@ -513,7 +619,7 @@ impl Qwen3TtsEngine {
         // standard layout). Cheap relative to generation.
         let flat: Vec<u32> = st.frames.iter().flat_map(|f| f.iter().copied()).collect();
         let n = st.frames.len();
-        let codes = Tensor::from_vec(flat, (n, 16), &self.device)?;
+        let codes = Tensor::from_vec(flat, (n, 16), &self.codec_device)?; // decoder lives on the codec device
         let codes = codes.t()?.unsqueeze(0)?;
         let wav = self.codec.decoder.chunked_decode(&codes, 300, 25)?;
         Ok((wav.squeeze(0)?, st.first_secs.unwrap_or(f64::NAN)))
@@ -546,6 +652,7 @@ impl Qwen3TtsEngine {
             "qwen3-tts: codec roundtrip codes shape = {:?}",
             codes.shape()
         );
+        let codes = codes.to_device(&self.codec_device)?; // decoder lives on the codec device
         let pcm = self.codec.decoder.chunked_decode(&codes, 300, 25)?; // (1, 1, T*1920)
         save_wav_mono(&pcm.squeeze(0)?, out_wav, self.sample_rate as u32)?;
         Ok(())

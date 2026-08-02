@@ -61,7 +61,12 @@ async fn main() -> Result<()> {
 
     let t_start = Instant::now();
     let mut first_transcript: Option<f64> = None;
+    let mut first_asr_delta: Option<f64> = None;
     let mut first_audio: Option<f64> = None;
+    let mut llm_text = String::new();
+    // Accumulate the streamed response.audio.delta PCM (24 kHz mono pcm16) so we can
+    // save a wav and listen / inspect it for babble — the multi-model corruption check.
+    let mut streamed_pcm: Vec<i16> = Vec::new();
 
     // Stream the audio in real-time-ish chunks (VAD needs frames to accumulate).
     let chunk = 6400; // 400 ms @ 16 kHz
@@ -76,7 +81,7 @@ async fn main() -> Result<()> {
         while let Ok(Some(Ok(Message::Text(s)))) =
             tokio::time::timeout(std::time::Duration::from_millis(1), ws.next()).await
         {
-            handle(&s, t_start, &mut first_transcript, &mut first_audio);
+            handle(&s, t_start, &mut first_transcript, &mut first_asr_delta, &mut first_audio, &mut llm_text, &mut streamed_pcm);
         }
     }
     eprintln!("audio sent in {:.2}s", t_start.elapsed().as_secs_f64());
@@ -104,7 +109,7 @@ async fn main() -> Result<()> {
                     println!("[t+{:.2}s] response.done", t_start.elapsed().as_secs_f64());
                     break;
                 }
-                handle(&s, t_start, &mut first_transcript, &mut first_audio);
+                handle(&s, t_start, &mut first_transcript, &mut first_asr_delta, &mut first_audio, &mut llm_text, &mut streamed_pcm);
             }
             Ok(Some(Ok(_))) => {}
             Ok(Some(Err(e))) => { eprintln!("ws err: {e}"); break; }
@@ -114,31 +119,81 @@ async fn main() -> Result<()> {
     }
 
     println!("\n=== milestones (from audio start) ===");
-    if let Some(t) = first_transcript { println!("first ASR transcript event: {t:.2}s"); }
+    if let Some(t) = first_asr_delta { println!("first ASR transcript DELTA:   {t:.2}s (streaming ✓)"); }
+    if let Some(t) = first_transcript { println!("first ASR transcript completed: {t:.2}s"); }
     if let Some(t) = first_audio { println!("first TTS audio delta:      {t:.2}s"); }
+    if !llm_text.trim().is_empty() {
+        println!("LLM reply text: {llm_text:?}");
+    }
+
+    // Save the streamed response audio (24 kHz mono) for listening / babble inspection.
+    if !streamed_pcm.is_empty() {
+        let out = std::env::args().nth(3).unwrap_or_else(|| "/tmp/probe_out.wav".into());
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 24_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(&out, spec)?;
+        for &s in &streamed_pcm { w.write_sample(s)?; }
+        w.finalize()?;
+        let dur = streamed_pcm.len() as f32 / 24_000.0;
+        // Simple speech-vs-noise heuristic: RMS and peak, and how many near-silent frames.
+        let peak = streamed_pcm.iter().map(|&s| (s as i32).abs()).max().unwrap_or(0);
+        let rms = (streamed_pcm.iter().map(|&s| (s as i64 * s as i64) as f64).sum::<f64>()
+            / streamed_pcm.len().max(1) as f64).sqrt();
+        println!(
+            "saved streamed audio → {out} ({dur:.2}s, peak={peak}, rms={rms:.0}, samples={})",
+            streamed_pcm.len()
+        );
+    }
     Ok(())
 }
 
-fn handle(s: &str, t0: Instant, ft: &mut Option<f64>, fa: &mut Option<f64>) {
+fn handle(s: &str, t0: Instant, ft: &mut Option<f64>, fd: &mut Option<f64>, fa: &mut Option<f64>, llm: &mut String, pcm: &mut Vec<i16>) {
     let v: serde_json::Value = match serde_json::from_str(s) { Ok(v) => v, Err(_) => return };
     let t = t0.elapsed().as_secs_f64();
-    match v["type"].as_str().unwrap_or("") {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let ty = v["type"].as_str().unwrap_or("");
+    match ty {
         "input_audio_buffer.speech_started" => println!("[t+{t:.2}s] speech_started"),
         "input_audio_buffer.speech_stopped" => println!("[t+{t:.2}s] speech_stopped"),
+        "conversation.item.input_audio_transcription.delta" => {
+            if fd.is_none() { *fd = Some(t); println!("[t+{t:.2}s] ASR delta {:?}", v["delta"].as_str().unwrap_or("")); }
+        }
         "conversation.item.input_audio_transcription.completed" => {
             if ft.is_none() { *ft = Some(t); }
             println!("[t+{t:.2}s] ASR → {:?}", v["transcript"].as_str().unwrap_or(""));
         }
         "response.audio_transcript.delta" => {
-            // LLM text streaming (verbose) — skip
+            // LLM text streaming — accumulate to print the reply at the end.
+            if let Some(d) = v["delta"].as_str() { llm.push_str(d); }
         }
         "response.audio.delta" => {
             if fa.is_none() {
                 *fa = Some(t);
                 println!("[t+{t:.2}s] first TTS audio");
             }
+            // Decode base64 pcm16 24 kHz mono → accumulate.
+            if let Some(delta) = v["delta"].as_str() {
+                if let Ok(bytes) = b64.decode(delta) {
+                    for c in bytes.chunks_exact(2) {
+                        pcm.push(i16::from_le_bytes([c[0], c[1]]));
+                    }
+                }
+            }
         }
         "response.created" => println!("[t+{t:.2}s] response.created"),
+        // Log the Realtime lifecycle events added in Phase 4 (others are noisy deltas).
+        "input_audio_buffer.committed"
+        | "conversation.item.created"
+        | "response.output_item.added"
+        | "response.output_item.done"
+        | "response.content_part.added"
+        | "response.content_part.done"
+        | "response.audio.done"
+        | "session.updated" => println!("[t+{t:.2}s] {ty}"),
         _ => {}
     }
 }
