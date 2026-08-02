@@ -659,6 +659,15 @@ fn listener_loop(
                 }
             };
             let is_speech = vad.last_frame_speech();
+            // Diagnostic (opt-in via VAD_DEBUG=1): log every ~1s of frames to see
+            // whether VAD detects speech/endpoints on the incoming mic audio.
+            if std::env::var("VAD_DEBUG").is_ok() {
+                static VAD_LOG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let n = VAD_LOG.fetch_add(1, Ordering::Relaxed);
+                if n % 40 == 0 {
+                    eprintln!("vad: frame#{n} rms={rms:.4} speech={is_speech} emitted={speech_started_emitted}");
+                }
+            }
             // speech_started/stopped events
             if is_speech && !speech_started_emitted {
                 speech_started_emitted = true;
@@ -689,6 +698,9 @@ fn listener_loop(
                 Ok(s) => s,
                 Err(_) => continue,
             };
+            if std::env::var("VAD_DEBUG").is_ok() {
+                eprintln!("vad: endpoint → segment {:.2}s ({} samples)", samples.len() as f32 / VAD_SAMPLE_RATE as f32, samples.len());
+            }
             // endpoint → speech_stopped + segment
             if speech_started_emitted {
                 speech_started_emitted = false;

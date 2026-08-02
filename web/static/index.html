@@ -238,12 +238,12 @@
     <div class="grp">
       <h3>麦克风</h3>
       <div class="fld">
-        <div class="lab"><label>增益 mic gain</label><span class="val" id="micGainV">1.0×</span></div>
-        <input type="range" id="micGain" min="1" max="16" step="0.5" value="1">
+        <div class="lab"><label>增益 mic gain</label><span class="val" id="micGainV">2.0×</span></div>
+        <input type="range" id="micGain" min="1" max="16" step="0.5" value="2">
       </div>
       <div class="fld">
-        <div class="lab"><label>拾音门限 rms gate</label><span class="val" id="rmsGateV">0.012</span></div>
-        <input type="range" id="rmsGate" min="0" max="0.1" step="0.002" value="0.012">
+        <div class="lab"><label>拾音门限 rms gate</label><span class="val" id="rmsGateV">0.004</span></div>
+        <input type="range" id="rmsGate" min="0" max="0.1" step="0.002" value="0.004">
         <div class="meter"><div id="rmsMeter"></div></div>
         <div class="hint">当前响度 <span id="rmsVal">0.0000</span> · 低于门限的声音被丢弃（挡远处人声）。</div>
       </div>
@@ -270,7 +270,7 @@
 const wsUrl = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws';
 const IN_SR = 16000, OUT_SR = 24000;
 let ws = null, ctx = null, micStream = null, recNode = null, playNode = null;
-let micOn = false, micGain = 1.0, rmsGate = 0.012;
+let micOn = false, micGain = 2.0, rmsGate = 0.004;
 let micSeq = 0, micPending = false; // mic on/off generation counter; bails stale micOn_ awaits
 let responding = false, replyBuf = '', replyEl = null;
 let reconnectDelay = 1000;
@@ -419,9 +419,12 @@ const waveBars = () => Array.from($('wave').children);
 // would alias >8 kHz content into the voice band. Cutoff ~= 8 kHz (16 kHz output
 // Nyquist); state persists across frames so the filter stays continuous.
 let micLpState = 0;
+let micFrameCount = 0, micSentCount = 0;
 function handleMicFrame(in0){
   let s = 0; for (let i = 0; i < in0.length; i++) s += in0[i]*in0[i];
   const r = Math.sqrt(s / in0.length);
+  micFrameCount++;
+  if (window.MIC_DEBUG && micFrameCount % 50 === 0) console.log(`[mic] frame#${micFrameCount} rms=${r.toFixed(4)} gate=${rmsGate} sent=${micSentCount} ws=${ws?ws.readyState:'null'}`);
   // waveform + meter
   const lv = Math.min(1, r*8);
   waveBars().forEach((b,i)=>{ b.style.height = (4 + lv*16*(0.5+0.5*Math.sin(Date.now()/90+i))) + 'px'; });
@@ -447,6 +450,7 @@ function handleMicFrame(in0){
   }
   const bytes = new Uint8Array(out.buffer);
   let bin = ''; for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  micSentCount++;
   ws.send(JSON.stringify({ type:'input_audio_buffer.append', audio: btoa(bin) }));
 }
 async function micOn_() {
