@@ -5,7 +5,7 @@
 //! `conversation.item.create/delete`, and emits `session.created/updated`,
 //! `input_audio_buffer.speech_started/stopped`,
 //! `conversation.item.input_audio_transcription.completed`,
-//! `response.created/audio_transcript.delta/audio.delta/...done`, `error`.
+//! `response.created/output_audio_transcript.delta/output_audio.delta/...done`, `error`.
 //!
 //! Audio: input 16 kHz 16-bit mono PCM (base64 in JSON); output 24 kHz 16-bit
 //! mono PCM (MOSS 48 k stereo downmixed, or Qwen3-TTS 24 k mono native — both
@@ -16,7 +16,7 @@
 //! client drives via create/delete).
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -173,6 +173,8 @@ enum TurnMode {
 
 #[derive(Clone)]
 struct Session {
+    id: String,
+    conv_id: String,
     instructions: Option<String>,
     turn_mode: TurnMode,
     max_history_turns: usize,
@@ -182,6 +184,8 @@ struct Session {
 impl Default for Session {
     fn default() -> Self {
         Self {
+            id: "sess_default".into(),
+            conv_id: "conv_default".into(),
             instructions: None,
             turn_mode: TurnMode::ServerVad {
                 threshold: 0.5,
@@ -194,13 +198,40 @@ impl Default for Session {
 }
 
 /// One outbound WS text frame (a JSON event). All server→client is JSON (audio
-/// is base64 inside `response.audio.delta`, per the doc).
+/// is base64 inside `response.output_audio.delta`, per the doc).
 struct Out(String);
 
+/// Per-connection monotonic id generator. One `Arc<AtomicU64>` shared (cloned)
+/// across the read task, the VAD listener thread, and the main turn thread, so
+/// every emitted event gets a globally-unique `event_id` — the Realtime contract
+/// (clients key on it for ack/replay/dedup). Previously each turn reset a local
+/// counter, so `event_id` repeated across turns.
+#[derive(Clone)]
+struct IdGen(Arc<AtomicU64>);
+impl IdGen {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(0)))
+    }
+    fn next(&self, prefix: &str) -> String {
+        format!("{prefix}_{}", self.0.fetch_add(1, Ordering::Relaxed))
+    }
+    /// Next server `event_id` ("event_<n>").
+    fn ev(&self) -> String {
+        self.next("event")
+    }
+    /// Next conversation `item_id` ("item_<n>").
+    fn item(&self) -> String {
+        self.next("item")
+    }
+}
+
 /// A turn's input: voiced audio (→ ASR) or typed text (client already pushed
-/// a user conversation item; use its text directly).
+/// a user conversation item; use its text directly). For audio, `item_id` is
+/// pre-allocated in the VAD listener at speech_started so the speech_started /
+/// speech_stopped / committed events and the resulting user conversation item all
+/// share one id (Realtime contract).
 enum TurnInput {
-    Audio(Vec<f32>),
+    Audio(Vec<f32>, String),
     Text(String),
 }
 
@@ -412,6 +443,19 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
     let speaking = Arc::new(AtomicBool::new(false));
     let streaming = Arc::new(AtomicBool::new(false));
     let barge = Arc::new(AtomicBool::new(false));
+    // Per-connection id generator (event_id / item_id) shared by the read task,
+    // VAD listener, and main turn thread — globally-unique ids across the session.
+    let idg = IdGen::new();
+    // `input_audio_buffer.clear` request: the read task sets this, the VAD listener
+    // drains its accumulated mic buffer on the next frame.
+    let want_clear = Arc::new(AtomicBool::new(false));
+    // Assign stable session / conversation ids for this connection (Realtime echoes
+    // them in session.created and every response.created / response.done).
+    {
+        let mut s = session.lock().unwrap();
+        s.id = idg.next("sess");
+        s.conv_id = idg.next("conv");
+    }
 
     // session.created — echo the full Realtime session object. Build the payload under
     // the lock, then drop the guard BEFORE the .await (MutexGuard is not Send).
@@ -419,7 +463,7 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
     let _ = out_tx
         .send(Out(json!({
             "type": "session.created",
-            "event_id": "event_sess_created",
+            "event_id": idg.ev(),
             "session": payload,
         }).to_string()))
         .await;
@@ -427,6 +471,8 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
     let session_r = session.clone();
     let out_tx_r = out_tx.clone();
     let barge_r = barge.clone();
+    let idg_r = idg.clone();
+    let want_clear_r = want_clear.clone();
     let read_task = tokio::spawn(async move {
         let mut manual_buf: Vec<f32> = Vec::new();
         while let Some(Ok(msg)) = stream.next().await {
@@ -440,9 +486,12 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
                 Ok(v) => v,
                 Err(e) => {
                     let _ = out_tx_r
-                        .send(Out(
-                            json!({"type":"error","error":{"message":format!("bad json: {e}")}})
-                                .to_string(),
+                        .send(error_event(
+                            &idg_r,
+                            "invalid_request_error",
+                            "invalid_event",
+                            &format!("bad json: {e}"),
+                            None,
                         ))
                         .await;
                     continue;
@@ -452,12 +501,12 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
             match t {
                 "session.update" => {
                     let s = ev.get("session").cloned().unwrap_or(json!({}));
-                    apply_session_update(&session_r, &s, &param_tx).await;
+                    apply_session_update(&session_r, &s, &param_tx);
                     let payload = session_payload(&session_r.lock().unwrap());
                     let _ = out_tx_r
                         .send(Out(json!({
                             "type": "session.updated",
-                            "event_id": "event_sess_updated",
+                            "event_id": idg_r.ev(),
                             "session": payload,
                         }).to_string()))
                         .await;
@@ -484,13 +533,26 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
                     // manual: nothing special (the append already buffered); client
                     // follows with response.create to run a turn.
                 }
+                "input_audio_buffer.clear" => {
+                    // Drop any buffered manual audio and tell the VAD listener to drain
+                    // its accumulated mic buffer on the next frame. Spec: respond with
+                    // input_audio_buffer.cleared.
+                    manual_buf.clear();
+                    want_clear_r.store(true, Ordering::Relaxed);
+                    let _ = out_tx_r
+                        .send(Out(json!({
+                            "event_id": idg_r.ev(),
+                            "type": "input_audio_buffer.cleared"
+                        }).to_string()))
+                        .await;
+                }
                 "response.create" => {
                     // Manual mode: if audio buffered, ASR it; else use the latest
                     // user conversation item (text the client pushed via
                     // conversation.item.create) as the prompt.
                     let buf = std::mem::take(&mut manual_buf);
                     if !buf.is_empty() {
-                        let _ = seg_tx.try_send(TurnInput::Audio(buf));
+                        let _ = seg_tx.try_send(TurnInput::Audio(buf, idg_r.item()));
                     } else {
                         let t = session_r
                             .lock()
@@ -528,24 +590,61 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
                             })
                             .unwrap_or_default();
                         if !text.is_empty() {
-                            let mut s = session_r.lock().unwrap();
-                            let id = format!("item_{}", s.items.len());
-                            s.items.push(ConvItem { id, role, text });
+                            let (prev, id) = {
+                                let mut s = session_r.lock().unwrap();
+                                let prev = s.items.last().map(|i| i.id.clone());
+                                let id = idg_r.item();
+                                s.items.push(ConvItem {
+                                    id: id.clone(),
+                                    role: role.clone(),
+                                    text: text.clone(),
+                                });
+                                (prev, id)
+                            };
+                            // Spec: respond with conversation.item.added. A user message
+                            // content part is `input_text`; an assistant text item is `text`.
+                            let part_type = if role == "assistant" { "text" } else { "input_text" };
+                            let _ = out_tx_r
+                                .send(Out(json!({
+                                    "event_id": idg_r.ev(),
+                                    "type": "conversation.item.added",
+                                    "previous_item_id": prev,
+                                    "item": {
+                                        "id": id, "object": "realtime.item", "type": "message",
+                                        "role": role, "status": "completed",
+                                        "content": [{ "type": part_type, "text": text }]
+                                    }
+                                }).to_string()))
+                                .await;
                         }
                     }
                 }
                 "conversation.item.delete" => {
                     if let Some(id) = ev.get("item_id").and_then(|v| v.as_str()) {
-                        let mut s = session_r.lock().unwrap();
-                        s.items.retain(|i| i.id != id);
+                        {
+                            let mut s = session_r.lock().unwrap();
+                            s.items.retain(|i| i.id != id);
+                        }
+                        // Spec: respond with conversation.item.deleted.
+                        let _ = out_tx_r
+                            .send(Out(json!({
+                                "event_id": idg_r.ev(),
+                                "type": "conversation.item.deleted",
+                                "item_id": id
+                            }).to_string()))
+                            .await;
                     }
                 }
                 _ => {
+                    let client_eid = ev.get("event_id").and_then(|v| v.as_str());
                     let _ = out_tx_r
-                        .send(Out(json!({
-                            "type":"error","error":{"message":format!("unsupported event: {t}")}
-                        })
-                        .to_string()))
+                        .send(error_event(
+                            &idg_r,
+                            "invalid_request_error",
+                            "unsupported_event",
+                            &format!("unsupported event: {t}"),
+                            client_eid,
+                        ))
                         .await;
                 }
             }
@@ -567,6 +666,8 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
     let barge_l = barge.clone();
     let out_tx_l = out_tx.clone();
     let vad_dir = st.vad_dir.clone();
+    let idg_l = idg.clone();
+    let want_clear_l = want_clear.clone();
     let listener_thread = std::thread::spawn(move || {
         listener_loop(
             vad_dir,
@@ -577,6 +678,8 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
             streaming_l,
             barge_l,
             out_tx_l,
+            idg_l,
+            want_clear_l,
         )
     });
 
@@ -587,6 +690,7 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
     let barge_m = barge.clone();
     let out_tx_m = out_tx.clone();
     let speaking_m = speaking.clone();
+    let idg_m = idg.clone();
     let main_thread = std::thread::spawn(move || {
         main_loop(
             eng,
@@ -596,6 +700,7 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
             barge_m,
             streaming_m,
             speaking_m,
+            idg_m,
         )
     });
 
@@ -606,7 +711,7 @@ async fn handle_conn(socket: WebSocket, st: Arc<ServerState>) {
     eprintln!("ws disconnected");
 }
 
-async fn apply_session_update(
+fn apply_session_update(
     session: &Arc<Mutex<Session>>,
     s: &Value,
     param_tx: &mpsc::Sender<VadOverrides>,
@@ -618,7 +723,12 @@ async fn apply_session_update(
     if let Some(m) = s.get("max_history_turns").and_then(|v| v.as_u64()) {
         sess.max_history_turns = m.clamp(1, 50) as usize;
     }
-    if let Some(td) = s.get("turn_detection") {
+    // turn_detection lives under `audio.input` in the 2025-08 session shape.
+    let td = s
+        .get("audio")
+        .and_then(|a| a.get("input"))
+        .and_then(|i| i.get("turn_detection"));
+    if let Some(td) = td {
         if td.is_null() {
             sess.turn_mode = TurnMode::Manual;
         } else if let Some(ty) = td.get("type").and_then(|v| v.as_str()) {
@@ -656,10 +766,10 @@ async fn apply_session_update(
     }
 }
 
-/// Serialize the session into the OpenAI-Realtime `session` object (echoed in
-/// `session.created` / `session.updated`). Additive: the browser ignores the payload,
-/// a standard Realtime client reads these fields. Audio format kept as the structured
-/// object the browser already tolerates; `pcm16` strings are the Realtime form.
+/// Serialize the session into the Realtime `session` object (echoed in
+/// `session.created` / `session.updated`), in the 2025-08 shape: nested
+/// `audio.input` / `audio.output`, `output_modalities`, `max_output_tokens`.
+/// `max_history_turns` is a non-standard extension the local browser client uses.
 fn session_payload(sess: &Session) -> Value {
     let turn_detection = match &sess.turn_mode {
         TurnMode::ServerVad { threshold, silence_ms } => json!({
@@ -667,22 +777,38 @@ fn session_payload(sess: &Session) -> Value {
             "threshold": threshold,
             "prefix_padding_ms": 300,
             "silence_duration_ms": silence_ms,
-            // echo the React-style create-time fields if a client sets them
+            "create_response": true,
+            "interrupt_response": true,
             "eagerness": "auto",
         }),
         TurnMode::Manual => Value::Null,
     };
     json!({
-        "id": "sess_default",
+        "id": sess.id,
         "object": "realtime.session",
-        "modalities": ["text", "audio"],
+        "type": "realtime",
+        "model": "tiny-cpm",
+        "output_modalities": ["audio"],
         "instructions": sess.instructions.clone().unwrap_or_default(),
-        "voice": "alloy",
-        "turn_detection": turn_detection,
-        "input_audio_format": { "sample_rate": VAD_SAMPLE_RATE, "channels": 1, "encoding": "pcm16" },
-        "output_audio_format": { "sample_rate": OUT_SR, "channels": 1, "encoding": "pcm16" },
-        "input_audio_transcription": { "model": "qwen3-asr-0.6b" },
-        "max_response_output_tokens": "inf",
+        "tools": [],
+        "tool_choice": "auto",
+        "max_output_tokens": "inf",
+        "tracing": null,
+        "expires_at": null,
+        "audio": {
+            "input": {
+                "format": { "type": "audio/pcm", "rate": VAD_SAMPLE_RATE },
+                "transcription": { "model": "qwen3-asr-0.6b" },
+                "noise_reduction": null,
+                "turn_detection": turn_detection,
+            },
+            "output": {
+                "format": { "type": "audio/pcm", "rate": OUT_SR },
+                "voice": "alloy",
+                "speed": 1,
+            }
+        },
+        // non-standard: how many past turns the local LLM keeps in prompt history.
         "max_history_turns": sess.max_history_turns,
     })
 }
@@ -696,6 +822,8 @@ fn listener_loop(
     streaming: Arc<AtomicBool>,
     barge: Arc<AtomicBool>,
     out_tx: mpsc::Sender<Out>,
+    idg: IdGen,
+    want_clear: Arc<AtomicBool>,
 ) {
     let mut vad = match FireRedVad::init(&vad_dir, Some(&Device::Cpu), None, None) {
         Ok(v) => v,
@@ -707,14 +835,25 @@ fn listener_loop(
     let mut onset_count = 0usize;
     let mut mic_buf: Vec<f32> = Vec::new();
     let mut speech_started_emitted = false;
+    // Total samples written to the input buffer this session — drives the
+    // audio_start_ms / audio_end_ms offsets in speech_started / speech_stopped.
+    let mut total_samples: usize = 0;
+    // item_id pre-allocated at speech_started; reused for speech_stopped and the
+    // user conversation item created from the committed buffer (Realtime contract).
+    let mut pending_item_id: Option<String> = None;
     loop {
         while let Ok(o) = param_rx.try_recv() {
             vad.update_params(&o);
+        }
+        // input_audio_buffer.clear: drain the accumulated mic buffer.
+        if want_clear.swap(false, Ordering::Relaxed) {
+            mic_buf.clear();
         }
         let chunk = match mic_rx.blocking_recv() {
             Some(c) => c,
             None => break,
         };
+        total_samples += chunk.len();
         mic_buf.extend_from_slice(&chunk);
         while mic_buf.len() >= VAD_FRAME_SAMPLES {
             let frame: Vec<f32> = mic_buf.drain(..VAD_FRAME_SAMPLES).collect();
@@ -739,8 +878,14 @@ fn listener_loop(
             // speech_started/stopped events
             if is_speech && !speech_started_emitted {
                 speech_started_emitted = true;
+                let item_id = idg.item();
+                pending_item_id = Some(item_id.clone());
+                let audio_start_ms = total_samples * 1000 / VAD_SAMPLE_RATE;
                 let _ = out_tx.blocking_send(Out(
-                    json!({"type":"input_audio_buffer.speech_started"}).to_string(),
+                    json!({"event_id": idg.ev(),
+                           "type":"input_audio_buffer.speech_started",
+                           "audio_start_ms": audio_start_ms,
+                           "item_id": item_id}).to_string(),
                 ));
                 // barge: a new speech onset during a streaming response cancels it.
                 // The browser clears its playback on speech_started; the main loop
@@ -772,12 +917,18 @@ fn listener_loop(
             // endpoint → speech_stopped + segment
             if speech_started_emitted {
                 speech_started_emitted = false;
+                let audio_end_ms = total_samples * 1000 / VAD_SAMPLE_RATE;
+                let item_id = pending_item_id.clone().unwrap_or_else(|| idg.item());
                 let _ = out_tx.blocking_send(Out(
-                    json!({"type":"input_audio_buffer.speech_stopped"}).to_string(),
+                    json!({"event_id": idg.ev(),
+                           "type":"input_audio_buffer.speech_stopped",
+                           "audio_end_ms": audio_end_ms,
+                           "item_id": item_id}).to_string(),
                 ));
             }
             if samples.len() >= MIN_SEGMENT_SAMPLES {
-                if seg_tx.blocking_send(TurnInput::Audio(samples)).is_err() {
+                let item_id = pending_item_id.take().unwrap_or_else(|| idg.item());
+                if seg_tx.blocking_send(TurnInput::Audio(samples, item_id)).is_err() {
                     break;
                 }
             }
@@ -785,21 +936,41 @@ fn listener_loop(
     }
 }
 
-/// Emit a Realtime lifecycle event with a monotonic `event_id`. `out_tx` and `ev_seq`
-/// are the caller's (main_loop) locals, referenced texturally — so this is only invoked
-/// from main_loop where both are in scope. The high-frequency audio/transcript deltas
-/// build their own json (no event_id).
+/// Emit a Realtime lifecycle event with a globally-unique `event_id` (from the
+/// per-connection `IdGen`). `$idg` is an `IdGen` (or `&IdGen`) in scope at the call
+/// site — typically `main_loop`'s clone, but usable from any thread holding one.
+/// High-frequency audio/transcript deltas go through the same id generator.
 macro_rules! emit {
-    ($tx:expr, $seq:expr, $($k:literal : $v:tt),+ $(,)?) => {
-        {
-            let seq: &mut u64 = $seq;
-            *seq += 1;
-            let _ = $tx.blocking_send(Out(json!({
-                "event_id": format!("event_{}", *seq),
-                $( $k: $v ),+
-            }).to_string()));
-        }
+    ($tx:expr, $idg:expr, $($k:literal : $v:tt),+ $(,)?) => {
+        let _ = $tx.blocking_send(Out(json!({
+            "event_id": $idg.ev(),
+            $( $k: $v ),+
+        }).to_string()));
     };
+}
+
+/// Build a Realtime `error` event with the full error object the spec requires
+/// (`type` / `code` / `message` / `param` / `event_id`). `client_event_id` is the id
+/// of the client event that triggered the error (None when it had none, e.g.
+/// unparseable JSON). `etype` is `"invalid_request_error"` | `"server_error"`.
+fn error_event(
+    idg: &IdGen,
+    etype: &str,
+    code: &str,
+    message: &str,
+    client_event_id: Option<&str>,
+) -> Out {
+    Out(json!({
+        "event_id": idg.ev(),
+        "type": "error",
+        "error": {
+            "type": etype,
+            "code": code,
+            "message": message,
+            "param": null,
+            "event_id": client_event_id,
+        }
+    }).to_string())
 }
 
 fn main_loop(
@@ -810,6 +981,7 @@ fn main_loop(
     barge: Arc<AtomicBool>,
     streaming: Arc<AtomicBool>,
     speaking: Arc<AtomicBool>,
+    idg: IdGen,
 ) {
     let mut turn = 0usize;
     loop {
@@ -822,11 +994,15 @@ fn main_loop(
         streaming.store(true, Ordering::Relaxed);
         turn += 1;
         let resp_id = format!("resp_{turn}");
-        let user_item_id = format!("item_u{turn}");
+        let conv_id = session.lock().unwrap().conv_id.clone();
+        // For voiced input the user item id was pre-allocated at speech_started and
+        // shared across speech_started / committed / conversation.item. Text input has
+        // none — user_item_id is only consumed on the Audio path below.
+        let user_item_id = match &input {
+            TurnInput::Audio(_, id) => id.clone(),
+            TurnInput::Text(_) => format!("item_u{turn}"),
+        };
         let asst_item_id = format!("item_a{turn}");
-        // Monotonic event_id for the per-turn lifecycle events (Realtime clients key on
-        // this for ack/replay). The high-frequency audio/transcript deltas omit it.
-        let mut ev_seq = 0u64;
         let prev_item_id = session
             .lock()
             .unwrap()
@@ -834,19 +1010,25 @@ fn main_loop(
             .last()
             .map(|i| i.id.clone());
 
-        if matches!(input, TurnInput::Audio(_)) {
+        if matches!(input, TurnInput::Audio(..)) {
             // server_vad committed the audio buffer at the VAD endpoint.
-            emit!(&out_tx, &mut ev_seq, "type": "input_audio_buffer.committed",
+            emit!(&out_tx, &idg, "type": "input_audio_buffer.committed",
                   "previous_item_id": prev_item_id,
                   "item_id": user_item_id);
         }
-        emit!(&out_tx, &mut ev_seq, "type": "response.created",
-              "response": { "id": resp_id, "object": "realtime.response",
-                            "status": "in_progress", "output": [] });
+        emit!(&out_tx, &idg, "type": "response.created",
+              "response": {
+                  "id": resp_id, "object": "realtime.response",
+                  "status": "in_progress", "status_details": null,
+                  "output": [], "conversation_id": conv_id,
+                  "output_modalities": ["audio"], "max_output_tokens": "inf",
+                  "audio": { "output": { "format": { "type": "audio/pcm", "rate": OUT_SR }, "voice": "alloy" } },
+                  "usage": null, "metadata": null
+              });
 
         // Voice → ASR + push a user item; Text → item already exists (client pushed it).
         let transcript = match input {
-            TurnInput::Audio(samples) => {
+            TurnInput::Audio(samples, _) => {
                 eprintln!(
                     "=== turn {turn}: utterance {:.2}s ===",
                     samples.len() as f32 / VAD_SAMPLE_RATE as f32
@@ -869,8 +1051,11 @@ fn main_loop(
                         if !delta.is_empty() {
                             let _ = out_tx.blocking_send(Out(
                                 json!({
+                                    "event_id": idg.ev(),
                                     "type":"conversation.item.input_audio_transcription.delta",
-                                    "item_id": user_item_id, "delta": delta
+                                    "item_id": user_item_id,
+                                    "content_index": 0,
+                                    "delta": delta
                                 })
                                 .to_string(),
                             ));
@@ -884,10 +1069,15 @@ fn main_loop(
                         Ok(t) => t,
                         Err(e) => {
                             eprintln!("turn {turn}: asr error: {e}");
-                            emit!(&out_tx, &mut ev_seq, "type": "response.done",
-                                  "response": { "id": resp_id, "object": "realtime.response",
-                                                "status": "failed", "error": { "code":"asr_failed",
-                                                "message": format!("{e}") }, "output": [] });
+                            emit!(&out_tx, &idg, "type": "response.done",
+                                  "response": {
+                                      "id": resp_id, "object": "realtime.response",
+                                      "status": "failed",
+                                      "status_details": { "type": "asr_failed", "reason": format!("{e}") },
+                                      "output": [], "conversation_id": conv_id,
+                                      "output_modalities": ["audio"], "max_output_tokens": "inf",
+                                      "usage": null, "metadata": null
+                                  });
                             speaking.store(false, Ordering::Relaxed);
                             streaming.store(false, Ordering::Relaxed);
                             continue;
@@ -900,21 +1090,26 @@ fn main_loop(
                     t.trim().chars().take(60).collect::<String>()
                 );
                 if t.trim().is_empty() {
-                    emit!(&out_tx, &mut ev_seq, "type": "response.done",
-                          "response": { "id": resp_id, "object": "realtime.response",
-                                        "status": "completed", "output": [] });
+                    emit!(&out_tx, &idg, "type": "response.done",
+                          "response": {
+                              "id": resp_id, "object": "realtime.response",
+                              "status": "completed", "status_details": null,
+                              "output": [], "conversation_id": conv_id,
+                              "output_modalities": ["audio"], "max_output_tokens": "inf",
+                              "usage": null, "metadata": null
+                          });
                     speaking.store(false, Ordering::Relaxed);
                     streaming.store(false, Ordering::Relaxed);
                     continue;
                 }
-                emit!(&out_tx, &mut ev_seq, "type": "conversation.item.input_audio_transcription.completed",
-                      "item_id": user_item_id, "transcript": t);
+                emit!(&out_tx, &idg, "type": "conversation.item.input_audio_transcription.completed",
+                      "item_id": user_item_id, "content_index": 0, "transcript": t);
                 session.lock().unwrap().items.push(ConvItem {
                     id: user_item_id.clone(),
                     role: "user".into(),
                     text: t.clone(),
                 });
-                emit!(&out_tx, &mut ev_seq, "type": "conversation.item.created",
+                emit!(&out_tx, &idg, "type": "conversation.item.added",
                       "previous_item_id": prev_item_id,
                       "item": {
                           "id": user_item_id, "object": "realtime.item", "type": "message",
@@ -967,11 +1162,11 @@ fn main_loop(
         // close it after the TTS worker drains.
         let out_index = 0u32;
         let content_index = 0u32;
-        emit!(&out_tx, &mut ev_seq, "type": "response.output_item.added",
+        emit!(&out_tx, &idg, "type": "response.output_item.added",
               "response_id": resp_id, "output_index": out_index,
               "item": { "id": asst_item_id, "object": "realtime.item", "type": "message",
                         "role": "assistant", "status": "in_progress", "content": [] });
-        emit!(&out_tx, &mut ev_seq, "type": "response.content_part.added",
+        emit!(&out_tx, &idg, "type": "response.content_part.added",
               "response_id": resp_id, "item_id": asst_item_id,
               "output_index": out_index, "content_index": content_index,
               "part": { "type": "audio", "audio": "" });
@@ -998,6 +1193,7 @@ fn main_loop(
         let resp_tts = resp_id.to_string();
         let item_tts = asst_item_id.clone();
         let barge_tts = Arc::clone(&barge);
+        let idg_tts = idg.clone();
         let tts_worker = move || {
             while let Some(sentence) = sen_rx.blocking_recv() {
                 if barge_tts.load(Ordering::Relaxed) {
@@ -1005,7 +1201,7 @@ fn main_loop(
                 }
                 synth_sentence(
                     tts, ref_voice, &sentence, &barge_tts, &out_tts, &resp_tts,
-                    &item_tts, out_index, content_index,
+                    &item_tts, out_index, content_index, &idg_tts,
                 );
             }
         };
@@ -1019,7 +1215,8 @@ fn main_loop(
                 }
                 full_reply.push_str(delta);
                 let _ = out_ref.blocking_send(Out(json!({
-                    "type":"response.audio_transcript.delta","response_id":resp_id,
+                    "event_id": idg.ev(),
+                    "type":"response.output_audio_transcript.delta","response_id":resp_id,
                     "item_id": asst_item_id, "output_index": out_index,
                     "content_index": content_index, "delta": delta
                 })
@@ -1056,7 +1253,8 @@ fn main_loop(
                 if let Some(rest) = splitter.flush() {
                     full_reply.push_str(&rest);
                     let _ = out_tx.blocking_send(Out(json!({
-                        "type":"response.audio_transcript.delta","response_id":resp_id,
+                        "event_id": idg.ev(),
+                        "type":"response.output_audio_transcript.delta","response_id":resp_id,
                         "item_id": asst_item_id, "output_index": out_index,
                         "content_index": content_index, "delta": rest
                     })
@@ -1069,37 +1267,34 @@ fn main_loop(
             drop(sen_tx);
             let _ = handle.join();
         });
-        // Realtime close lifecycle for the assistant audio part. On cancel (barge-in) we
-        // skip the audio/content_part/output_item done events but still surface the
-        // partial transcript + response.done{cancelled}.
+        // Realtime close lifecycle for the assistant audio part. The spec requires
+        // output_audio.done / output_audio_transcript.done / content_part.done /
+        // output_item.done on BOTH completion and cancellation (interrupted/cancelled
+        // still close the in-progress part). The final item carries the transcript as
+        // an `output_audio` content part. status: completed → "completed", cancelled →
+        // the item is "incomplete" while the response itself is "cancelled".
         let status = if barge.load(Ordering::Relaxed) {
             "cancelled"
         } else {
             "completed"
         };
-        if status == "completed" {
-            emit!(&out_tx, &mut ev_seq, "type": "response.audio.done",
-                  "response_id": resp_id, "item_id": asst_item_id,
-                  "output_index": out_index, "content_index": content_index);
-            emit!(&out_tx, &mut ev_seq, "type": "response.audio_transcript.done",
-                  "response_id": resp_id, "item_id": asst_item_id,
-                  "output_index": out_index, "content_index": content_index,
-                  "transcript": full_reply);
-            emit!(&out_tx, &mut ev_seq, "type": "response.content_part.done",
-                  "response_id": resp_id, "item_id": asst_item_id,
-                  "output_index": out_index, "content_index": content_index,
-                  "part": { "type": "audio", "audio": "" });
-            emit!(&out_tx, &mut ev_seq, "type": "response.output_item.done",
-                  "response_id": resp_id, "output_index": out_index,
-                  "item": { "id": asst_item_id, "object": "realtime.item", "type": "message",
-                            "role": "assistant", "status": "completed",
-                            "content": [{ "type": "audio", "audio": "" }] });
-        } else {
-            emit!(&out_tx, &mut ev_seq, "type": "response.audio_transcript.done",
-                  "response_id": resp_id, "item_id": asst_item_id,
-                  "output_index": out_index, "content_index": content_index,
-                  "transcript": full_reply);
-        }
+        let item_status = if status == "completed" { "completed" } else { "incomplete" };
+        emit!(&out_tx, &idg, "type": "response.output_audio.done",
+              "response_id": resp_id, "item_id": asst_item_id,
+              "output_index": out_index, "content_index": content_index);
+        emit!(&out_tx, &idg, "type": "response.output_audio_transcript.done",
+              "response_id": resp_id, "item_id": asst_item_id,
+              "output_index": out_index, "content_index": content_index,
+              "transcript": full_reply);
+        emit!(&out_tx, &idg, "type": "response.content_part.done",
+              "response_id": resp_id, "item_id": asst_item_id,
+              "output_index": out_index, "content_index": content_index,
+              "part": { "type": "output_audio", "transcript": full_reply });
+        emit!(&out_tx, &idg, "type": "response.output_item.done",
+              "response_id": resp_id, "output_index": out_index,
+              "item": { "id": asst_item_id, "object": "realtime.item", "type": "message",
+                        "role": "assistant", "status": item_status,
+                        "content": [{ "type": "output_audio", "transcript": full_reply }] });
         // Push the assistant conversation item (next turn's history includes it), then
         // emit conversation.item.created with the previous item id.
         let prev_for_asst = {
@@ -1113,17 +1308,28 @@ fn main_loop(
             prev
         };
         if status == "completed" {
-            emit!(&out_tx, &mut ev_seq, "type": "conversation.item.created",
+            emit!(&out_tx, &idg, "type": "conversation.item.added",
                   "previous_item_id": prev_for_asst,
                   "item": {
                       "id": asst_item_id, "object": "realtime.item", "type": "message",
                       "role": "assistant", "status": "completed",
-                      "content": [{ "type": "text", "text": full_reply }]
+                      "content": [{ "type": "output_audio", "transcript": full_reply }]
                   });
         }
-        emit!(&out_tx, &mut ev_seq, "type": "response.done",
-              "response": { "id": resp_id, "object": "realtime.response",
-                            "status": status, "output": [] });
+        emit!(&out_tx, &idg, "type": "response.done",
+              "response": {
+                  "id": resp_id, "object": "realtime.response",
+                  "status": status, "status_details": null,
+                  "output": [{
+                      "id": asst_item_id, "type": "message", "status": item_status,
+                      "role": "assistant",
+                      "content": [{ "type": "output_audio", "transcript": full_reply }]
+                  }],
+                  "conversation_id": conv_id,
+                  "output_modalities": ["audio"], "max_output_tokens": "inf",
+                  "audio": { "output": { "format": { "type": "audio/pcm", "rate": OUT_SR }, "voice": "alloy" } },
+                  "usage": null, "metadata": null
+              });
         speaking.store(false, Ordering::Relaxed);
         streaming.store(false, Ordering::Relaxed);
         eprintln!("turn {turn} {status}");
@@ -1219,6 +1425,7 @@ fn synth_sentence(
     item_id: &str,
     output_index: u32,
     content_index: u32,
+    idg: &IdGen,
 ) {
     let resp_id = resp_id.to_string();
     let item_id = item_id.to_string();
@@ -1234,7 +1441,8 @@ fn synth_sentence(
                 }
                 let b64 = downmix_24k_mono_i16_b64(&pcm);
                 let _ = out_tx.blocking_send(Out(
-                    json!({"type":"response.audio.delta","response_id":resp_id,
+                    json!({"event_id": idg.ev(),
+                           "type":"response.output_audio.delta","response_id":resp_id,
                            "item_id":item_id,"output_index":output_index,
                            "content_index":content_index,"delta":b64})
                         .to_string(),
@@ -1279,7 +1487,8 @@ fn synth_sentence(
                 }
                 let b64 = mono_24k_i16_b64(pcm);
                 let _ = out_tx.blocking_send(Out(
-                    json!({"type":"response.audio.delta","response_id":resp_id,
+                    json!({"event_id": idg.ev(),
+                           "type":"response.output_audio.delta","response_id":resp_id,
                            "item_id":item_id,"output_index":output_index,
                            "content_index":content_index,"delta":b64})
                         .to_string(),

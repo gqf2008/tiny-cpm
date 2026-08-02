@@ -166,11 +166,11 @@ fn handle(s: &str, t0: Instant, ft: &mut Option<f64>, fd: &mut Option<f64>, fa: 
             if ft.is_none() { *ft = Some(t); }
             println!("[t+{t:.2}s] ASR → {:?}", v["transcript"].as_str().unwrap_or(""));
         }
-        "response.audio_transcript.delta" => {
+        "response.output_audio_transcript.delta" => {
             // LLM text streaming — accumulate to print the reply at the end.
             if let Some(d) = v["delta"].as_str() { llm.push_str(d); }
         }
-        "response.audio.delta" => {
+        "response.output_audio.delta" => {
             if fa.is_none() {
                 *fa = Some(t);
                 println!("[t+{t:.2}s] first TTS audio");
@@ -187,12 +187,14 @@ fn handle(s: &str, t0: Instant, ft: &mut Option<f64>, fd: &mut Option<f64>, fa: 
         "response.created" => println!("[t+{t:.2}s] response.created"),
         // Log the Realtime lifecycle events added in Phase 4 (others are noisy deltas).
         "input_audio_buffer.committed"
-        | "conversation.item.created"
+        | "conversation.item.added"
+        | "conversation.item.deleted"
         | "response.output_item.added"
         | "response.output_item.done"
         | "response.content_part.added"
         | "response.content_part.done"
-        | "response.audio.done"
+        | "response.output_audio.done"
+        | "response.output_audio_transcript.done"
         | "session.updated" => println!("[t+{t:.2}s] {ty}"),
         _ => {}
     }

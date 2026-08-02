@@ -385,7 +385,7 @@ function onMessage(ev) {
       addMsg('user', m.transcript); break;
     case 'response.created':
       responding = true; setStatus('思考中…', 'busy'); showTyping(); break;
-    case 'response.audio_transcript.delta':
+    case 'response.output_audio_transcript.delta':
       if (m.delta) {
         hideTyping();
         replyBuf += m.delta;
@@ -394,7 +394,7 @@ function onMessage(ev) {
         scrollDown(); setStatus('回复中…', 'busy');
       }
       break;
-    case 'response.audio.delta':
+    case 'response.output_audio.delta':
       if (m.delta) {
         const raw = atob(m.delta); const a = new Uint8Array(raw.length);
         for (let i=0;i<raw.length;i++) a[i]=raw.charCodeAt(i);
@@ -513,8 +513,9 @@ function paintRange(el){ const p = (el.value-el.min)/(el.max-el.min)*100; el.sty
 function buildSession() {
   return { type:'session.update', session: {
     instructions: $('persona').value || null,
-    input_audio_format:'pcm', output_audio_format:'pcm',
-    turn_detection: { type:'server_vad', threshold: parseFloat($('threshold').value), silence_duration_ms: parseInt($('silence').value) },
+    // 2025-08 shape: turn_detection lives under audio.input. The server hardcodes
+    // 16 kHz mono in / 24 kHz mono out, so no format fields are sent.
+    audio: { input: { turn_detection: { type:'server_vad', threshold: parseFloat($('threshold').value), silence_duration_ms: parseInt($('silence').value) } } },
     max_history_turns: parseInt($('hist').value),
   }};
 }
