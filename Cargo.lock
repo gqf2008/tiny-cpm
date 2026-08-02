@@ -2776,15 +2776,18 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "candle-core",
+ "candle-nn",
  "futures-util",
  "serde",
  "serde_json",
  "tiny-cpm",
  "tokenizers",
  "tokio",
+ "tokio-tungstenite",
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "tungstenite",
 ]
 
 [[package]]
