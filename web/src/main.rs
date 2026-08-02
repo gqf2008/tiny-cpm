@@ -858,12 +858,15 @@ fn main_loop(
                     let _ = sen_tx.blocking_send(sentence);
                 }
             };
-            // no_think=true: append an empty think block so MiniCPM5 answers
-            // directly. With thinking enabled (false), a reply that never emits
-            // `</think>` makes chat.rs's `printed==0` fallback dump the whole
-            // reasoning stream into the transcript AND the TTS splitter — the
-            // model literally speaks its inner monologue. Voice replies should
-            // be fast and direct anyway, so we skip reasoning.
+            // Think mode (no_think=false): MiniCPM5-1B needs its <think> block
+            // to answer properly. no_think (an empty pre-closed think block)
+            // was measurably broken on multi-turn turns: with history in the
+            // prompt, the 1B model repeated the previous assistant text
+            // verbatim (8 tokens: "你好！有什么我可以帮助你的吗？") for every new
+            // question instead of answering. In think mode it reasons inside
+            // <think>…</think> and stream_clean only forwards post-think text
+            // to the sink, so the reasoning is never displayed or spoken.
+            // 1024 tokens covers thinking + answer (~260 tokens measured).
             let _ = chat::generate_reply_with_history(
                 llm,
                 tokenizer,
@@ -871,7 +874,7 @@ fn main_loop(
                 Some(&persona),
                 &history,
                 &transcript,
-                true,
+                false,
                 DEFAULT_MAX_TOKENS,
                 &mut sink,
                 Some(&barge),
