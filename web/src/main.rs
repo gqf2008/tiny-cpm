@@ -740,6 +740,7 @@ fn main_loop(
                     "=== turn {turn}: utterance {:.2}s ===",
                     samples.len() as f32 / VAD_SAMPLE_RATE as f32
                 );
+                let t_asr = std::time::Instant::now();
                 let t = {
                     let mut e = eng.lock().unwrap();
                     match e.asr.transcribe_samples(&samples, ASR_MAX_TOKENS) {
@@ -756,6 +757,11 @@ fn main_loop(
                         }
                     }
                 };
+                eprintln!(
+                    "turn {turn}: asr {:.2}s → \"{}\"",
+                    t_asr.elapsed().as_secs_f64(),
+                    t.trim().chars().take(60).collect::<String>()
+                );
                 if t.trim().is_empty() {
                     let _ = out_tx.blocking_send(Out(json!({
                         "type":"response.done","response":{"id":resp_id,"status":"completed"}

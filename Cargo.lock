@@ -2778,6 +2778,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "futures-util",
+ "hound",
  "serde",
  "serde_json",
  "tiny-cpm",
