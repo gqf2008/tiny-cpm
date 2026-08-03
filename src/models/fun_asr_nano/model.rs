@@ -1,7 +1,11 @@
 //! Ported from aha (github.com/jhqxxx/aha) src/models/fun_asr_nano/model.rs
-use anyhow::{Result, anyhow};
-use candle_core::{D, IndexOp, Tensor};
-use candle_nn::{Conv1d, LayerNorm, Linear, Module, VarBuilder, linear, ops::softmax_last_dim};
+use anyhow::{Result, anyhow, bail};
+use candle_core::{D, Device, IndexOp, Tensor};
+use candle_core::quantized::GgmlDType;
+use candle_nn::{
+    Conv1d, Embedding, LayerNorm, Linear, Module, RmsNorm, VarBuilder, embedding, linear,
+    linear_no_bias, rms_norm, ops::softmax_last_dim,
+};
 
 use crate::{
     common::{
@@ -14,9 +18,12 @@ use crate::{
     models::{
         fun_asr_nano::config::FunASRNanoConfig,
         qwen3::{config::Qwen3Config, model::Qwen3Model},
+        qwen3_tts::quantized_talker,
     },
-    position_embed::sinusoidal::SinusoidalPositionEncoderCat,
-    utils::tensor_utils::{attn_masked_fill, get_equal_mask, masked_scatter_dim0},
+    position_embed::{rope::RoPE, sinusoidal::SinusoidalPositionEncoderCat},
+    utils::tensor_utils::{
+        attn_masked_fill, get_equal_mask, masked_scatter_dim0, prepare_causal_attention_mask,
+    },
 };
 
 pub struct MultiHeadedAttentionSANM {
@@ -577,10 +584,200 @@ impl AudioAdaptor {
     }
 }
 
+/// Quant-only mirror of the Qwen3 LLM fields Fun-ASR needs, with a
+/// `QuantizedTalkerBackbone` in place of `Vec<Qwen3DecoderLayer>`. Lives here
+/// (not in `qwen3/model.rs`) because the `qwen3` leaf cannot depend on
+/// `qwen3_tts` (cycle: `qwen3_tts -> qwen3`). The forward mirrors
+/// `Qwen3Model::forward_hidden` + `forward` exactly; the backbone returns raw
+/// (unnormed) F32 output, cast to the embed dtype before the single `norm` +
+/// `lm_head` (no double-norm). `kv_pos == seqlen_offset` for the preallocated KV.
+pub struct FunAsrQuantLlm {
+    embed_tokens: Embedding,
+    backbone: quantized_talker::QuantizedTalkerBackbone,
+    norm: RmsNorm,
+    rotary: RoPE,
+    lm_head: Linear,
+    kv_cap: usize,
+}
+
+impl FunAsrQuantLlm {
+    /// `vb_metal` is the `llm`-rooted Metal builder (embed/norm/lm_head stay BF16);
+    /// `vb_cpu` is the repo-root CPU builder — `load_stack` prefixes `llm.model`
+    /// itself (Fun-ASR's LLM keys are `llm.model.layers.N.*`, per Qwen3Model::new's
+    /// auto-`model` prefix).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        vb_metal: VarBuilder,
+        vb_cpu: VarBuilder,
+        cfg: &Qwen3Config,
+        quant: GgmlDType,
+        kv_cap: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        // Mirror Qwen3Model::new's conditional `model.` prefix — Fun-ASR's LLM keys
+        // are `llm.model.*`, so embed/norm/lm_head sit one level deeper than the
+        // `llm`-rooted vb_metal we receive.
+        let vb_metal = if vb_metal.contains_tensor("model.embed_tokens.weight") {
+            vb_metal.pp("model")
+        } else {
+            vb_metal
+        };
+        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_metal.pp("embed_tokens"))?;
+        let backbone = quantized_talker::load_stack(
+            &vb_cpu,
+            "llm.model",
+            cfg.num_hidden_layers,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.intermediate_size,
+            cfg.rms_norm_eps,
+            quant,
+            kv_cap,
+            device,
+        )?;
+        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_metal.pp("norm"))?;
+        let rotary = RoPE::new(cfg.head_dim, cfg.rope_theta, device)?;
+        let lm_head = if cfg.tie_word_embeddings {
+            Linear::new(embed_tokens.embeddings().clone(), None)
+        } else {
+            linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb_metal.pp("lm_head"))?
+        };
+        Ok(Self {
+            embed_tokens,
+            backbone,
+            norm,
+            rotary,
+            lm_head,
+            kv_cap,
+        })
+    }
+
+    pub fn embedding_token_id(&self, input_ids: &Tensor) -> Result<Tensor> {
+        Ok(self.embed_tokens.forward(input_ids)?)
+    }
+
+    pub fn forward(
+        &mut self,
+        input_ids: Option<&Tensor>,
+        inputs_embeds: Option<&Tensor>,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        let inputs_embeds = if let Some(inputs_embeds) = inputs_embeds {
+            inputs_embeds.clone()
+        } else {
+            let input_ids = input_ids.unwrap();
+            self.embed_tokens.forward(input_ids)?
+        };
+        let (bs, seq_len, _) = inputs_embeds.dims3()?;
+        let attention_mask: Option<Tensor> = if seq_len <= 1 {
+            None
+        } else {
+            Some(prepare_causal_attention_mask(
+                bs,
+                seq_len,
+                0,
+                inputs_embeds.device(),
+            )?)
+        };
+        let (cos, sin) = self
+            .rotary
+            .forward(seqlen_offset, seq_len, inputs_embeds.device())?;
+        if seqlen_offset + seq_len > self.kv_cap {
+            bail!(
+                "Fun-ASR quant KV cap ({}) exceeded at position {}+{}; raise TINY_CPM_FUNASR_KV_CAP",
+                self.kv_cap,
+                seqlen_offset,
+                seq_len
+            );
+        }
+        let mut hs = self
+            .backbone
+            .forward(&inputs_embeds, &cos, &sin, attention_mask.as_ref(), seqlen_offset)?;
+        // Quant backbone returns F32 (QMatMul constraint); cast back for norm/lm_head.
+        hs = hs.to_dtype(inputs_embeds.dtype())?;
+        let hs = self.norm.forward(&hs)?;
+        let hs = hs.narrow(1, seq_len - 1, 1)?;
+        let logits = self.lm_head.forward(&hs)?;
+        Ok(logits)
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        self.backbone.clear_kv_cache();
+    }
+}
+
+/// Fun-ASR's LLM: either the BF16 `Qwen3Model` (default) or the quantized
+/// `FunAsrQuantLlm` (opt-in via `--quant`). Dispatches the three callsites
+/// `FunAsrNanoModel` uses (embedding_token_id / forward / clear_kv_cache).
+pub enum FunAsrLlm {
+    Full(Qwen3Model),
+    Quant(FunAsrQuantLlm),
+}
+
+impl FunAsrLlm {
+    pub fn embedding_token_id(&self, input_ids: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Full(m) => m.embedding_token_id(input_ids),
+            Self::Quant(m) => m.embedding_token_id(input_ids),
+        }
+    }
+
+    pub fn forward(
+        &mut self,
+        input_ids: Option<&Tensor>,
+        inputs_embeds: Option<&Tensor>,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Full(m) => m.forward(input_ids, inputs_embeds, seqlen_offset),
+            Self::Quant(m) => m.forward(input_ids, inputs_embeds, seqlen_offset),
+        }
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        match self {
+            Self::Full(m) => m.clear_kv_cache(),
+            Self::Quant(m) => m.clear_kv_cache(),
+        }
+    }
+}
+
+/// Build the SenseVoice audio encoder + adaptor (shared by the BF16 and quantized
+/// constructors — only the LLM stack differs between them).
+fn build_audio(
+    vb: &VarBuilder,
+    config: &FunASRNanoConfig,
+) -> Result<(SenseVoiceEncoderSmall, AudioAdaptor)> {
+    let input_size = config.frontend_conf.lfr_m * config.frontend_conf.n_mels;
+    let audio_encoder = SenseVoiceEncoderSmall::new(
+        vb.pp("audio_encoder"),
+        input_size,
+        config.audio_encoder_conf.output_size,
+        config.audio_encoder_conf.attention_heads,
+        config.audio_encoder_conf.linear_units,
+        config.audio_encoder_conf.num_blocks,
+        config.audio_encoder_conf.tp_blocks,
+        config.audio_encoder_conf.normalize_before,
+        config.audio_encoder_conf.kernel_size,
+        config.audio_encoder_conf.sanm_shfit,
+    )?;
+    let audio_adaptor = AudioAdaptor::new(
+        vb.pp("audio_adaptor"),
+        config.audio_adaptor_conf.downsample_rate,
+        config.audio_adaptor_conf.encoder_dim,
+        config.audio_adaptor_conf.llm_dim,
+        config.audio_adaptor_conf.ffn_dim,
+        config.audio_adaptor_conf.n_layer,
+        8,
+    )?;
+    Ok((audio_encoder, audio_adaptor))
+}
+
 pub struct FunAsrNanoModel {
     audio_encoder: SenseVoiceEncoderSmall,
     audio_adaptor: AudioAdaptor,
-    llm: Qwen3Model,
+    llm: FunAsrLlm,
     stop_token_ids: Vec<u32>,
 }
 impl FunAsrNanoModel {
@@ -590,29 +787,38 @@ impl FunAsrNanoModel {
         llm_cfg: &Qwen3Config,
         eos_ids: Vec<u32>,
     ) -> Result<Self> {
-        let input_size = config.frontend_conf.lfr_m * config.frontend_conf.n_mels;
-        let audio_encoder = SenseVoiceEncoderSmall::new(
-            vb.pp("audio_encoder"),
-            input_size,
-            config.audio_encoder_conf.output_size,
-            config.audio_encoder_conf.attention_heads,
-            config.audio_encoder_conf.linear_units,
-            config.audio_encoder_conf.num_blocks,
-            config.audio_encoder_conf.tp_blocks,
-            config.audio_encoder_conf.normalize_before,
-            config.audio_encoder_conf.kernel_size,
-            config.audio_encoder_conf.sanm_shfit,
-        )?;
-        let audio_adaptor = AudioAdaptor::new(
-            vb.pp("audio_adaptor"),
-            config.audio_adaptor_conf.downsample_rate,
-            config.audio_adaptor_conf.encoder_dim,
-            config.audio_adaptor_conf.llm_dim,
-            config.audio_adaptor_conf.ffn_dim,
-            config.audio_adaptor_conf.n_layer,
-            8,
-        )?;
-        let llm = Qwen3Model::new(llm_cfg, vb.pp("llm"), vec![])?;
+        let (audio_encoder, audio_adaptor) = build_audio(&vb, config)?;
+        let llm = FunAsrLlm::Full(Qwen3Model::new(llm_cfg, vb.pp("llm"), vec![])?);
+        Ok(Self {
+            audio_encoder,
+            audio_adaptor,
+            llm,
+            stop_token_ids: eos_ids,
+        })
+    }
+
+    /// Quantized LLM stack (opt-in). The audio encoder + adaptor load BF16 from
+    /// `vb`; only the LLM decoder layers quantize from the CPU-mmaped `vb_cpu`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_quantized(
+        vb: VarBuilder,
+        vb_cpu: VarBuilder,
+        config: &FunASRNanoConfig,
+        llm_cfg: &Qwen3Config,
+        eos_ids: Vec<u32>,
+        quant: GgmlDType,
+        kv_cap: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let (audio_encoder, audio_adaptor) = build_audio(&vb, config)?;
+        let llm = FunAsrLlm::Quant(FunAsrQuantLlm::new(
+            vb.pp("llm"),
+            vb_cpu,
+            llm_cfg,
+            quant,
+            kv_cap,
+            device,
+        )?);
         Ok(Self {
             audio_encoder,
             audio_adaptor,
