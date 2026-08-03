@@ -29,6 +29,7 @@ use candle_nn::VarBuilder;
 use tiny_cpm::common::modules::eager_attention_forward;
 use tiny_cpm::models::qwen3::config::Qwen3Config;
 use tiny_cpm::models::qwen3::model::Qwen3DecoderLayer;
+use tiny_cpm::models::qwen3_asr::config::{Qwen3ASRConfig, qwen3asr_text_config2qwen3_config};
 use tiny_cpm::models::qwen3_tts::config::{CodePredictorConfig, TalkerConfig};
 use tiny_cpm::models::qwen3_tts::quantized_talker;
 use tiny_cpm::models::qwen3_tts::rope_fused::apply_rope_fused;
@@ -231,6 +232,44 @@ fn mirror_predictor_layer_matches_reference_decode() {
         &qwen3_cfg_predictor(&cpc),
         cpc.hidden_size,
         cpc.rope_theta as f32,
+        &vb_f32,
+        &vb_cpu,
+    );
+}
+
+/// ASR thinker layer 0 vs mirror — the same double-RMSNorm / RoPE-layout guard
+/// as the talker/predictor checks, but at the Qwen3-ASR decoder dims (the shared
+/// `Qwen3DecoderLayer` the ASR thinker builds its stack from, and the layer the
+/// upcoming decoder-quantization lever will swap for a `QuantizedTalkerBackbone`).
+/// A wiring regression in that shared layer localizes here. Skips when
+/// `models/Qwen3-ASR-0.6B` is absent.
+#[test]
+fn mirror_asr_layer_matches_reference_decode() {
+    let asr_dir = "models/Qwen3-ASR-0.6B";
+    if !std::path::Path::new(&format!("{asr_dir}/model.safetensors")).exists() {
+        eprintln!("skip: {asr_dir} absent (needs Qwen3-ASR weights)");
+        return;
+    }
+    let device = Device::new_metal(0).unwrap();
+    let cfg: Qwen3ASRConfig =
+        serde_json::from_str(&std::fs::read_to_string(format!("{asr_dir}/config.json")).unwrap())
+            .unwrap();
+    let text = cfg.thinker_config.text_config;
+    let qcfg = qwen3asr_text_config2qwen3_config(&text);
+
+    let files = [format!("{asr_dir}/model.safetensors")];
+    let vb_f32 =
+        unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::F32, &device).unwrap() };
+    let vb_cpu =
+        unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::F32, &Device::Cpu).unwrap() };
+
+    check_layer0_matches(
+        &device,
+        "asr",
+        "thinker.model",
+        &qcfg,
+        text.hidden_size,
+        text.rope_theta as f32,
         &vb_f32,
         &vb_cpu,
     );

@@ -12,8 +12,8 @@
 
 use std::time::Instant;
 
-use anyhow::{Result, bail};
-use candle_core::{DType, Device, Tensor};
+use anyhow::{Result, anyhow, bail};
+use candle_core::{DType, Device, Tensor, quantized::GgmlDType};
 use candle_nn::VarBuilder;
 
 use crate::{
@@ -39,7 +39,12 @@ const DEFAULT_TEMPLATE: &str = "<|im_start|>system\n<|im_end|>\n<|im_start|>user
 /// Qwen3ASR outputs format: "language English<asr_text>The morning sun..."
 /// This function extracts the text after "<asr_text>" marker.
 /// If no marker is found, returns the original text trimmed (for compatibility).
-fn clean_asr_response(raw: &str) -> String {
+///
+/// `#[doc(hidden)] pub`: exposed only so `tests/asr_correctness.rs` can compare
+/// the cleaned transcript against a committed golden; not part of the crate API
+/// (mirrors the `gpu_sample_token` test-only export in `talker.rs`).
+#[doc(hidden)]
+pub fn clean_asr_response(raw: &str) -> String {
     if let Some(start) = raw.find("<asr_text>") {
         raw[start + "<asr_text>".len()..].trim().to_string()
     } else {
@@ -77,6 +82,18 @@ fn find_type_files(path: &str, extension_type: &str) -> Result<Vec<String>> {
     Ok(files)
 }
 
+/// Parse the `--quant` / `TINY_CPM_ASR_QUANT` value. `none`/empty → BF16 (default);
+/// `q8_0` → `Q8_0` (greedy ASR stays token-exact); `q4_k` → `Q4K` (faster, may flip
+/// occasional tokens — measure CER). Same knob set as chat's `TINY_CPM_QUANT`.
+fn parse_asr_quant(s: &str) -> Result<Option<GgmlDType>> {
+    Ok(match s.trim().to_ascii_lowercase().as_str() {
+        "" | "none" => None,
+        "q8_0" | "q8" => Some(GgmlDType::Q8_0),
+        "q4_k" | "q4k" => Some(GgmlDType::Q4K),
+        other => bail!("unknown ASR quant '{other}' (expected q8_0 | q4_k | none)"),
+    })
+}
+
 /// Qwen3-ASR model + processor + tokenizer, loaded once and reusable.
 /// Also serves as the ASR stage of the `live` subcommand.
 pub struct Qwen3AsrEngine {
@@ -90,11 +107,34 @@ pub struct Qwen3AsrEngine {
     eos_token_id1: u32,
     eos_token_id2: u32,
     temperature: f32,
+    /// generation_config.json `do_sample`. Qwen3-ASR ships `do_sample: false`
+    /// (greedy) — honored below so the decode loop uses ArgMax instead of a
+    /// temperature-1e-6 multinomial over the full 151936 vocab (which forces a
+    /// ~607KB GPU→CPU logits readback + softmax + O(V) CPU draw every token).
+    do_sample: bool,
 }
 
 impl Qwen3AsrEngine {
     /// aha Qwen3AsrGenerateModel::init: tokenizer + configs + safetensors.
+    /// Quant level comes from `TINY_CPM_ASR_QUANT` (none/q8_0/q4_k); `--quant` on
+    /// the CLI calls [`Self::load_with_quant`] directly.
     pub fn load(model_dir: &str, device: &Device) -> Result<Self> {
+        let quant = match std::env::var("TINY_CPM_ASR_QUANT") {
+            Ok(s) => parse_asr_quant(&s)?,
+            Err(_) => None,
+        };
+        Self::load_with_quant(model_dir, device, quant)
+    }
+
+    /// Like [`Self::load`] but with an explicit quant level (`None` = BF16). When
+    /// `Some`, the 28 thinker decoder layers are quantized in-memory from a
+    /// CPU-mmaped copy of the safetensors (`quantize_onto` needs a CPU source); the
+    /// audio tower / embeddings / lm_head stay BF16 from the Metal mmap.
+    pub fn load_with_quant(
+        model_dir: &str,
+        device: &Device,
+        quant: Option<GgmlDType>,
+    ) -> Result<Self> {
         let tokenizer = TokenizerModel::init(model_dir)?;
         let generation_config_path = model_dir.to_string() + "/generation_config.json";
         let generation_config: Qwen3ASRGenerationConfig =
@@ -114,7 +154,39 @@ impl Qwen3AsrEngine {
             bail!("no safetensors files found in {model_dir}");
         }
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_list, dtype, device)? };
-        let model = Qwen3ASRModel::new(vb, &cfg, generation_config.eos_token_id.clone())?;
+        // kv_cap for the quant path's preallocated KV (the BF16 path's Tensor::cat
+        // cache is uncapped). 4096 covers ~300s of audio at ~13 tokens/s; raise via
+        // TINY_CPM_ASR_KV_CAP for longer single-chunk audio.
+        let kv_cap = std::env::var("TINY_CPM_ASR_KV_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4096);
+        let model = match quant {
+            Some(g) => {
+                let tq = Instant::now();
+                let vb_cpu = unsafe {
+                    VarBuilder::from_mmaped_safetensors(&model_list, dtype, &Device::Cpu)?
+                };
+                let m = Qwen3ASRModel::new_quantized(
+                    vb,
+                    vb_cpu,
+                    &cfg,
+                    generation_config.eos_token_id.clone(),
+                    g,
+                    kv_cap,
+                    device,
+                )?;
+                eprintln!(
+                    "qwen3-asr: thinker backbone = {g:?} (quantized in {:.2?}, kv_cap={kv_cap})",
+                    tq.elapsed()
+                );
+                m
+            }
+            None => {
+                eprintln!("qwen3-asr: thinker backbone = bf16");
+                Qwen3ASRModel::new(vb, &cfg, generation_config.eos_token_id.clone())?
+            }
+        };
         Ok(Self {
             device: device.clone(),
             tokenizer,
@@ -125,6 +197,7 @@ impl Qwen3AsrEngine {
             eos_token_id1: generation_config.eos_token_id[0],
             eos_token_id2: generation_config.eos_token_id[1],
             temperature: generation_config.temperature,
+            do_sample: generation_config.do_sample,
         })
     }
 
@@ -145,7 +218,13 @@ impl Qwen3AsrEngine {
     ) -> Result<(String, usize, usize, usize, std::time::Duration)> {
         let seed = 34562u64;
         let prof = std::env::var("ASR_PROF").is_ok();
-        let mut logit_processor = get_logit_processor(Some(self.temperature), None, None, seed);
+        // Honor do_sample: Qwen3-ASR ships do_sample=false (greedy). Passing the
+        // config's temperature=1e-6 anyway would build Sampling::All, which does a
+        // full-vocab divide+softmax, a ~607KB GPU→CPU readback and an O(V) CPU
+        // multinomial per token. temperature=None → candle Sampling::ArgMax (one
+        // argmax kernel + a 4-byte readback), which is what greedy decode means.
+        let temperature = if self.do_sample { Some(self.temperature) } else { None };
+        let mut logit_processor = get_logit_processor(temperature, None, None, seed);
         let i_start = Instant::now();
         // Opt ASR decode into the qwen3-tts fused SDPA path (simd_sum + fast::exp,
         // skips repeat_kv and its contiguous copy — both O(KV) per token). Prefill
@@ -298,23 +377,50 @@ impl Qwen3AsrEngine {
 }
 
 pub fn run(args: &[String]) -> Result<()> {
-    let Some(model_dir) = args.first() else {
-        bail!("usage: tiny-cpm asr qwen3 <model-dir> <audio-file> [max_tokens]");
+    // Pull `--quant <name>` / `--quant=<name>` out of the args; the rest are
+    // positionals. Without `--quant`, fall back to TINY_CPM_ASR_QUANT via load().
+    let mut quant: Option<GgmlDType> = None;
+    let mut positional: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--quant" {
+            let v = args
+                .get(i + 1)
+                .ok_or_else(|| anyhow!("--quant needs a value (q8_0 | q4_k | none)"))?;
+            quant = parse_asr_quant(v)?;
+            i += 2;
+        } else if let Some(v) = a.strip_prefix("--quant=") {
+            quant = parse_asr_quant(v)?;
+            i += 1;
+        } else {
+            positional.push(a.clone());
+            i += 1;
+        }
+    }
+    const USAGE: &str =
+        "usage: tiny-cpm asr qwen3 <model-dir> <audio-file> [max_tokens] [--quant q8_0|q4_k|none]";
+    let Some(model_dir) = positional.first() else {
+        bail!("{USAGE}");
     };
-    let Some(audio_file) = args.get(1) else {
-        bail!("usage: tiny-cpm asr qwen3 <model-dir> <audio-file> [max_tokens]");
+    let Some(audio_file) = positional.get(1) else {
+        bail!("{USAGE}");
     };
-    let max_tokens: usize = match args.get(2) {
+    let max_tokens: usize = match positional.get(2) {
         Some(s) => s
             .parse()
-            .map_err(|_| anyhow::anyhow!("invalid max_tokens: {s}"))?,
+            .map_err(|_| anyhow!("invalid max_tokens: {s}"))?,
         None => 512, // same default as aha's asr_audio
     };
 
     let device = Device::new_metal(0)?;
 
     let i_start = Instant::now();
-    let mut engine = Qwen3AsrEngine::load(model_dir, &device)?;
+    let mut engine = if let Some(q) = quant {
+        Qwen3AsrEngine::load_with_quant(model_dir, &device, Some(q))?
+    } else {
+        Qwen3AsrEngine::load(model_dir, &device)? // honors TINY_CPM_ASR_QUANT
+    };
     eprintln!(
         "loaded model in {:?} ({} safetensors shard(s), dtype {:?})",
         i_start.elapsed(),

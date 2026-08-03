@@ -1,6 +1,7 @@
 //! Ported from aha (github.com/jhqxxx/aha) src/models/qwen3_asr/model.rs
-use anyhow::Result;
-use candle_core::Tensor;
+use anyhow::{Result, bail};
+use candle_core::{Device, Tensor};
+use candle_core::quantized::GgmlDType;
 use candle_nn::{
     Activation, Conv2d, Embedding, LayerNorm, Linear, Module, RmsNorm, VarBuilder, embedding,
     linear, linear_no_bias, rms_norm,
@@ -20,6 +21,7 @@ use crate::{
             },
             processor::get_feat_extract_output_lengths,
         },
+        qwen3_tts::quantized_talker,
     },
     position_embed::{rope::Qwen3VLTextRotaryEmbedding, sinusoidal::SinusoidalPositionEncoderCat},
     utils::tensor_utils::{
@@ -225,12 +227,65 @@ impl Qwen3ASRAudioEncoder {
     }
 }
 
+/// Decoder stack for the ASR thinker text model: either the BF16
+/// `Vec<Qwen3DecoderLayer>` (default) or a `QuantizedTalkerBackbone` (QMatMul
+/// mirror, opt-in via `--quant`). The quant arm is the SAME struct the Qwen3-TTS
+/// talker drives — both ASR LLMs run the identical `Qwen3DecoderLayer` it mirrors —
+/// so `quantized_talker::load_stack` builds it verbatim with the ASR prefix/dims.
+/// The quant arm additionally carries the preallocated-KV + fused-RoPE append the
+/// talker banked (no per-step `Tensor::cat`), so ASR gets quant + cat-removal in
+/// one switch.
+enum AsrTextBackbone {
+    Full(Vec<Qwen3DecoderLayer>),
+    Quant(quantized_talker::QuantizedTalkerBackbone),
+}
+
+impl AsrTextBackbone {
+    /// Run the stack over `xs` (1, T, hidden). `kv_pos` is the KV write position for
+    /// the Quant arm (= seqlen_offset: prefill at 0, decode at the cumulative
+    /// position); the Full arm tracks its own per-layer caches and ignores it.
+    fn forward(
+        &mut self,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention_mask: Option<&Tensor>,
+        kv_pos: usize,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Full(layers) => {
+                let mut xs = xs.clone();
+                for layer in layers.iter_mut() {
+                    xs = layer.forward(&xs, cos, sin, attention_mask)?;
+                }
+                Ok(xs)
+            }
+            Self::Quant(b) => b.forward(xs, cos, sin, attention_mask, kv_pos),
+        }
+    }
+
+    fn clear_kv_cache(&mut self) {
+        match self {
+            Self::Full(layers) => {
+                for layer in layers.iter_mut() {
+                    layer.clear_kv_cache()
+                }
+            }
+            Self::Quant(b) => b.clear_kv_cache(),
+        }
+    }
+}
+
 pub struct Qwen3ASRThinkerTextModel {
     embed_tokens: Embedding,
-    layers: Vec<Qwen3DecoderLayer>,
+    backbone: AsrTextBackbone,
     norm: RmsNorm,
     rotary_emb: Qwen3VLTextRotaryEmbedding,
     mrope_section: Vec<usize>,
+    /// Preallocated-KV capacity (Quant arm only); `usize::MAX` for the Full arm
+    /// (uncapped, grows via `Tensor::cat`). Guarded in `forward` so the quant path
+    /// never writes past the buffer.
+    kv_cap: usize,
 }
 
 impl Qwen3ASRThinkerTextModel {
@@ -247,10 +302,52 @@ impl Qwen3ASRThinkerTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(cfg.head_dim, cfg.rope_theta);
         Ok(Self {
             embed_tokens,
-            layers,
+            backbone: AsrTextBackbone::Full(layers),
             norm,
             rotary_emb,
             mrope_section: cfg.rope_scaling.mrope_section.clone(),
+            kv_cap: usize::MAX,
+        })
+    }
+
+    /// Quantized backbone (`--quant`). `vb` is the Metal `thinker.model` builder
+    /// (embed_tokens / norm stay full-precision BF16); `vb_cpu` is the repo-root
+    /// CPU-mmaped builder — `quantized_talker::load_stack` quantizes the 28 decoder
+    /// layers from it (`quantize_onto` needs a CPU source) and prefixes
+    /// `thinker.model` itself. `kv_cap` is the preallocated-KV capacity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_quantized(
+        vb: VarBuilder,
+        vb_cpu: VarBuilder,
+        cfg: &Qwen3ASRTextConfig,
+        quant: GgmlDType,
+        kv_cap: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
+        let qwen3cfg = qwen3asr_text_config2qwen3_config(cfg);
+        let backbone = quantized_talker::load_stack(
+            &vb_cpu,
+            "thinker.model",
+            qwen3cfg.num_hidden_layers,
+            qwen3cfg.num_attention_heads,
+            qwen3cfg.num_key_value_heads,
+            qwen3cfg.head_dim,
+            qwen3cfg.intermediate_size,
+            qwen3cfg.rms_norm_eps,
+            quant,
+            kv_cap,
+            device,
+        )?;
+        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
+        let rotary_emb = Qwen3VLTextRotaryEmbedding::new(cfg.head_dim, cfg.rope_theta);
+        Ok(Self {
+            embed_tokens,
+            backbone: AsrTextBackbone::Quant(backbone),
+            norm,
+            rotary_emb,
+            mrope_section: cfg.rope_scaling.mrope_section.clone(),
+            kv_cap,
         })
     }
 
@@ -277,7 +374,6 @@ impl Qwen3ASRThinkerTextModel {
             input_embeds.dtype(),
             self.mrope_section.clone(),
         )?;
-        let mut xs = input_embeds.clone();
         let attention_mask: Option<Tensor> = {
             if seq_len <= 1 {
                 None
@@ -290,17 +386,31 @@ impl Qwen3ASRThinkerTextModel {
                 )?)
             }
         };
-        for layer in self.layers.iter_mut() {
-            xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
+        // kv_pos == seqlen_offset for the Quant arm (prefill at 0, decode at the
+        // cumulative position); the Full arm ignores it. Guard the cap so the quant
+        // path never writes past its preallocated KV buffer.
+        let kv_pos = seqlen_offset;
+        if kv_pos + seq_len > self.kv_cap {
+            bail!(
+                "Qwen3-ASR quant KV cap ({}) exceeded at position {}+{}; raise TINY_CPM_ASR_KV_CAP \
+                 (default 4096 covers ~300s of audio at ~13 tokens/s)",
+                self.kv_cap,
+                kv_pos,
+                seq_len
+            );
         }
+        let mut xs = self
+            .backbone
+            .forward(input_embeds, &cos, &sin, attention_mask.as_ref(), kv_pos)?;
+        // The Quant backbone runs/returns F32 (QMatMul Metal constraint); cast back to
+        // the thinker dtype for the shared norm + lm_head. No-op for the Full arm.
+        xs = xs.to_dtype(input_embeds.dtype())?;
         let xs = self.norm.forward(&xs)?;
         Ok(xs)
     }
 
     pub fn clear_kv_cache(&mut self) {
-        for layer in self.layers.iter_mut() {
-            layer.clear_kv_cache()
-        }
+        self.backbone.clear_kv_cache();
     }
 }
 
@@ -315,6 +425,44 @@ impl Qwen3ASRThinker {
     pub fn new(vb: VarBuilder, config: &ThinkerConfig) -> Result<Self> {
         let audio_tower = Qwen3ASRAudioEncoder::new(vb.pp("audio_tower"), &config.audio_config)?;
         let model = Qwen3ASRThinkerTextModel::new(vb.pp("model"), &config.text_config)?;
+        let lm_head = if config.text_config.tie_word_embeddings {
+            Linear::new(model.embed_tokens.embeddings().clone(), None)
+        } else {
+            linear_no_bias(
+                config.text_config.hidden_size,
+                config.text_config.vocab_size,
+                vb.pp("lm_head"),
+            )?
+        };
+        Ok(Self {
+            audio_tower,
+            model,
+            audio_token_id: config.audio_token_id,
+            lm_head,
+        })
+    }
+
+    /// Quantized thinker: the audio tower + lm_head load from `vb` (Metal, BF16);
+    /// only the text-decoder layers quantize from `vb_cpu` (CPU mmap). See
+    /// [`Qwen3ASRThinkerTextModel::new_quantized`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_quantized(
+        vb: VarBuilder,
+        vb_cpu: VarBuilder,
+        config: &ThinkerConfig,
+        quant: GgmlDType,
+        kv_cap: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let audio_tower = Qwen3ASRAudioEncoder::new(vb.pp("audio_tower"), &config.audio_config)?;
+        let model = Qwen3ASRThinkerTextModel::new_quantized(
+            vb.pp("model"),
+            vb_cpu,
+            &config.text_config,
+            quant,
+            kv_cap,
+            device,
+        )?;
         let lm_head = if config.text_config.tie_word_embeddings {
             Linear::new(model.embed_tokens.embeddings().clone(), None)
         } else {
@@ -372,6 +520,33 @@ pub struct Qwen3ASRModel {
 impl Qwen3ASRModel {
     pub fn new(vb: VarBuilder, config: &Qwen3ASRConfig, eos_ids: Vec<u32>) -> Result<Self> {
         let thinker = Qwen3ASRThinker::new(vb.pp("thinker"), &config.thinker_config)?;
+        Ok(Self {
+            thinker,
+            stop_token_ids: eos_ids,
+        })
+    }
+
+    /// Quantized thinker decoder (opt-in). `vb` is the repo-root Metal builder; the
+    /// audio tower / lm_head / embeddings stay BF16 from it, only the decoder layers
+    /// quantize from the repo-root CPU-mmaped `vb_cpu`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_quantized(
+        vb: VarBuilder,
+        vb_cpu: VarBuilder,
+        config: &Qwen3ASRConfig,
+        eos_ids: Vec<u32>,
+        quant: GgmlDType,
+        kv_cap: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let thinker = Qwen3ASRThinker::new_quantized(
+            vb.pp("thinker"),
+            vb_cpu,
+            &config.thinker_config,
+            quant,
+            kv_cap,
+            device,
+        )?;
         Ok(Self {
             thinker,
             stop_token_ids: eos_ids,

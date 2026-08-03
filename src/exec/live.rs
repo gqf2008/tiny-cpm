@@ -690,8 +690,16 @@ pub fn run(args: &[String]) -> Result<()> {
     );
 
     let t = Instant::now();
-    let mut asr = Qwen3AsrEngine::load(asr_dir, &device)?;
-    eprintln!("loaded Qwen3-ASR in {:.2}s", t.elapsed().as_secs_f64());
+    // Realtime path defaults to a quantized ASR thinker (Q4_K): ~3× faster decode,
+    // verified near-lossless (greedy transcript token-exact on zh, one-comma-off on
+    // en vs BF16). VAD segments are seconds-long, well under the kv_cap. Override
+    // to BF16 by editing here (load_with_quant(.., None)).
+    let mut asr = Qwen3AsrEngine::load_with_quant(
+        asr_dir,
+        &device,
+        Some(candle_core::quantized::GgmlDType::Q4K),
+    )?;
+    eprintln!("loaded Qwen3-ASR (Q4_K) in {:.2}s", t.elapsed().as_secs_f64());
 
     let t = Instant::now();
     let mut llm = chat::load_model(minicpm_path, &device)?;

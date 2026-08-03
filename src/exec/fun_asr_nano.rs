@@ -12,6 +12,7 @@ use anyhow::{Result, anyhow, bail};
 use candle_core::{DType, Device, Tensor, pickle::read_all_with_key};
 use candle_nn::VarBuilder;
 
+use crate::common::modules::sdpa_fast_guard;
 use crate::common::sample::{get_logit_processor, use_repeat_penalty};
 use crate::common::{InferenceModel, MultiModalData};
 use crate::models::fun_asr_nano::{
@@ -162,6 +163,13 @@ impl FunAsrEngine {
         let mut seqlen_offset = 0usize;
         let mut seq_len = prompt_len;
 
+        // Route the Qwen3-0.6B decode through the fused SDPA path (same guard the
+        // identical-backbone Qwen3-ASR uses in qwen3_asr.rs): skips repeat_kv + its
+        // contiguous copy per token. The is_decode check inside
+        // eager_attention_forward auto-falls-back to eager for the seq>1 prefill, so
+        // wrapping the whole transcribe is safe. Decode is GPU-forward-bound, and
+        // this is exactly the lever that cuts it.
+        let _sdpa_fast = sdpa_fast_guard();
         let i_start = Instant::now();
         let logits = self
             .model
